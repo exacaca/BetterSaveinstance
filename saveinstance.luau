@@ -2011,6 +2011,22 @@ do
 		["table.freeze"] = "frozen",
 		["table.isfrozen"] = "is_frozen",
 		["string.format"] = "formatted",
+		-- * the same functions reached as `s:gsub(...)` arrive here by bare name
+		format = "formatted",
+		gsub = "replaced",
+		sub = "part",
+		find = "position",
+		match = "found",
+		gmatch = "matches",
+		split = "parts",
+		rep = "repeated",
+		reverse = "reversed",
+		lower = "lowered",
+		upper = "uppered",
+		byte = "byte",
+		char = "character",
+		len = "length",
+		trim = "trimmed",
 		["string.split"] = "parts",
 		["string.sub"] = "part",
 		["string.gsub"] = "replaced",
@@ -2137,6 +2153,20 @@ do
 			return body
 		end
 		return s
+	end
+
+	-- * `s:gsub("%W", "")` must not produce a variable called `W`
+	local function looksLikePattern(text)
+		if find(text, "%%%a") or find(text, "%%%%") then
+			return true
+		end
+		if find(text, "^%^") or find(text, "%$$") then
+			return true
+		end
+		if find(text, "%.[%*%-%+]") or find(text, "%[%^") then
+			return true
+		end
+		return false
 	end
 
 	local function sanitize(name)
@@ -2469,7 +2499,7 @@ do
 		if type(src) ~= "string" or #src < 8 then
 			return src
 		end
-		if not find(src, "[%a_]_?%d") then -- nothing that even looks generic
+		if not find(src, "[%a_]_?%d") and not wantBindings then -- * nothing that even looks generic
 			return src
 		end
 
@@ -2801,11 +2831,14 @@ do
 			local t = toks[first[1]]
 			if t.k == "str" and first[1] == first[2] then
 				local text = stringContents(t.v)
-				if text and text ~= "" then
+				if text and text ~= "" and not looksLikePattern(text) then
 					if singular then
 						text = singularize(text)
 					end
-					return sanitize(text)
+					local clean = sanitize(text)
+					if clean and #clean >= 2 then
+						return clean
+					end
 				end
 				return nil
 			end
