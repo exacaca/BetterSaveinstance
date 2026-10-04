@@ -2340,7 +2340,7 @@ do
 		-- * Long scripts must not freeze the game, so we hand time back every frame
 		local lastStep = clock()
 		local function breathe()
-			if step and clock() - lastStep >= 0.015 then
+			if step and clock() - lastStep >= 0.25 then -- * Rare on purpose: a yielded frame in a heavy place costs far more than the work itself
 				step()
 				lastStep = clock()
 			end
@@ -3979,6 +3979,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local TreatUnionsAsParts = OPTIONS.TreatUnionsAsParts
 
 	local RenameVariables = OPTIONS.RenameVariables
+	local RenameStats = { time = 0, count = 0 }
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
 		OPTIONS.scriptcache = true
@@ -4407,7 +4408,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				if ok then
 					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
 					if RenameVariables then
+						local renameStarted = os.clock()
 						local renamed_ok, renamed = pcall(RenameDecompiledVariables, result)
+						RenameStats.time += os.clock() - renameStarted
+						RenameStats.count += 1
 						if renamed_ok and type(renamed) == "string" and renamed ~= "" then
 							result = renamed
 						elseif __DEBUG_MODE then
@@ -5603,6 +5607,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 		GLOBAL_ENV[placename] = nil
+		if RenameStats.count > 0 then
+			warn(string.format("[DEBUG] RenameVariables: %.2fs total over %d scripts (%.1f ms each)", RenameStats.time, RenameStats.count, RenameStats.time / RenameStats.count * 1000))
+		end
 		if StatusText then
 			task.spawn(function()
 				elapse_t = os.clock() - elapse_t
