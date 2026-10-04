@@ -4278,7 +4278,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end)
 
 			task.spawn(function()
-				task.wait(1)
+				-- * One frame is enough: this only has to let the caller below reach
+				-- * coroutine.yield() first, and the `status ~= "suspended"` loop further
+				-- * down already guarantees that. A full second here cost ~1s per script.
+				task.wait()
 
 				local ok, result = pcall(f, script)
 
