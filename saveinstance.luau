@@ -1741,6 +1741,15 @@ All options are case insensitive.
     - Studio otherwise rejects the whole script with `Using 'function' as a type annotation is not supported`, and everything that requires it fails to load.
   - Only annotations whose type is a reserved keyword are removed; a keyword can never be a valid type, so there is nothing to lose. Valid annotations such as `: string` are kept, and `obj:method()` calls are never touched.
   - Default: true
+- FixGoto: `boolean`
+  - Rewrites the `goto` statements some decompilers emit into Luau's `continue` / `break`. Luau has no `goto` and no `::labels::` at all, so a script containing even one fails to parse and everything that requires it fails to load.
+    - A label at the end of a loop body: every `goto` to it becomes `continue`
+    - A label immediately after a loop's `end`: every `goto` to it becomes `break`
+    - The label itself is then removed
+  - Only provably equivalent jumps are rewritten. The jump must be in the same function and the same loop as its label, and must be the last statement of its block (Luau requires that of `continue` / `break`). If even one jump to a label does not qualify, that label and all of its jumps are left exactly as they were, and `repeat ... until` loops are skipped entirely.
+  - Because it rewrites control flow rather than names, it is off by default. Turn it on, then diff a few scripts before trusting it.
+  - If a script still contains `goto` afterwards, those jumps were not of a shape that maps onto Luau and need fixing by hand.
+  - Default: false
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
   - Enables the option ScriptCache
@@ -1880,7 +1889,7 @@ All options are case insensitive.
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables, StripDecompilerComments, FixBrokenTypeAnnotations
+local RenameDecompiledVariables, StripDecompilerComments, FixBrokenTypeAnnotations, FixGotoStatements
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -2487,6 +2496,283 @@ do
 				end
 			end
 			i = i + 1
+		end
+
+		if fixed == 0 then
+			return src
+		end
+		return concat(pieces)
+	end
+
+	--------------------------------------------------------------------------
+	-- Luau has no `goto` and no labels, so a decompiler that emits them makes
+	-- the whole script fail to parse. Decompilers produce exactly two shapes,
+	-- and both map onto Luau one for one:
+	--   a label at the end of a loop body  -> `continue`
+	--   a label right after a loop's `end` -> `break`
+	-- Anything that is not provably one of those is left exactly as it was.
+	--------------------------------------------------------------------------
+
+	function FixGotoStatements(src)
+		if type(src) ~= "string" or src == "" then
+			return src
+		end
+		if not find(src, "goto", 1, true) then
+			return src
+		end
+
+		local pieces, toks, ntoks = lex(src)
+
+		local function isOp(i, v)
+			local t = toks[i]
+			return t ~= nil and t.k == "op" and t.v == v
+		end
+		local function isKw(i, v)
+			local t = toks[i]
+			return t ~= nil and t.k == "kw" and t.v == v
+		end
+
+		-- * `::name::` at i, stepping over one leading `;`
+		local function labelAt(i)
+			if isOp(i, ";") then
+				i = i + 1
+			end
+			if isOp(i, "::") and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "::") then
+				return i, toks[i + 1].v
+			end
+			return nil
+		end
+
+		-- * Luau wants `continue` / `break` to be the last statement of a block
+		local function terminatesBlock(i)
+			if isOp(i, ";") then
+				i = i + 1
+			end
+			local t = toks[i]
+			if not t or t.k ~= "kw" then
+				return false
+			end
+			return t.v == "end" or t.v == "else" or t.v == "elseif" or t.v == "until"
+		end
+
+		local blocks = {}
+		local funcDepth = 0
+		local pendingLoop = false
+		local pendingIf = {}
+		local labels = {}
+		local gotos = {}
+
+		-- * the loop a `goto` sits in, stopping at a function boundary and
+		-- * refusing `repeat`, where Luau restricts `continue`
+		local function enclosingLoop()
+			for n = #blocks, 1, -1 do
+				local b = blocks[n]
+				if b.kind == "func" or b.kind == "repeat" then
+					return nil
+				end
+				if b.isLoop then
+					return b.openTok
+				end
+			end
+			return nil
+		end
+
+		local function statementIf(i)
+			local t = toks[i]
+			if t.nl then
+				return true
+			end
+			local prev = toks[i - 1]
+			if not prev then
+				return true
+			end
+			if prev.k == "op" and prev.v == ";" then
+				return true
+			end
+			if prev.k == "kw" and (prev.v == "then" or prev.v == "else" or prev.v == "do" or prev.v == "repeat" or prev.v == "end") then
+				return true
+			end
+			return false
+		end
+
+		local function noteLabel(at, name, kind, loopOpen)
+			local known = labels[name]
+			if known then
+				if known.tokStart ~= at then
+					known.count = known.count + 1
+					known.kind = nil -- * the same name twice, too ambiguous to touch
+				end
+				return
+			end
+			labels[name] = {
+				count = 1,
+				kind = kind,
+				tokStart = at,
+				tokEnd = at + 2,
+				loopOpen = loopOpen,
+				funcDepth = funcDepth,
+			}
+		end
+
+		local i = 1
+		while i <= ntoks do
+			local t = toks[i]
+			if t.k == "kw" then
+				local kw = t.v
+				if kw == "for" or kw == "while" then
+					pendingLoop = true
+				elseif kw == "do" then
+					blocks[#blocks + 1] = { kind = "do", isLoop = pendingLoop, openTok = i }
+					pendingLoop = false
+				elseif kw == "repeat" then
+					blocks[#blocks + 1] = { kind = "repeat", openTok = i }
+				elseif kw == "function" then
+					if not (isOp(i - 1, ":") or isOp(i - 1, "::")) then
+						funcDepth = funcDepth + 1
+						blocks[#blocks + 1] = { kind = "func", openTok = i }
+					end
+				elseif kw == "if" then
+					pendingIf[#pendingIf + 1] = statementIf(i)
+				elseif kw == "then" then
+					local isStmt = true
+					if #pendingIf > 0 then
+						isStmt = pendingIf[#pendingIf]
+						pendingIf[#pendingIf] = nil
+					end
+					blocks[#blocks + 1] = { kind = isStmt and "then" or "thenexpr", openTok = i }
+				elseif kw == "else" then
+					if blocks[#blocks] and blocks[#blocks].kind == "thenexpr" then
+						blocks[#blocks] = nil
+					else
+						blocks[#blocks] = nil
+						blocks[#blocks + 1] = { kind = "then", openTok = i }
+					end
+				elseif kw == "elseif" then
+					if blocks[#blocks] and blocks[#blocks].kind == "thenexpr" then
+						blocks[#blocks] = nil
+						pendingIf[#pendingIf + 1] = false
+					else
+						blocks[#blocks] = nil
+						pendingIf[#pendingIf + 1] = true
+					end
+				elseif kw == "end" then
+					while blocks[#blocks] and blocks[#blocks].kind == "thenexpr" do
+						blocks[#blocks] = nil
+					end
+					local closed = blocks[#blocks]
+					blocks[#blocks] = nil
+					if closed then
+						if closed.kind == "func" then
+							funcDepth = funcDepth - 1
+						elseif closed.isLoop then
+							local at, name = labelAt(i + 1)
+							if at then
+								noteLabel(at, name, "break", closed.openTok)
+							end
+						end
+					end
+				elseif kw == "until" then
+					while blocks[#blocks] and blocks[#blocks].kind == "thenexpr" do
+						blocks[#blocks] = nil
+					end
+					blocks[#blocks] = nil
+				end
+				i = i + 1
+			elseif t.k == "op" and t.v == "::" and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "::") then
+				local top = blocks[#blocks]
+				local kind, loopOpen = nil, nil
+				if isKw(i + 3, "end") and top and top.isLoop then
+					kind, loopOpen = "continue", top.openTok
+				end
+				noteLabel(i, toks[i + 1].v, kind, loopOpen)
+				i = i + 3
+			elseif t.k == "name" and t.v == "goto" and toks[i + 1] and toks[i + 1].k == "name" then
+				local prev = toks[i - 1]
+				local after = toks[i + 2]
+				local isField = prev ~= nil and prev.k == "op" and (prev.v == "." or prev.v == ":")
+				local isIndexed = after ~= nil and after.k == "op"
+					and (after.v == "=" or after.v == "." or after.v == ":" or after.v == "(" or after.v == "[" or after.v == ",")
+				if not isField and not isIndexed then
+					gotos[#gotos + 1] = {
+						name = toks[i + 1].v,
+						tokGoto = i,
+						tokName = i + 1,
+						loopOpen = enclosingLoop(),
+						funcDepth = funcDepth,
+						terminates = terminatesBlock(i + 2),
+					}
+					i = i + 2
+				else
+					i = i + 1
+				end
+			else
+				i = i + 1
+			end
+		end
+
+		local byLabel = {}
+		for n = 1, #gotos do
+			local g = gotos[n]
+			local list = byLabel[g.name]
+			if not list then
+				list = {}
+				byLabel[g.name] = list
+			end
+			list[#list + 1] = g
+		end
+
+		local function blankRange(fromPiece, toPiece)
+			for piece = fromPiece, toPiece do
+				pieces[piece] = ""
+			end
+		end
+
+		local function dropLeadingBlank(piece)
+			local before = pieces[piece - 1]
+			if before and find(before, "^[ \t\r\n]*$") then
+				if find(before, "\n[ \t]*$") then
+					pieces[piece - 1] = gsub(before, "\n[ \t]*$", "")
+				else
+					pieces[piece - 1] = gsub(before, "[ \t]+$", "")
+				end
+			end
+		end
+
+		local fixed = 0
+		for name, list in pairs(byLabel) do
+			local label = labels[name]
+			if label and label.count == 1 and label.kind and label.loopOpen then
+				local safe = true
+				for n = 1, #list do
+					local g = list[n]
+					-- * same function, same loop, and in a position Luau accepts
+					if not g.terminates or g.funcDepth ~= label.funcDepth or g.loopOpen ~= label.loopOpen then
+						safe = false
+						break
+					end
+				end
+				if safe then
+					local word = (label.kind == "continue") and "continue" or "break"
+					for n = 1, #list do
+						local g = list[n]
+						pieces[toks[g.tokGoto].i] = word
+						blankRange(toks[g.tokGoto].i + 1, toks[g.tokName].i)
+					end
+					blankRange(toks[label.tokStart].i, toks[label.tokEnd].i)
+					dropLeadingBlank(toks[label.tokStart].i)
+					label.removed = true
+					fixed = fixed + 1
+				end
+			end
+		end
+
+		-- * a label nothing jumps to is dead; dropping it can only help the parse
+		for _, label in pairs(labels) do
+			if not label.removed and label.count == 1 and byLabel[toks[label.tokStart + 1].v] == nil then
+				blankRange(toks[label.tokStart].i, toks[label.tokEnd].i)
+				dropLeadingBlank(toks[label.tokStart].i)
+				fixed = fixed + 1
+			end
 		end
 
 		if fixed == 0 then
@@ -3895,6 +4181,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		RenameVariables = true,
 		StripComments = true,
 		FixInvalidTypes = true,
+		FixGoto = false,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -4170,6 +4457,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local RenameVariables = OPTIONS.RenameVariables
 	local StripComments = OPTIONS.StripComments
 	local FixInvalidTypes = OPTIONS.FixInvalidTypes
+	local FixGoto = OPTIONS.FixGoto
 	local RenameStats = { time = 0, count = 0 }
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -4601,6 +4889,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local output
 				if ok then
 					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+					if FixGoto then
+						local goto_ok, gotoed = pcall(FixGotoStatements, result)
+						if goto_ok and type(gotoed) == "string" and gotoed ~= "" then
+							result = gotoed
+						elseif __DEBUG_MODE then
+							__DEBUG_MODE("FixGoto failed, keeping the original output for", script:GetFullName(), gotoed)
+						end
+					end
 					if FixInvalidTypes then
 						local typed_ok, typed = pcall(FixBrokenTypeAnnotations, result)
 						if typed_ok and type(typed) == "string" and typed ~= "" then
