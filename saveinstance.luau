@@ -1735,6 +1735,12 @@ All options are case insensitive.
   - Comments the original author wrote are kept, as is `-- Original Source: ...`. Anything not in the list above is left alone.
   - Works on a real lexer, so `-- upvalues:` appearing inside a string is never touched.
   - Default: true
+- FixInvalidTypes: `boolean`
+  - Removes type annotations that Luau cannot parse, which decompilers emit regularly.
+    - `local function preload(list: table, callback: function?)` becomes `(list: table, callback)`
+    - Studio otherwise rejects the whole script with `Using 'function' as a type annotation is not supported`, and everything that requires it fails to load.
+  - Only annotations whose type is a reserved keyword are removed; a keyword can never be a valid type, so there is nothing to lose. Valid annotations such as `: string` are kept, and `obj:method()` calls are never touched.
+  - Default: true
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
   - Enables the option ScriptCache
@@ -1874,7 +1880,7 @@ All options are case insensitive.
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables, StripDecompilerComments
+local RenameDecompiledVariables, StripDecompilerComments, FixBrokenTypeAnnotations
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -2412,6 +2418,51 @@ do
 		end
 		-- * leading whitespace cannot be inside a string literal, so this is safe
 		return (gsub(concat(pieces), "^[ \t\r\n]+", ""))
+	end
+
+	--------------------------------------------------------------------------
+	-- Decompilers emit type annotations that Luau cannot parse, such as
+	-- `callback: function?`. Studio then refuses the whole script with
+	-- "Using 'function' as a type annotation is not supported". A keyword can
+	-- never be a type, so dropping the annotation is always the right repair.
+	--------------------------------------------------------------------------
+
+	function FixBrokenTypeAnnotations(src)
+		if type(src) ~= "string" or src == "" then
+			return src
+		end
+		if not find(src, ":%s*function") then -- * fast path: nothing to repair
+			return src
+		end
+
+		local pieces, toks, ntoks = lex(src)
+		local fixed = 0
+		local i = 1
+		while i < ntoks do
+			local t = toks[i]
+			if t.k == "op" and (t.v == ":" or t.v == "::") then
+				local after = toks[i + 1]
+				-- * a method call is `obj:name(...)`, whose `name` is never a keyword,
+				-- * so a keyword here can only be a (broken) type annotation
+				if after and after.k == "kw" and after.v == "function" then
+					local last = i + 1
+					if toks[last + 1] and toks[last + 1].k == "op" and toks[last + 1].v == "?" then
+						last = last + 1
+					end
+					for piece = t.i, toks[last].i do
+						pieces[piece] = ""
+					end
+					fixed = fixed + 1
+					i = last
+				end
+			end
+			i = i + 1
+		end
+
+		if fixed == 0 then
+			return src
+		end
+		return concat(pieces)
 	end
 
 	function RenameDecompiledVariables(src, wantBindings)
@@ -3810,6 +3861,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		RenameVariables = true,
 		StripComments = true,
+		FixInvalidTypes = true,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -4084,6 +4136,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local RenameVariables = OPTIONS.RenameVariables
 	local StripComments = OPTIONS.StripComments
+	local FixInvalidTypes = OPTIONS.FixInvalidTypes
 	local RenameStats = { time = 0, count = 0 }
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -4515,6 +4568,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local output
 				if ok then
 					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+					if FixInvalidTypes then
+						local typed_ok, typed = pcall(FixBrokenTypeAnnotations, result)
+						if typed_ok and type(typed) == "string" and typed ~= "" then
+							result = typed
+						elseif __DEBUG_MODE then
+							__DEBUG_MODE("FixInvalidTypes failed, keeping the original output for", script:GetFullName(), typed)
+						end
+					end
 					if StripComments then
 						local stripped_ok, stripped = pcall(StripDecompilerComments, result)
 						if stripped_ok and type(stripped) == "string" and stripped ~= "" then
