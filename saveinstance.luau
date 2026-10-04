@@ -2534,7 +2534,7 @@ do
 
 		-- * `::name::` at i, stepping over one leading `;`
 		local function labelAt(i)
-			if isOp(i, ";") then
+			while isOp(i, ";") do
 				i = i + 1
 			end
 			if isOp(i, "::") and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "::") then
@@ -2545,7 +2545,7 @@ do
 
 		-- * Luau wants `continue` / `break` to be the last statement of a block
 		local function terminatesBlock(i)
-			if isOp(i, ";") then
+			while isOp(i, ";") do
 				i = i + 1
 			end
 			local t = toks[i]
@@ -2553,6 +2553,20 @@ do
 				return false
 			end
 			return t.v == "end" or t.v == "else" or t.v == "elseif" or t.v == "until"
+		end
+
+		-- * `::l0::;` and `::l0:: ::l1::` are still the end of the body
+		local function reachesBlockEnd(i)
+			for _ = 1, 64 do
+				if isOp(i, ";") then
+					i = i + 1
+				elseif isOp(i, "::") and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "::") then
+					i = i + 3
+				else
+					break
+				end
+			end
+			return isKw(i, "end")
 		end
 
 		local blocks = {}
@@ -2681,7 +2695,7 @@ do
 			elseif t.k == "op" and t.v == "::" and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "::") then
 				local top = blocks[#blocks]
 				local kind, loopOpen = nil, nil
-				if isKw(i + 3, "end") and top and top.isLoop then
+				if reachesBlockEnd(i + 3) and top and top.isLoop then
 					kind, loopOpen = "continue", top.openTok
 				end
 				noteLabel(i, toks[i + 1].v, kind, loopOpen)
@@ -2721,6 +2735,15 @@ do
 			list[#list + 1] = g
 		end
 
+		-- * the `;` after `::l0::;` was part of the label statement
+		local function labelStop(label)
+			local stop = label.tokEnd
+			while toks[stop + 1] and toks[stop + 1].k == "op" and toks[stop + 1].v == ";" do
+				stop = stop + 1
+			end
+			return stop
+		end
+
 		local function blankRange(fromPiece, toPiece)
 			for piece = fromPiece, toPiece do
 				pieces[piece] = ""
@@ -2758,7 +2781,7 @@ do
 						pieces[toks[g.tokGoto].i] = word
 						blankRange(toks[g.tokGoto].i + 1, toks[g.tokName].i)
 					end
-					blankRange(toks[label.tokStart].i, toks[label.tokEnd].i)
+					blankRange(toks[label.tokStart].i, toks[labelStop(label)].i)
 					dropLeadingBlank(toks[label.tokStart].i)
 					label.removed = true
 					fixed = fixed + 1
@@ -2769,7 +2792,7 @@ do
 		-- * a label nothing jumps to is dead; dropping it can only help the parse
 		for _, label in pairs(labels) do
 			if not label.removed and label.count == 1 and byLabel[toks[label.tokStart + 1].v] == nil then
-				blankRange(toks[label.tokStart].i, toks[label.tokEnd].i)
+				blankRange(toks[label.tokStart].i, toks[labelStop(label)].i)
 				dropLeadingBlank(toks[label.tokStart].i)
 				fixed = fixed + 1
 			end
@@ -4458,7 +4481,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local StripComments = OPTIONS.StripComments
 	local FixInvalidTypes = OPTIONS.FixInvalidTypes
 	local FixGoto = OPTIONS.FixGoto
-	local RenameStats = { time = 0, count = 0 }
+	local RenameStats = { time = 0, count = 0, goto_fixed = 0, goto_left = 0 }
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
 		OPTIONS.scriptcache = true
@@ -4892,9 +4915,15 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					if FixGoto then
 						local goto_ok, gotoed = pcall(FixGotoStatements, result)
 						if goto_ok and type(gotoed) == "string" and gotoed ~= "" then
+							if gotoed ~= result then
+								RenameStats.goto_fixed += 1
+							end
 							result = gotoed
 						elseif __DEBUG_MODE then
 							__DEBUG_MODE("FixGoto failed, keeping the original output for", script:GetFullName(), gotoed)
+						end
+						if string.find(result, "goto", 1, true) then
+							RenameStats.goto_left += 1
 						end
 					end
 					if FixInvalidTypes then
@@ -6114,6 +6143,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 		GLOBAL_ENV[placename] = nil
+		if RenameStats.goto_fixed > 0 or RenameStats.goto_left > 0 then
+			warn(string.format("[DEBUG] FixGoto: rewrote jumps in %d scripts; %d scripts still contain goto and need fixing by hand", RenameStats.goto_fixed, RenameStats.goto_left))
+		end
 		if RenameStats.count > 0 then
 			warn(string.format("[DEBUG] RenameVariables: %.2fs total over %d scripts (%.1f ms each)", RenameStats.time, RenameStats.count, RenameStats.time / RenameStats.count * 1000))
 		end
