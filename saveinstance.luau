@@ -1476,7 +1476,7 @@ do
 						is_matched = true
 
 						local version_hash = string.match(line, "(version%-[^%s]+)")
-						if version_hash then
+						if version_hash and version_hash ~= "version-hidden" then -- * Roblox hides the hash on most recent deploys, there is no API dump to fetch for those
 							matching_versions[version_hash] = true
 						end
 					elseif is_matched then
@@ -1501,7 +1501,9 @@ do
 				end
 			end
 
-			writefile(CLIENT_VERSION_str, API_Dump)
+			if API_Dump then -- * Without a dump there is nothing to cache, and writefile(path, nil) would throw
+				writefile(CLIENT_VERSION_str, API_Dump)
+			end
 		end)
 
 		if not ok or not API_Dump then
@@ -1706,7 +1708,7 @@ All options are case insensitive.
   - Default: true
 - decomptype: `string`
   - "custom" - for a built-in custom decompiler.
-  - Uses Konstant 2.1, locally hosted instead of the API to increase speed. ([Konstant Discord Server](https://discord.gg/wyButjTMhM), [Konstant Decompiled Source Code](https://raw.githubusercontent.com/Devraj2010isme/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau))
+  - Uses Konstant 2.1, locally hosted instead of the API to increase speed. ([Konstant Discord Server](https://discord.gg/wyButjTMhM), [Konstant Decompiled Source Code](https://raw.githubusercontent.com/exacaca/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau))
   - Default: Your executor's decompiler, if available. Otherwise uses "custom" if not.
 - timeout: `number`
   - If the decompilation run time exceeds this value it gets cancelled.
@@ -4287,7 +4289,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	if getscriptbytecode then
 		if (decompile == nil and OPTIONS.decomptype == "") or OPTIONS.decomptype == "custom" then
 			if __DEBUG_MODE then __DEBUG_MODE("Attempting to load Konstant Decompiler. If there is an error/crash after this, set the option decomptype to any string other than custom") end
-			local url = "https://raw.githubusercontent.com/Devraj2010isme/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau"
+			local url = "https://raw.githubusercontent.com/exacaca/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau"
 			local konstant = loadstring(game:HttpGet(url, true))()
 			GLOBAL_ENV.decompile = konstant.decompile
 			if __DEBUG_MODE then __DEBUG_MODE("Konstant Decompiler loaded") end
