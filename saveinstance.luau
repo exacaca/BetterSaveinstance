@@ -1870,6 +1870,8 @@ do
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
 	local concat = table.concat
 	local floor = math.floor
+	local clock = os.clock
+	local step = (task and task.wait) or wait
 
 	local KEYWORDS = {}
 	for word in string.gmatch(
@@ -1909,6 +1911,11 @@ do
 	local LOGIC = { ["and"] = true, ["or"] = true }
 	local COMPARE = { ["=="] = true, ["~="] = true, ["!="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true }
 	local ARITH = { ["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true, ["//"] = true }
+
+	-- * hoisted so the hot path does not allocate a table per lookup
+	local SET_CONCAT = { [".."] = true }
+	local SET_ASSIGN = { ["="] = true }
+	local SET_THEN = { ["then"] = true }
 
 	local ORDINALS = { "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth" }
 
@@ -2330,7 +2337,17 @@ do
 			return src
 		end
 
+		-- * Long scripts must not freeze the game, so we hand time back every frame
+		local lastStep = clock()
+		local function breathe()
+			if step and clock() - lastStep >= 0.015 then
+				step()
+				lastStep = clock()
+			end
+		end
+
 		local pieces, toks, ntoks = lex(src)
+		breathe()
 
 		local decls = {}
 		local bindOf = {} -- token index -> declaration it refers to
@@ -2390,7 +2407,12 @@ do
 			return t ~= nil and t.k == "kw" and t.v == v
 		end
 
+		local pairCache = {}
 		local function matchPair(i)
+			local hit = pairCache[i]
+			if hit then
+				return hit
+			end
 			local depth = 0
 			for j = i, ntoks do
 				local t = toks[j]
@@ -2400,11 +2422,13 @@ do
 					elseif CLOSE[t.v] then
 						depth = depth - 1
 						if depth == 0 then
+							pairCache[i] = j
 							return j
 						end
 					end
 				end
 			end
+			pairCache[i] = ntoks
 			return ntoks
 		end
 
@@ -2791,7 +2815,7 @@ do
 				if last.a > last.b then
 					return "tbl"
 				end
-				if findTopLevel(last.a, last.b, { ["="] = true }) then
+				if findTopLevel(last.a, last.b, SET_ASSIGN) then
 					return "data"
 				end
 				return "list"
@@ -2898,7 +2922,7 @@ do
 				return "matched"
 			end
 
-			if findTopLevel(a, b, { [".."] = true }) then
+			if findTopLevel(a, b, SET_CONCAT) then
 				return "text"
 			end
 
@@ -2924,7 +2948,7 @@ do
 				return inferRange(a + 1, b, skipValueName, depth)
 			end
 			if head.k == "kw" and head.v == "if" then
-				local thenTok = findTopLevel(a, b, { ["then"] = true })
+				local thenTok = findTopLevel(a, b, SET_THEN)
 				if thenTok then
 					return inferRange(thenTok + 1, b, skipValueName, depth)
 				end
@@ -3284,7 +3308,12 @@ do
 		end
 
 		local ti = 1
+		local steps = 0
 		while ti <= ntoks do
+			steps = steps + 1
+			if steps % 4096 == 0 then
+				breathe()
+			end
 			local bucket = pendingRegister[ti]
 			if bucket then
 				for n = 1, #bucket do
@@ -3445,7 +3474,11 @@ do
 						end
 					end
 					local doTok = nil
-					for m = j, ntoks do
+					local scanTo = j + 4096
+					if scanTo > ntoks then
+						scanTo = ntoks
+					end
+					for m = j, scanTo do
 						if isKw(m, "do") then
 							doTok = m
 							break
@@ -3580,6 +3613,9 @@ do
 		end
 
 		for n = 1, #decls do
+			if n % 2048 == 0 then
+				breathe()
+			end
 			local d = decls[n]
 			if d.rename then
 				local base = rawNameOf(d)
@@ -3587,18 +3623,24 @@ do
 					base = FALLBACK[d.kind] or "value"
 				end
 				local fnRec = d.fnRec or rootFn
-				local final, suffix = base, 1
+				fnRec.used = fnRec.used or {}
+				fnRec.cursor = fnRec.cursor or {}
+				-- * resume where this base name left off: without the cursor, N locals
+				-- * that all infer the same name would cost N^2 to number
+				local cursor = fnRec.cursor
+				local suffix = cursor[base] or 1
+				local final = (suffix == 1) and base or (base .. "_" .. suffix)
 				while not isFree(final, fnRec) or isGenericName(final) do
 					suffix = suffix + 1
 					final = base .. "_" .. suffix
 					if isGenericName(final) or suffix > 400 then
 						-- * `i_7` would just be another generic name, so widen the base instead
 						base = ALIAS[base] or (base .. "_value")
-						suffix = 1
-						final = base
+						suffix = cursor[base] or 1
+						final = (suffix == 1) and base or (base .. "_" .. suffix)
 					end
 				end
-				fnRec.used = fnRec.used or {}
+				cursor[base] = suffix
 				fnRec.used[final] = true
 				d.final = final
 				for m = 1, #d.tokens do
