@@ -1713,6 +1713,16 @@ All options are case insensitive.
   - Set to -1 to disable timeout (unreliable).
   - Aliases: DecompileTimeout
   - Default: 10
+- RenameVariables: `boolean`
+  - Renames the generic names decompilers emit (`v14`, `p1`, `s1`, `arg3`, `var_1`, ...) to names inferred from what each variable is assigned from, or how each parameter is used.
+    - `local v14 = load("ClientStore")` becomes `local ClientStore = load("ClientStore")`
+    - `local v17 = store:getState().house_exteriors or {}` becomes `local house_exteriors = ...`
+    - `local v28 = child:GetChildren()[1]` becomes `local firstChild = ...`
+    - `function set_house_edit_mode(p2)` becomes `function set_house_edit_mode(house_edit_mode)`
+  - Works with every decompiler, including your executor's own, because it runs on the decompiled text.
+  - Names already present in the script, strings, comments, table keys and formatting are left exactly as they were. Each new name is unique within its function and every function enclosing it, so nothing can be shadowed.
+  - Variables it cannot infer a name for become `value`, `instance`, `list`, `callback`, ... never `v14`.
+  - Default: true
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
   - Enables the option ScriptCache
@@ -1848,6 +1858,1775 @@ All options are case insensitive.
 - ) → ()
 ]=]
 
+-- * Renames generic decompiler output names (v14, p1, s1, arg3, ...) into names
+-- * inferred from what they get assigned from / how they are used.
+-- * Pure text in, text out. Comments, whitespace and everything else is preserved.
+
+local RenameDecompiledVariables
+do
+	local sub, find, gsub, rep, upper, lower, match =
+		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
+	local concat = table.concat
+	local floor = math.floor
+
+	local KEYWORDS = {}
+	for word in string.gmatch(
+		"and break do else elseif end false for function if in local nil not or repeat return then true until while",
+		"%S+"
+	) do
+		KEYWORDS[word] = true
+	end
+
+	-- * Names we must never generate, so that we can never shadow something the script needs
+	local RESERVED = {}
+	for word in pairs(KEYWORDS) do
+		RESERVED[word] = true
+	end
+	for word in string.gmatch(
+		[[continue export type typeof self _G _ENV game workspace Workspace script shared plugin string table math os io
+		coroutine bit32 buffer utf8 debug task print warn error assert pairs ipairs next select tostring tonumber pcall
+		xpcall ypcall rawget rawset rawequal rawlen setmetatable getmetatable unpack require wait spawn delay tick time
+		newproxy loadstring load getfenv setfenv collectgarbage gcinfo elapsedTime version settings UserSettings stats
+		PluginManager Instance Vector3 Vector2 Vector3int16 Vector2int16 CFrame UDim UDim2 Color3 BrickColor ColorSequence
+		ColorSequenceKeypoint NumberRange NumberSequence NumberSequenceKeypoint Enum Ray Region3 Region3int16 TweenInfo
+		Random Faces Axes Rect PhysicalProperties DateTime Font OverlapParams RaycastParams RaycastResult Content
+		SharedTable vector]],
+		"%S+"
+	) do
+		RESERVED[word] = true
+	end
+
+	local OPS = {
+		"...", "..=", "//=", "<<=", ">>=",
+		"..", "==", "~=", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "^=", "//", "::", "->", "<<", ">>",
+	}
+
+	local OPEN = { ["("] = true, ["["] = true, ["{"] = true }
+	local CLOSE = { [")"] = true, ["]"] = true, ["}"] = true }
+	local STOPPERS = { ["end"] = true, ["until"] = true, ["local"] = true, ["return"] = true, ["break"] = true, ["continue"] = true }
+	local LOGIC = { ["and"] = true, ["or"] = true }
+	local COMPARE = { ["=="] = true, ["~="] = true, ["!="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true }
+	local ARITH = { ["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true, ["//"] = true }
+
+	local ORDINALS = { "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth" }
+
+	-- * marker: "name this after the first argument of the call"
+	local A1 = "\1arg1"
+
+	local METHODS = {
+		GetChildren = "children",
+		GetDescendants = "descendants",
+		GetAncestors = "ancestors",
+		GetPlayers = "players",
+		GetTags = "tags",
+		GetAttributes = "attributes",
+		GetAttribute = A1,
+		GetJoints = "joints",
+		GetConnectedParts = "connected_parts",
+		GetTouchingParts = "touching_parts",
+		GetFullName = "full_name",
+		GetDebugId = "debug_id",
+		GetPropertyChangedSignal = "signal",
+		GetAttributeChangedSignal = "signal",
+		GetBoundingBox = "bounding_box",
+		GetExtentsSize = "extents_size",
+		GetPivot = "pivot",
+		GetScale = "scale",
+		GetMouse = "mouse",
+		GetService = A1,
+		FindService = A1,
+		FindFirstChild = A1,
+		WaitForChild = A1,
+		FindFirstChildOfClass = A1,
+		FindFirstChildWhichIsA = A1,
+		FindFirstAncestor = A1,
+		FindFirstAncestorOfClass = A1,
+		FindFirstAncestorWhichIsA = A1,
+		FindFirstDescendant = A1,
+		Clone = "clone",
+		IsA = "matches_class",
+		IsDescendantOf = "is_descendant",
+		IsAncestorOf = "is_ancestor",
+		tostring = "text",
+		tonumber = "number",
+		typeof = "type_name",
+		type = "type_name",
+		unpack = "unpacked",
+		Wait = "elapsed",
+		Invoke = "invoke_result",
+		InvokeServer = "invoke_result",
+		Connect = "connection",
+		Once = "connection",
+		ConnectParallel = "connection",
+		LoadAnimation = "track",
+		["table.clone"] = "clone",
+		["table.concat"] = "text",
+		["table.find"] = "index",
+		["table.remove"] = "removed",
+		["table.pack"] = "packed",
+		["table.unpack"] = "unpacked",
+		["table.getn"] = "count",
+		["table.maxn"] = "count",
+		["table.freeze"] = "frozen",
+		["table.isfrozen"] = "is_frozen",
+		["string.format"] = "formatted",
+		["string.split"] = "parts",
+		["string.sub"] = "part",
+		["string.gsub"] = "replaced",
+		["string.match"] = "found",
+		["string.gmatch"] = "matches",
+		["string.find"] = "position",
+		["string.rep"] = "repeated",
+		["string.len"] = "length",
+		["string.byte"] = "byte",
+		["string.char"] = "character",
+		["string.reverse"] = "reversed",
+		["string.lower"] = "lowered",
+		["string.upper"] = "uppered",
+		["os.time"] = "timestamp",
+		["os.clock"] = "clock",
+		["os.date"] = "date",
+		tick = "timestamp",
+		["math.random"] = "random",
+		["coroutine.create"] = "thread",
+		["coroutine.wrap"] = "thread",
+		["task.spawn"] = "thread",
+		["task.defer"] = "thread",
+		["task.delay"] = "thread",
+		["buffer.create"] = "buff",
+		["buffer.fromstring"] = "buff",
+	}
+
+	local VERB_PATTERNS = {
+		"^[Gg]et_?(%w.*)$",
+		"^[Ff]etch_?(%w.*)$",
+		"^[Ll]oad_?(%w.*)$",
+		"^[Rr]ead_?(%w.*)$",
+		"^[Mm]ake_?(%w.*)$",
+		"^[Cc]reate_?(%w.*)$",
+		"^[Bb]uild_?(%w.*)$",
+		"^[Cc]ompute_?(%w.*)$",
+		"^[Cc]alculate_?(%w.*)$",
+		"^[Rr]esolve_?(%w.*)$",
+		"^[Pp]arse_?(%w.*)$",
+		"^[Gg]enerate_?(%w.*)$",
+		"^[Cc]onstruct_?(%w.*)$",
+		"^[Rr]etrieve_?(%w.*)$",
+		"^[Qq]uery_?(%w.*)$",
+		"^[Dd]ownload_?(%w.*)$",
+		"^[Rr]equest_?(%w.*)$",
+	}
+
+	local BOOL_PATTERNS = { "^[Ii]s[_%u]", "^[Hh]as[_%u]", "^[Cc]an[_%u]", "^[Ss]hould[_%u]", "^[Ww]as[_%u]" }
+
+	-- * `i` reads well, `i_7` does not, so short names grow a real word when they collide
+	local ALIAS = {
+		i = "index", j = "index", k = "key", v = "value", n = "count", t = "tbl", s = "text",
+		b = "flag", f = "callback", c = "character", d = "data", e = "entry", m = "match",
+		o = "object", p = "part", r = "result", u = "value", w = "value", x = "value", y = "value", z = "value",
+	}
+
+	local PLAYER_FIELDS = {
+		Character = true, UserId = true, DisplayName = true, PlayerGui = true, Backpack = true,
+		Team = true, TeamColor = true, AccountAge = true, CharacterAdded = true, FollowUserId = true,
+	}
+
+	--------------------------------------------------------------------------
+	-- helpers
+	--------------------------------------------------------------------------
+
+	local function isGenericName(name)
+		if RESERVED[name] then
+			return false
+		end
+		if find(name, "^[A-Za-z]%d+$") then -- v14, p1, s1, u3, A2
+			return true
+		end
+		if find(name, "^[A-Za-z]_%d+$") then -- v_14, l_3
+			return true
+		end
+		if find(name, "^arg%d*$") or find(name, "^args%d+$") or find(name, "^var%d*$") or find(name, "^param%d*$") then
+			return true
+		end
+		if find(name, "^upval%w*%d+$") or find(name, "^loc%d+$") or find(name, "^tmp%d*$") or find(name, "^temp%d*$") then
+			return true
+		end
+		if find(name, "^unknown%d*$") or find(name, "^slot%d+$") or find(name, "^reg%d+$") then
+			return true
+		end
+		return false
+	end
+
+	-- * `v`, `k`, `t`, ... carry no meaning, so we look through them to what they hold
+	local function isWeakName(name)
+		return #name <= 2 and not find(name, "^%u") and name ~= "_"
+	end
+
+	local function upperFirst(s)
+		return (gsub(s, "^%l", upper))
+	end
+
+	local function lowerFirst(s)
+		return (gsub(s, "^%u", lower))
+	end
+
+	local IRREGULAR = {
+		children = "child", people = "person", men = "man", women = "woman", feet = "foot",
+		teeth = "tooth", mice = "mouse", geese = "goose", indices = "index", vertices = "vertex",
+		matrices = "matrix", criteria = "criterion", data = "entry", descendants = "descendant",
+	}
+
+	local function singularize(s)
+		local irregular = IRREGULAR[lower(s)]
+		if irregular then
+			return find(s, "^%u") and upper(sub(irregular, 1, 1)) .. sub(irregular, 2) or irregular
+		end
+		if #s < 4 then
+			return s
+		end
+		local body
+		if find(s, "ies$") then
+			body = sub(s, 1, #s - 3) .. "y"
+		elseif find(s, "[sxz]es$") or find(s, "[cs]hes$") then
+			body = sub(s, 1, #s - 2)
+		elseif find(s, "[^suiSUI]s$") and not find(s, "ss$") then
+			body = sub(s, 1, #s - 1)
+		end
+		if body and #body >= 2 then
+			return body
+		end
+		return s
+	end
+
+	local function sanitize(name)
+		if type(name) ~= "string" or name == "" then
+			return nil
+		end
+		name = gsub(name, "[^%w_]+", "_")
+		name = gsub(name, "__+", "_")
+		name = gsub(name, "^_+", "")
+		name = gsub(name, "_+$", "")
+		if name == "" then
+			return nil
+		end
+		if find(name, "^%d") then
+			name = "n" .. name
+		end
+		if #name > 42 then
+			name = gsub(sub(name, 1, 42), "_+$", "")
+		end
+		if KEYWORDS[name] then
+			name = name .. "_value"
+		end
+		if isGenericName(name) then
+			return nil
+		end
+		return name
+	end
+
+	local function stringContents(text)
+		local q = sub(text, 1, 1)
+		if q == '"' or q == "'" then
+			return sub(text, 2, #text - 1)
+		end
+		local s, e = find(text, "^%[=*%[")
+		if s then
+			return sub(text, e + 1, #text - (e - s))
+		end
+		return nil
+	end
+
+	--------------------------------------------------------------------------
+	-- lexer: `pieces` holds every byte of the source in order, `toks` holds
+	-- the meaningful tokens, each pointing at the piece it occupies
+	--------------------------------------------------------------------------
+
+	local function lex(src)
+		local pieces, toks = {}, {}
+		local np, nt = 0, 0
+		local total = #src
+		local pendingNL = true
+
+		local function pushRaw(s)
+			np = np + 1
+			pieces[np] = s
+		end
+		local function pushTok(s, kind)
+			np = np + 1
+			pieces[np] = s
+			nt = nt + 1
+			toks[nt] = { i = np, k = kind, v = s, nl = pendingNL }
+			pendingNL = false
+		end
+
+		local lexChunk
+		lexChunk = function(from, to)
+			local i = from
+			while i <= to do
+				local c = sub(src, i, i)
+				if c == " " or c == "\t" or c == "\r" or c == "\n" then
+					local s, e = find(src, "^[ \t\r\n]+", i)
+					local w = sub(src, s, e)
+					if find(w, "\n", 1, true) then
+						pendingNL = true
+					end
+					pushRaw(w)
+					i = e + 1
+				elseif c == "-" and sub(src, i + 1, i + 1) == "-" then
+					local bs, be = find(src, "^%[=*%[", i + 2)
+					local stop
+					if bs then
+						local closer = "]" .. rep("=", be - bs - 1) .. "]"
+						local _, ce = find(src, closer, be + 1, true)
+						stop = ce or to
+					else
+						local nl = find(src, "\n", i + 2, true)
+						stop = (nl and nl - 1) or to
+					end
+					local w = sub(src, i, stop)
+					if find(w, "\n", 1, true) then
+						pendingNL = true
+					end
+					pushRaw(w)
+					i = stop + 1
+				elseif c == "[" and find(src, "^%[=*%[", i) then
+					local bs, be = find(src, "^%[=*%[", i)
+					local closer = "]" .. rep("=", be - bs - 1) .. "]"
+					local _, ce = find(src, closer, be + 1, true)
+					local stop = ce or to
+					pushTok(sub(src, i, stop), "str")
+					i = stop + 1
+				elseif c == '"' or c == "'" then
+					local j = i + 1
+					while j <= to do
+						local d = sub(src, j, j)
+						if d == "\\" then
+							j = j + 2
+						elseif d == c or d == "\n" then
+							break
+						else
+							j = j + 1
+						end
+					end
+					if j > to then
+						j = to
+					end
+					pushTok(sub(src, i, j), "str")
+					i = j + 1
+				elseif c == "`" then
+					pushRaw("`")
+					local j = i + 1
+					local litStart = j
+					while j <= to do
+						local d = sub(src, j, j)
+						if d == "\\" then
+							j = j + 2
+						elseif d == "`" then
+							break
+						elseif d == "{" then
+							if j > litStart then
+								pushRaw(sub(src, litStart, j - 1))
+							end
+							pushRaw("{")
+							local depth, k = 1, j + 1
+							while k <= to do
+								local e2 = sub(src, k, k)
+								if e2 == "{" then
+									depth = depth + 1
+									k = k + 1
+								elseif e2 == "}" then
+									depth = depth - 1
+									if depth == 0 then
+										break
+									end
+									k = k + 1
+								elseif e2 == '"' or e2 == "'" then
+									local q = e2
+									k = k + 1
+									while k <= to do
+										local f2 = sub(src, k, k)
+										if f2 == "\\" then
+											k = k + 2
+										elseif f2 == q then
+											k = k + 1
+											break
+										else
+											k = k + 1
+										end
+									end
+								else
+									k = k + 1
+								end
+							end
+							if k > to then
+								k = to + 1
+							end
+							if k - 1 >= j + 1 then
+								lexChunk(j + 1, k - 1)
+							end
+							pushRaw("}")
+							j = k + 1
+							litStart = j
+						else
+							j = j + 1
+						end
+					end
+					if j > to then
+						j = to
+					end
+					if j >= litStart then
+						pushRaw(sub(src, litStart, j))
+					end
+					i = j + 1
+				elseif find(src, "^[%a_]", i) then
+					local s, e = find(src, "^[%a_][%w_]*", i)
+					local w = sub(src, s, e)
+					pushTok(w, KEYWORDS[w] and "kw" or "name")
+					i = e + 1
+				elseif find(src, "^%d", i) or (c == "." and find(src, "^%.%d", i)) then
+					local s, e = find(src, "^%.?%d[%w_%.]*", i)
+					while true do
+						local tail = sub(src, e, e)
+						if (tail == "e" or tail == "E" or tail == "p" or tail == "P") and find(src, "^[%+%-]%d", e + 1) then
+							local _, e2 = find(src, "^[%+%-][%d_]*", e + 1)
+							e = e2
+						else
+							break
+						end
+					end
+					pushTok(sub(src, s, e), "num")
+					i = e + 1
+				else
+					local matched
+					for n = 1, #OPS do
+						local op = OPS[n]
+						if sub(src, i, i + #op - 1) == op then
+							matched = op
+							break
+						end
+					end
+					matched = matched or c
+					pushTok(matched, "op")
+					i = i + #matched
+				end
+			end
+		end
+
+		lexChunk(1, total)
+		return pieces, toks, nt
+	end
+
+	--------------------------------------------------------------------------
+	-- main entry point
+	--------------------------------------------------------------------------
+
+	function RenameDecompiledVariables(src, wantBindings)
+		if type(src) ~= "string" or #src < 8 then
+			return src
+		end
+		if not find(src, "[%a_]_?%d") then -- nothing that even looks generic
+			return src
+		end
+
+		local pieces, toks, ntoks = lex(src)
+
+		local decls = {}
+		local bindOf = {} -- token index -> declaration it refers to
+		local taken = {} -- every name already present in the source as a variable / global
+		local rootFn = { used = {}, parent = nil, bodyFrom = 1, bodyTo = ntoks, paramCount = 0 }
+		local scopes = { {} }
+		local scopeFns = { rootFn }
+		local nscopes = 1
+		local budget = 40000
+
+		local function currentFn()
+			for s = nscopes, 1, -1 do
+				if scopeFns[s] then
+					return scopeFns[s]
+				end
+			end
+			return rootFn
+		end
+
+		local function pushScope(fn)
+			if fn then
+				fn.parent = currentFn()
+				fn.used = {}
+			end
+			nscopes = nscopes + 1
+			scopes[nscopes] = {}
+			scopeFns[nscopes] = fn or false
+		end
+		local function popScope(atTok)
+			if nscopes <= 1 then
+				return
+			end
+			local fn = scopeFns[nscopes]
+			if fn then
+				fn.bodyTo = atTok
+			end
+			scopes[nscopes] = nil
+			scopeFns[nscopes] = nil
+			nscopes = nscopes - 1
+		end
+		local function lookup(name)
+			for s = nscopes, 1, -1 do
+				local d = scopes[s][name]
+				if d then
+					return d
+				end
+			end
+			return nil
+		end
+
+		local function isOp(i, v)
+			local t = toks[i]
+			return t ~= nil and t.k == "op" and t.v == v
+		end
+		local function isKw(i, v)
+			local t = toks[i]
+			return t ~= nil and t.k == "kw" and t.v == v
+		end
+
+		local function matchPair(i)
+			local depth = 0
+			for j = i, ntoks do
+				local t = toks[j]
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						depth = depth - 1
+						if depth == 0 then
+							return j
+						end
+					end
+				end
+			end
+			return ntoks
+		end
+
+		local function stmtEnd(i)
+			local depth, blocks = 0, 0
+			local j = i
+			while j <= ntoks do
+				local t = toks[j]
+				if t.nl and j > i and depth == 0 and blocks == 0 then
+					return j - 1
+				end
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						if depth == 0 then
+							return j - 1
+						end
+						depth = depth - 1
+					elseif t.v == ";" and depth == 0 and blocks == 0 then
+						return j - 1
+					end
+				elseif t.k == "kw" then
+					if t.v == "function" then
+						blocks = blocks + 1
+					elseif t.v == "end" or t.v == "until" then
+						if blocks > 0 then
+							blocks = blocks - 1
+						elseif depth == 0 then
+							return j - 1
+						end
+					elseif STOPPERS[t.v] and depth == 0 and blocks == 0 and j > i then
+						return j - 1
+					end
+				end
+				j = j + 1
+			end
+			return ntoks
+		end
+
+		local function splitLogic(a, b)
+			local parts, depth, start = nil, 0, a
+			for j = a, b do
+				local t = toks[j]
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						depth = depth - 1
+					end
+				elseif t.k == "kw" and LOGIC[t.v] and depth == 0 then
+					parts = parts or {}
+					parts[#parts + 1] = { start, j - 1 }
+					start = j + 1
+				end
+			end
+			if parts then
+				parts[#parts + 1] = { start, b }
+			end
+			return parts
+		end
+
+		local function findTopLevel(a, b, set)
+			local depth, blocks = 0, 0
+			for j = a, b do
+				local t = toks[j]
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						depth = depth - 1
+					elseif depth == 0 and blocks == 0 and set[t.v] and j > a then
+						return j
+					end
+				elseif t.k == "kw" then
+					if t.v == "function" then
+						blocks = blocks + 1
+					elseif t.v == "end" then
+						blocks = blocks - 1
+					elseif depth == 0 and blocks == 0 and set[t.v] and j > a then
+						return j
+					end
+				end
+			end
+			return nil
+		end
+
+		local function splitCommas(a, b)
+			local parts, depth = {}, 0
+			local start = a
+			if a > b then
+				return parts
+			end
+			for j = a, b do
+				local t = toks[j]
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						depth = depth - 1
+					elseif t.v == "," and depth == 0 then
+						parts[#parts + 1] = { start, j - 1 }
+						start = j + 1
+					end
+				end
+			end
+			parts[#parts + 1] = { start, b }
+			return parts
+		end
+
+		----------------------------------------------------------------
+		-- name inference
+		----------------------------------------------------------------
+
+		local inferRange
+		local rawNameOf
+
+		local function suffixChain(a, b)
+			local t = toks[a]
+			if not t then
+				return nil
+			end
+			local chain = {}
+			local i = a
+			if t.k == "name" then
+				chain[1] = { kind = "name", name = t.v, tok = a }
+				i = a + 1
+			elseif t.k == "op" and t.v == "(" then
+				local close = matchPair(a)
+				if close > b then
+					return nil
+				end
+				chain[1] = { kind = "paren", a = a + 1, b = close - 1 }
+				i = close + 1
+			elseif t.k == "str" then
+				chain[1] = { kind = "str" }
+				i = a + 1
+			elseif t.k == "num" then
+				chain[1] = { kind = "num" }
+				i = a + 1
+			elseif t.k == "op" and t.v == "{" then
+				local close = matchPair(a)
+				if close > b then
+					return nil
+				end
+				chain[1] = { kind = "table", a = a + 1, b = close - 1 }
+				i = close + 1
+			elseif t.k == "op" and t.v == "..." then
+				chain[1] = { kind = "varargs" }
+				i = a + 1
+			elseif t.k == "kw" and (t.v == "nil" or t.v == "true" or t.v == "false") then
+				chain[1] = { kind = t.v }
+				i = a + 1
+			elseif t.k == "kw" and t.v == "function" then
+				return { { kind = "function" } }
+			else
+				return nil
+			end
+
+			while i <= b do
+				local c = toks[i]
+				if c.k == "op" and c.v == "." and toks[i + 1] and toks[i + 1].k == "name" then
+					chain[#chain + 1] = { kind = "field", name = toks[i + 1].v }
+					i = i + 2
+				elseif c.k == "op" and c.v == "[" then
+					local close = matchPair(i)
+					if close > b then
+						return nil
+					end
+					chain[#chain + 1] = { kind = "index", a = i + 1, b = close - 1 }
+					i = close + 1
+				elseif c.k == "op" and c.v == "(" then
+					local close = matchPair(i)
+					if close > b then
+						return nil
+					end
+					chain[#chain + 1] = { kind = "call", args = splitCommas(i + 1, close - 1) }
+					i = close + 1
+				elseif c.k == "op" and c.v == ":" and toks[i + 1] and toks[i + 1].k == "name" and isOp(i + 2, "(") then
+					local close = matchPair(i + 2)
+					if close > b then
+						return nil
+					end
+					chain[#chain + 1] = { kind = "method", name = toks[i + 1].v, args = splitCommas(i + 3, close - 1) }
+					i = close + 1
+				elseif c.k == "str" then
+					chain[#chain + 1] = { kind = "call", args = { { i, i } } }
+					i = i + 1
+				elseif c.k == "op" and c.v == "{" then
+					local close = matchPair(i)
+					if close > b then
+						return nil
+					end
+					chain[#chain + 1] = { kind = "call", args = { { i, close } } }
+					i = close + 1
+				else
+					return nil
+				end
+			end
+			return chain
+		end
+
+		local function calleePath(chain, upto)
+			local parts = {}
+			for n = 1, upto do
+				local op = chain[n]
+				if op.kind == "name" or op.kind == "field" then
+					parts[#parts + 1] = op.name
+				else
+					return nil
+				end
+			end
+			if #parts == 0 then
+				return nil
+			end
+			return concat(parts, "."), parts[#parts], parts[1]
+		end
+
+		local function argCount(args)
+			if not args or #args == 0 then
+				return 0
+			end
+			if #args == 1 and args[1][1] > args[1][2] then
+				return 0
+			end
+			return #args
+		end
+
+		local function nameFromArg(args, skipValueName, singular)
+			local first = args and args[1]
+			if not first or first[1] > first[2] then
+				return nil
+			end
+			local t = toks[first[1]]
+			if t.k == "str" and first[1] == first[2] then
+				local text = stringContents(t.v)
+				if text and text ~= "" then
+					if singular then
+						text = singularize(text)
+					end
+					return sanitize(text)
+				end
+				return nil
+			end
+			local inner = inferRange(first[1], first[2], skipValueName)
+			if inner and singular then
+				inner = singularize(inner)
+			end
+			return inner
+		end
+
+		local nameFromChain
+
+		local function nameFromCall(chain, idx, skipValueName)
+			local op = chain[idx]
+			local path, last, first
+			if op.kind == "method" then
+				last = op.name
+				path = op.name
+			else
+				path, last, first = calleePath(chain, idx - 1)
+				if not path then
+					local prev = chain[idx - 1]
+					if prev and (prev.kind == "field" or prev.kind == "name") then
+						last = prev.name
+						path = prev.name
+					else
+						return nil
+					end
+				end
+			end
+
+			local nargs = argCount(op.args)
+			local mapped = METHODS[path] or METHODS[last]
+			if mapped == A1 then
+				local got = nameFromArg(op.args, skipValueName, nargs >= 2)
+				if got then
+					return got
+				end
+			elseif mapped then
+				return mapped
+			end
+
+			if last == "new" then
+				local firstArg = op.args and op.args[1]
+				if firstArg and firstArg[1] <= firstArg[2] and toks[firstArg[1]].k == "str" then
+					local got = nameFromArg(op.args, skipValueName, false)
+					if got then
+						return got
+					end
+				end
+				local base = chain[idx - 2]
+				local baseName = (base and base.name) or first
+				if baseName then
+					local clean = sanitize(lower(baseName))
+					if clean then
+						return clean
+					end
+				end
+			end
+
+			if last == "require" then
+				local got = nameFromArg(op.args, skipValueName, false)
+				if got then
+					return got
+				end
+			end
+
+			for n = 1, #BOOL_PATTERNS do
+				if find(last, BOOL_PATTERNS[n]) then
+					return sanitize(last)
+				end
+			end
+
+			for n = 1, #VERB_PATTERNS do
+				local captured = match(last, VERB_PATTERNS[n])
+				if captured and captured ~= "" then
+					local clean = sanitize(captured)
+					if clean then
+						return clean
+					end
+				end
+			end
+
+			local firstArg = op.args and op.args[1]
+			if firstArg and firstArg[1] <= firstArg[2] and toks[firstArg[1]].k == "str" then
+				local got = nameFromArg(op.args, skipValueName, nargs >= 2)
+				if got then
+					return got
+				end
+			end
+
+			local base = sanitize(last)
+			if base then
+				return base .. "_result"
+			end
+			return nil
+		end
+
+		function nameFromChain(chain, skipValueName)
+			local n = #chain
+			if skipValueName then
+				while n > 1 do
+					local op = chain[n]
+					if op.kind == "field" and (op.name == "Value" or op.name == "Name" or op.name == "Text") then
+						n = n - 1
+					else
+						break
+					end
+				end
+			end
+
+			local last = chain[n]
+			if not last then
+				return nil
+			end
+			local kind = last.kind
+
+			if kind == "name" then
+				local d = bindOf[last.tok] or lookup(last.name)
+				if d then
+					if d.rename or isWeakName(d.name) then
+						local got = rawNameOf(d)
+						if got then
+							return got
+						end
+					end
+					if d.rename then
+						return nil
+					end
+					return sanitize(d.name)
+				end
+				if RESERVED[last.name] then
+					return nil
+				end
+				return sanitize(last.name)
+			elseif kind == "field" then
+				return sanitize(last.name)
+			elseif kind == "str" then
+				return "text"
+			elseif kind == "num" then
+				return "number"
+			elseif kind == "table" then
+				if last.a > last.b then
+					return "tbl"
+				end
+				if findTopLevel(last.a, last.b, { ["="] = true }) then
+					return "data"
+				end
+				return "list"
+			elseif kind == "varargs" then
+				return "args"
+			elseif kind == "function" then
+				return "callback"
+			elseif kind == "nil" then
+				return nil
+			elseif kind == "true" or kind == "false" then
+				return "flag"
+			elseif kind == "paren" then
+				return inferRange(last.a, last.b, skipValueName)
+			elseif kind == "index" then
+				local base = nil
+				if n >= 2 then
+					local head = {}
+					for m = 1, n - 1 do
+						head[m] = chain[m]
+					end
+					base = nameFromChain(head, skipValueName)
+				end
+				local it = toks[last.a]
+				if last.a == last.b and it and it.k == "str" then
+					local clean = sanitize(stringContents(it.v) or "")
+					if clean then
+						return clean
+					end
+				end
+				if last.a == last.b and it and it.k == "num" then
+					local idx = tonumber(it.v)
+					if idx and idx >= 1 and idx <= 10 and idx == floor(idx) then
+						local ordinal = ORDINALS[idx]
+						if base then
+							local one = singularize(base)
+							if find(one, "_") then
+								return ordinal .. "_" .. one
+							end
+							return ordinal .. upperFirst(one)
+						end
+						return ordinal .. "_item"
+					end
+				end
+				if base then
+					local one = singularize(base)
+					if one ~= base then
+						return one
+					end
+					return base .. "_item"
+				end
+				return "entry"
+			elseif kind == "call" or kind == "method" then
+				return nameFromCall(chain, n, skipValueName)
+			end
+			return nil
+		end
+
+		function inferRange(a, b, skipValueName, depth)
+			depth = (depth or 0) + 1
+			budget = budget - 1
+			if a > b or depth > 10 or budget <= 0 then
+				return nil
+			end
+			while isOp(a, "(") and matchPair(a) == b do
+				a = a + 1
+				b = b - 1
+				if a > b then
+					return nil
+				end
+			end
+
+			local parts = splitLogic(a, b)
+			if parts then
+				-- * `x and x:FindFirstChild("Doors")`: the bare `x` guard tells us nothing,
+				-- * so operands that are a single variable are only a last resort
+				for pass = 1, 2 do
+					for n = 1, #parts do
+						local p = parts[n]
+						if p[1] <= p[2] then
+							local bare = p[1] == p[2] and toks[p[1]].k == "name"
+							if pass == 2 or not bare then
+								local got = inferRange(p[1], p[2], skipValueName, depth)
+								if got then
+									return got
+								end
+							end
+						end
+					end
+				end
+				return nil
+			end
+
+			local cmp = findTopLevel(a, b, COMPARE)
+			if cmp then
+				local side = inferRange(a, cmp - 1, true, depth) or inferRange(cmp + 1, b, true, depth)
+				if side then
+					for n = 1, #BOOL_PATTERNS do
+						if find(side, BOOL_PATTERNS[n]) then
+							return side
+						end
+					end
+					return "is_" .. lower(side)
+				end
+				return "matched"
+			end
+
+			if findTopLevel(a, b, { [".."] = true }) then
+				return "text"
+			end
+
+			local art = findTopLevel(a, b, ARITH)
+			if art then
+				local got = inferRange(a, art - 1, skipValueName, depth)
+				if got and got ~= "number" then
+					return got
+				end
+				return "number"
+			end
+
+			local head = toks[a]
+			if head.k == "kw" and head.v == "not" then
+				local got = inferRange(a + 1, b, skipValueName, depth)
+				return got and ("not_" .. lower(got)) or "flag"
+			end
+			if head.k == "op" and head.v == "#" then
+				local got = inferRange(a + 1, b, skipValueName, depth)
+				return got and (got .. "_count") or "count"
+			end
+			if head.k == "op" and head.v == "-" then
+				return inferRange(a + 1, b, skipValueName, depth)
+			end
+			if head.k == "kw" and head.v == "if" then
+				local thenTok = findTopLevel(a, b, { ["then"] = true })
+				if thenTok then
+					return inferRange(thenTok + 1, b, skipValueName, depth)
+				end
+				return nil
+			end
+
+			local chain = suffixChain(a, b)
+			if chain then
+				return nameFromChain(chain, skipValueName)
+			end
+			return nil
+		end
+
+		----------------------------------------------------------------
+		-- parameter inference, from how the parameter is used
+		----------------------------------------------------------------
+
+		local function operandAfter(i, limit)
+			local depth = 0
+			for j = i, limit do
+				local t = toks[j]
+				if t.nl and j > i and depth == 0 then
+					return j - 1
+				end
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						if depth == 0 then
+							return j - 1
+						end
+						depth = depth - 1
+					elseif depth == 0 and (t.v == "," or t.v == ";") then
+						return j - 1
+					end
+				elseif t.k == "kw" and depth == 0 and (LOGIC[t.v] or t.v == "then" or t.v == "do" or STOPPERS[t.v]) then
+					return j - 1
+				end
+			end
+			return limit
+		end
+
+		local function operandBefore(i, limit)
+			local depth = 0
+			for j = i, limit, -1 do
+				local t = toks[j]
+				if t.k == "op" then
+					if CLOSE[t.v] then
+						depth = depth + 1
+					elseif OPEN[t.v] then
+						if depth == 0 then
+							return j + 1
+						end
+						depth = depth - 1
+					elseif depth == 0 and (t.v == "," or t.v == ";" or t.v == "=") then
+						return j + 1
+					end
+				elseif t.k == "kw" and depth == 0 and (LOGIC[t.v] or t.v == "then" or t.v == "if" or STOPPERS[t.v]) then
+					return j + 1
+				end
+			end
+			return limit
+		end
+
+		local function inferParam(d)
+			local fn = d.fn
+			local bodyTo = (fn and fn.bodyTo) or ntoks
+			local bodyFrom = (fn and fn.bodyFrom) or 1
+
+			if fn and fn.name and d.slot == 1 and fn.paramCount == 1 then
+				local captured = match(fn.name, "^[Ss]et_?(%w.*)$")
+				if captured and captured ~= "" then
+					local clean = sanitize(captured)
+					if clean then
+						return clean
+					end
+				end
+			end
+
+			-- * only a bare `param == other` tells us what the parameter itself is;
+			-- * `param.Name == other` is about the field, not the parameter
+			local function isBareRef(ti)
+				local after = toks[ti + 1]
+				if after and after.k == "op" and (after.v == "." or after.v == ":" or after.v == "[" or after.v == "(") then
+					return false
+				end
+				local before = toks[ti - 1]
+				if before and before.k == "op" and (before.v == "." or before.v == ":") then
+					return false
+				end
+				return true
+			end
+
+			local refs = d.refs
+			for n = 1, #refs do
+				local ti = refs[n]
+				if isBareRef(ti) then
+					local after = toks[ti + 1]
+					if after and after.k == "op" and (after.v == "==" or after.v == "~=") then
+						local got = inferRange(ti + 2, operandAfter(ti + 2, bodyTo), true)
+						if got then
+							return got
+						end
+					end
+					local before = toks[ti - 1]
+					if before and before.k == "op" and (before.v == "==" or before.v == "~=") then
+						local got = inferRange(operandBefore(ti - 2, bodyFrom), ti - 2, true)
+						if got then
+							return got
+						end
+					end
+				end
+			end
+
+			for n = 1, #refs do
+				local ti = refs[n]
+				if isOp(ti - 1, "(") and toks[ti - 2] and toks[ti - 2].k == "name" then
+					local fname = toks[ti - 2].v
+					if METHODS[fname] == A1 and (isOp(ti - 3, ":") or isOp(ti - 3, ".")) then
+						local recv = toks[ti - 4]
+						if recv and recv.k == "name" and not isGenericName(recv.v) then
+							local base = sanitize(lower(singularize(recv.v)))
+							if base then
+								return base .. "_name"
+							end
+						end
+					end
+				end
+			end
+
+			local sawPlayer, sawInstance, sawCall, sawList = false, false, false, false
+			for n = 1, #refs do
+				local ti = refs[n]
+				if isOp(ti + 1, ".") and toks[ti + 2] and toks[ti + 2].k == "name" then
+					local field = toks[ti + 2].v
+					if PLAYER_FIELDS[field] then
+						sawPlayer = true
+					elseif field == "Name" or field == "Parent" or field == "ClassName" then
+						sawInstance = true
+					end
+				elseif isOp(ti + 1, ":") then
+					sawInstance = true
+				elseif isOp(ti + 1, "(") then
+					sawCall = true
+				elseif isOp(ti + 1, "[") or isOp(ti - 1, "#") then
+					sawList = true
+				end
+			end
+			if sawPlayer then
+				return "player"
+			end
+			if sawList then
+				return "list"
+			end
+			if sawCall then
+				return "callback"
+			end
+			if sawInstance then
+				return "instance"
+			end
+
+			local a = d.annotation
+			if a then
+				if a == "string" then
+					return "text"
+				elseif a == "number" then
+					return "number"
+				elseif a == "boolean" then
+					return "flag"
+				elseif a == "Instance" then
+					return "instance"
+				elseif a ~= "any" and a ~= "unknown" then
+					local clean = sanitize(lowerFirst(a))
+					if clean then
+						return clean
+					end
+				end
+			end
+
+			local generic = d.name
+			if find(generic, "^s%d+$") then
+				return "text"
+			elseif find(generic, "^n%d+$") then
+				return "number"
+			elseif find(generic, "^b%d+$") then
+				return "flag"
+			elseif find(generic, "^f%d+$") then
+				return "callback"
+			elseif find(generic, "^t%d+$") then
+				return "tbl"
+			end
+			return nil
+		end
+
+		local function inferLoop(d)
+			local info = d.loopInfo
+			if not info then
+				return nil
+			end
+			if info.numeric then
+				return (info.slot == 1) and "i" or "bound"
+			end
+			local base, generator = nil, nil
+			local collection = info.collection
+			if collection then
+				local gtok = toks[collection[1]]
+				if gtok and gtok.k == "name" then
+					generator = gtok.v
+				end
+				local chain = suffixChain(collection[1], collection[2])
+				local tail = chain and chain[#chain]
+				if tail and tail.kind == "call" and tail.args and tail.args[1] and tail.args[1][1] <= tail.args[1][2] then
+					base = inferRange(tail.args[1][1], tail.args[1][2], false)
+				end
+				if not base then
+					base = inferRange(collection[1], collection[2], false)
+				end
+			end
+			if info.count == 1 then
+				return base and singularize(base) or "item"
+			elseif info.slot == 1 then
+				return (generator == "ipairs" and "i") or "key"
+			elseif info.slot == 2 then
+				return base and singularize(base) or "value"
+			end
+			return "extra"
+		end
+
+		function rawNameOf(d)
+			if d.rawDone then
+				return d.raw
+			end
+			if d.busy then
+				return nil
+			end
+			d.busy = true
+			local got = nil
+			if d.kind == "param" then
+				got = inferParam(d)
+			elseif d.kind == "loop" then
+				got = inferLoop(d)
+			else
+				local exprs = d.exprs
+				for n = 1, (exprs and #exprs or 0) do
+					local e = exprs[n]
+					got = inferRange(e[1], e[2], false)
+					if got then
+						break
+					end
+				end
+			end
+			d.busy = false
+			d.raw = got and sanitize(got) or nil
+			d.rawDone = true
+			return d.raw
+		end
+
+		----------------------------------------------------------------
+		-- pass 1: declarations, references, scopes
+		----------------------------------------------------------------
+
+		local function newDecl(name, kind, tokIdx, extra)
+			local d = extra or {}
+			d.name = name
+			d.kind = kind
+			d.tokens = { tokIdx }
+			d.refs = {}
+			d.exprs = d.exprs or {}
+			d.rename = isGenericName(name)
+			d.fnRec = d.fn or currentFn()
+			if not d.rename then
+				taken[name] = true
+			end
+			decls[#decls + 1] = d
+			bindOf[tokIdx] = d
+			return d
+		end
+
+		local function skipType(i)
+			local depth = 0
+			local j = i
+			while j <= ntoks do
+				local t = toks[j]
+				if t.nl and j > i and depth == 0 then
+					return j - 1
+				end
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth = depth + 1
+					elseif CLOSE[t.v] then
+						if depth == 0 then
+							return j - 1
+						end
+						depth = depth - 1
+					elseif depth == 0 and (t.v == "," or t.v == "=" or t.v == ";") then
+						return j - 1
+					end
+				elseif t.k == "kw" and depth == 0 and STOPPERS[t.v] then
+					return j - 1
+				elseif t.k == "kw" and depth == 0 and (t.v == "do" or t.v == "then" or t.v == "in") then
+					return j - 1
+				end
+				j = j + 1
+			end
+			return ntoks
+		end
+
+		local pendingRegister = {}
+		local pendingPop = false
+		local braceStack = {}
+		local braceScope = {}
+		local nbrace = 0
+		local blocks = {} -- open blocks: "func" / "do" / "then" / "repeat" / "thenexpr"
+		local pendingIf = {} -- for every `if` seen: is it a statement (not a Luau if expression)?
+
+		local function popBlock()
+			while #blocks > 0 and blocks[#blocks] == "thenexpr" do
+				blocks[#blocks] = nil
+			end
+			if #blocks > 0 then
+				blocks[#blocks] = nil
+			end
+		end
+
+		-- * `if` starts a statement, or it is a Luau `if a then b else c` expression,
+		-- * which has no `end` and must not open a scope
+		local function isStatementIf(i)
+			local t = toks[i]
+			if t.nl then
+				return true
+			end
+			local prev = toks[i - 1]
+			if not prev then
+				return true
+			end
+			if prev.k == "op" and prev.v == ";" then
+				return true
+			end
+			if prev.k == "kw" and (prev.v == "then" or prev.v == "else" or prev.v == "do" or prev.v == "repeat" or prev.v == "end") then
+				return true
+			end
+			return false
+		end
+
+		local function queueRegister(at, list)
+			if #list == 0 then
+				return
+			end
+			local bucket = pendingRegister[at]
+			if not bucket then
+				bucket = {}
+				pendingRegister[at] = bucket
+			end
+			for n = 1, #list do
+				bucket[#bucket + 1] = list[n]
+			end
+		end
+
+		local ti = 1
+		while ti <= ntoks do
+			local bucket = pendingRegister[ti]
+			if bucket then
+				for n = 1, #bucket do
+					local d = bucket[n]
+					scopes[nscopes][d.name] = d
+				end
+				pendingRegister[ti] = nil
+			end
+
+			local t = toks[ti]
+			if pendingPop and t.nl then
+				popScope(ti)
+				pendingPop = false
+			end
+
+			if t.k == "op" then
+				if t.v == "{" or t.v == "(" or t.v == "[" then
+					nbrace = nbrace + 1
+					braceStack[nbrace] = (t.v == "{") and "table" or "other"
+					braceScope[nbrace] = nscopes
+				elseif CLOSE[t.v] then
+					if nbrace > 0 then
+						braceStack[nbrace] = nil
+						braceScope[nbrace] = nil
+						nbrace = nbrace - 1
+					end
+				end
+				ti = ti + 1
+			elseif t.k == "kw" then
+				local kw = t.v
+				if kw == "local" then
+					if isKw(ti + 1, "function") and toks[ti + 2] and toks[ti + 2].k == "name" then
+						local d = newDecl(toks[ti + 2].v, "localfunc", ti + 2)
+						scopes[nscopes][d.name] = d
+						ti = ti + 1
+					else
+						local slots = {}
+						local j = ti + 1
+						while toks[j] and toks[j].k == "name" do
+							local slot = { tok = j, name = toks[j].v }
+							slots[#slots + 1] = slot
+							j = j + 1
+							if isOp(j, ":") then
+								local typeEnd = skipType(j + 1)
+								if typeEnd == j + 1 and toks[j + 1] and toks[j + 1].k == "name" then
+									slot.annotation = toks[j + 1].v
+								end
+								j = typeEnd + 1
+							end
+							if isOp(j, ",") then
+								j = j + 1
+							else
+								break
+							end
+						end
+						if #slots == 0 then
+							ti = ti + 1
+						else
+							local created = {}
+							local registerAt = j
+							local parts = nil
+							if isOp(j, "=") then
+								local exprEnd = stmtEnd(j + 1)
+								parts = splitCommas(j + 1, exprEnd)
+								registerAt = exprEnd + 1
+							end
+							for n = 1, #slots do
+								local slot = slots[n]
+								local d = {
+									annotation = slot.annotation,
+									exprs = {},
+								}
+								d = newDecl(slot.name, "local", slot.tok, d)
+								if parts then
+									local p = parts[n] or parts[#parts]
+									if p and p[1] <= p[2] then
+										d.exprs[1] = p
+									end
+								end
+								created[#created + 1] = d
+								scopes[nscopes][slot.name] = nil
+							end
+							queueRegister(registerAt, created)
+							ti = slots[#slots].tok + 1
+						end
+					end
+				elseif kw == "function" then
+					local fn = { paramCount = 0, bodyFrom = ti, bodyTo = ntoks }
+					local j = ti + 1
+					if toks[j] and toks[j].k == "name" then
+						fn.name = toks[j].v
+						if not isGenericName(fn.name) then
+							taken[fn.name] = true
+						end
+						j = j + 1
+						while (isOp(j, ".") or isOp(j, ":")) and toks[j + 1] and toks[j + 1].k == "name" do
+							fn.name = toks[j + 1].v
+							j = j + 2
+						end
+					else
+						local prev = toks[ti - 1]
+						if prev and prev.k == "op" and prev.v == "=" then
+							local owner = toks[ti - 2]
+							if owner and owner.k == "name" then
+								fn.name = owner.v
+							elseif owner and owner.k == "str" then
+								fn.name = stringContents(owner.v)
+							end
+						end
+					end
+					blocks[#blocks + 1] = "func"
+					pushScope(fn)
+					if isOp(j, "(") then
+						local close = matchPair(j)
+						local k = j + 1
+						local slot = 0
+						while k < close do
+							local pt = toks[k]
+							if pt.k == "name" then
+								slot = slot + 1
+								local annotation = nil
+								local after = k + 1
+								if isOp(after, ":") then
+									local typeEnd = skipType(after + 1)
+									if typeEnd == after + 1 and toks[after + 1] and toks[after + 1].k == "name" then
+										annotation = toks[after + 1].v
+									end
+									after = typeEnd + 1
+								end
+								if pt.v ~= "self" then
+									local d = newDecl(pt.v, "param", k, { fn = fn, slot = slot, annotation = annotation })
+									scopes[nscopes][pt.v] = d
+								end
+								k = after
+							else
+								k = k + 1
+							end
+						end
+						fn.paramCount = slot
+						fn.bodyFrom = close + 1
+						ti = close + 1
+					else
+						ti = j
+					end
+				elseif kw == "for" then
+					local names = {}
+					local j = ti + 1
+					while toks[j] and toks[j].k == "name" do
+						names[#names + 1] = { tok = j, name = toks[j].v }
+						j = j + 1
+						if isOp(j, ":") then
+							j = skipType(j + 1) + 1
+						end
+						if isOp(j, ",") then
+							j = j + 1
+						else
+							break
+						end
+					end
+					local doTok = nil
+					for m = j, ntoks do
+						if isKw(m, "do") then
+							doTok = m
+							break
+						end
+					end
+					local numeric = isOp(j, "=")
+					local collection = nil
+					if not numeric and isKw(j, "in") and doTok and doTok > j + 1 then
+						collection = { j + 1, doTok - 1 }
+					end
+					local created = {}
+					for n = 1, #names do
+						local d = newDecl(names[n].name, "loop", names[n].tok, {
+							loopInfo = {
+								numeric = numeric,
+								slot = n,
+								count = #names,
+								collection = collection,
+							},
+						})
+						created[#created + 1] = d
+						scopes[nscopes][names[n].name] = nil
+					end
+					queueRegister((doTok and doTok + 1) or j, created)
+					ti = (names[#names] and names[#names].tok + 1) or (ti + 1)
+				elseif kw == "if" then
+					pendingIf[#pendingIf + 1] = isStatementIf(ti)
+					ti = ti + 1
+				elseif kw == "then" then
+					local isStmt = true
+					if #pendingIf > 0 then
+						isStmt = pendingIf[#pendingIf]
+						pendingIf[#pendingIf] = nil
+					end
+					if isStmt then
+						blocks[#blocks + 1] = "then"
+						pushScope(nil)
+					else
+						blocks[#blocks + 1] = "thenexpr"
+					end
+					ti = ti + 1
+				elseif kw == "do" or kw == "repeat" then
+					blocks[#blocks + 1] = kw
+					pushScope(nil)
+					ti = ti + 1
+				elseif kw == "end" then
+					popBlock()
+					popScope(ti)
+					ti = ti + 1
+				elseif kw == "until" then
+					popBlock()
+					pendingPop = true
+					ti = ti + 1
+				elseif kw == "else" then
+					if blocks[#blocks] == "thenexpr" then
+						blocks[#blocks] = nil
+					else
+						popScope(ti)
+						pushScope(nil)
+					end
+					ti = ti + 1
+				elseif kw == "elseif" then
+					if blocks[#blocks] == "thenexpr" then
+						blocks[#blocks] = nil
+						pendingIf[#pendingIf + 1] = false
+					else
+						popBlock()
+						popScope(ti)
+						pendingIf[#pendingIf + 1] = true
+					end
+					ti = ti + 1
+				else
+					ti = ti + 1
+				end
+			elseif t.k == "name" then
+				local prev = toks[ti - 1]
+				local isField = prev ~= nil and prev.k == "op" and (prev.v == "." or prev.v == ":")
+				local isKey = false
+				-- * a table key, but only when we are directly inside the constructor;
+				-- * `{ f = function() v16 = 1 end }` assigns to the variable, it is no key
+				if not isField and braceStack[nbrace] == "table" and braceScope[nbrace] == nscopes and isOp(ti + 1, "=") then
+					if prev and prev.k == "op" and (prev.v == "{" or prev.v == "," or prev.v == ";") then
+						isKey = true
+					end
+				end
+				if not isField and not isKey then
+					local d = lookup(t.v)
+					if d then
+						bindOf[ti] = d
+						if d.rename then
+							d.refs[#d.refs + 1] = ti
+							d.tokens[#d.tokens + 1] = ti
+							if isOp(ti + 1, "=") and (t.nl or (prev and prev.k == "op" and prev.v == ";")) then
+								local e = stmtEnd(ti + 2)
+								if ti + 2 <= e then
+									d.exprs[#d.exprs + 1] = { ti + 2, e }
+								end
+							end
+						end
+					elseif not RESERVED[t.v] and not isGenericName(t.v) then
+						taken[t.v] = true
+					end
+				end
+				ti = ti + 1
+			else
+				ti = ti + 1
+			end
+		end
+
+		----------------------------------------------------------------
+		-- pass 2: settle on the final names and write them back
+		----------------------------------------------------------------
+
+		local FALLBACK = { param = "value", loop = "item", ["local"] = "value", localfunc = "callback" }
+		local renamed = 0
+
+		-- * A name is free for this declaration when nothing in the source already uses it
+		-- * and no other new name in this function or any function enclosing it uses it.
+		-- * Sibling functions can therefore reuse the same name without ever shadowing.
+		local function isFree(name, fnRec)
+			if taken[name] or RESERVED[name] then
+				return false
+			end
+			local rec = fnRec
+			while rec do
+				if rec.used and rec.used[name] then
+					return false
+				end
+				rec = rec.parent
+			end
+			return true
+		end
+
+		for n = 1, #decls do
+			local d = decls[n]
+			if d.rename then
+				local base = rawNameOf(d)
+				if not base or base == "" then
+					base = FALLBACK[d.kind] or "value"
+				end
+				local fnRec = d.fnRec or rootFn
+				local final, suffix = base, 1
+				while not isFree(final, fnRec) or isGenericName(final) do
+					suffix = suffix + 1
+					final = base .. "_" .. suffix
+					if isGenericName(final) or suffix > 400 then
+						-- * `i_7` would just be another generic name, so widen the base instead
+						base = ALIAS[base] or (base .. "_value")
+						suffix = 1
+						final = base
+					end
+				end
+				fnRec.used = fnRec.used or {}
+				fnRec.used[final] = true
+				d.final = final
+				for m = 1, #d.tokens do
+					pieces[toks[d.tokens[m]].i] = final
+				end
+				renamed = renamed + 1
+			end
+		end
+
+		-- * debug only: a fingerprint of "which declaration does every identifier bind to".
+		-- * Renaming must never change it; the test harness compares input against output.
+		local bindings = nil
+		if wantBindings then
+			local out = {}
+			for i = 1, ntoks do
+				if toks[i].k == "name" then
+					local d = bindOf[i]
+					out[#out + 1] = d and d.tokens[1] or 0
+				end
+			end
+			bindings = concat(out, ",")
+		end
+
+		if renamed == 0 then
+			return src, bindings
+		end
+		return concat(pieces), bindings
+	end
+end
+
 local function synsaveinstance(CustomOptions, CustomOptions2)
 	if GLOBAL_ENV.USSI then
 		return
@@ -1882,6 +3661,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- MaxThreads = 3 -- Description: The number of decompilation threads that can run at once. More threads means it can decompile for scripts at a time.
 		-- DisableCompression = false, --Description: Disables compression in the binary output
 
+		RenameVariables = true,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -2154,6 +3934,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 	local TreatUnionsAsParts = OPTIONS.TreatUnionsAsParts
 
+	local RenameVariables = OPTIONS.RenameVariables
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
 		OPTIONS.scriptcache = true
@@ -2581,6 +4362,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local output
 				if ok then
 					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+					if RenameVariables then
+						local renamed_ok, renamed = pcall(RenameDecompiledVariables, result)
+						if renamed_ok and type(renamed) == "string" and renamed ~= "" then
+							result = renamed
+						elseif __DEBUG_MODE then
+							__DEBUG_MODE("RenameVariables failed, keeping the original output for", script:GetFullName(), renamed)
+						end
+					end
 					output = result
 				else
 					output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
