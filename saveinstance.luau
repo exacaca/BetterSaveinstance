@@ -1725,6 +1725,16 @@ All options are case insensitive.
   - Names already present in the script, strings, comments, table keys and formatting are left exactly as they were. Each new name is unique within its function and every function enclosing it, so nothing can be shadowed.
   - Variables it cannot infer a name for become `value`, `instance`, `list`, `callback`, ... never `v14`.
   - Default: true
+- StripComments: `boolean`
+  - Removes the bookkeeping comments decompilers add, for clean output.
+    - `-- Decompiled with <name>'s decompiler.`, `-- Decompiled on ...`, `-- Script hash: ...`, `-- Time taken: ...`
+    - `-- [[ Script name: X, time of decompilation: ... ]]`
+    - `-- upvalues: u4 (copy), u1 (copy)`
+    - `-- Line: 9, Name: add_entries` (and `-- line: 14`)
+    - The per-script `-- Saved by UniversalSynSaveInstance ...` header. The credit string is still present in the saved file's header and footer, as the LICENSE requires.
+  - Comments the original author wrote are kept, as is `-- Original Source: ...`. Anything not in the list above is left alone.
+  - Works on a real lexer, so `-- upvalues:` appearing inside a string is never touched.
+  - Default: true
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
   - Enables the option ScriptCache
@@ -1864,7 +1874,7 @@ All options are case insensitive.
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables
+local RenameDecompiledVariables, StripDecompilerComments
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -1911,6 +1921,22 @@ do
 	local LOGIC = { ["and"] = true, ["or"] = true }
 	local COMPARE = { ["=="] = true, ["~="] = true, ["!="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true }
 	local ARITH = { ["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true, ["//"] = true }
+
+	-- * Comments a decompiler bolts on, which say nothing about the code itself.
+	-- * Anything not listed here is left alone.
+	local NOISE_COMMENTS = {
+		"^%-%-%s*Saved by UniversalSynSaveInstance",
+		"^%-%-%s*Decompiled with",
+		"^%-%-%s*Decompiled on",
+		"^%-%-%s*Decompiled using",
+		"^%-%-%s*Decompiled by",
+		"^%-%-%s*Decompiler[:%s]",
+		"^%-%-%s*Script hash:",
+		"^%-%-%s*Time taken:",
+		"^%-%-%s*[Uu]pvalues?:",
+		"^%-%-%s*[Ll]ine:?%s*%d",
+		"^%-%-%s*%[+%s*Script name:",
+	}
 
 	-- * hoisted so the hot path does not allocate a table per lookup
 	local SET_CONCAT = { [".."] = true }
@@ -2151,14 +2177,20 @@ do
 	--------------------------------------------------------------------------
 
 	local function lex(src)
-		local pieces, toks = {}, {}
-		local np, nt = 0, 0
+		local pieces, toks, comments = {}, {}, {}
+		local np, nt, nc = 0, 0, 0
 		local total = #src
 		local pendingNL = true
 
 		local function pushRaw(s)
 			np = np + 1
 			pieces[np] = s
+		end
+		local function pushComment(s)
+			np = np + 1
+			pieces[np] = s
+			nc = nc + 1
+			comments[nc] = np
 		end
 		local function pushTok(s, kind)
 			np = np + 1
@@ -2196,7 +2228,7 @@ do
 					if find(w, "\n", 1, true) then
 						pendingNL = true
 					end
-					pushRaw(w)
+					pushComment(w)
 					i = stop + 1
 				elseif c == "[" and find(src, "^%[=*%[", i) then
 					local bs, be = find(src, "^%[=*%[", i)
@@ -2322,12 +2354,65 @@ do
 		end
 
 		lexChunk(1, total)
-		return pieces, toks, nt
+		return pieces, toks, nt, comments, nc
 	end
 
 	--------------------------------------------------------------------------
 	-- main entry point
 	--------------------------------------------------------------------------
+
+	--------------------------------------------------------------------------
+	-- Strips the bookkeeping comments decompilers emit, leaving real code and
+	-- real comments untouched. Uses the same lexer, so nothing inside a string
+	-- is ever mistaken for a comment.
+	--------------------------------------------------------------------------
+
+	function StripDecompilerComments(src)
+		if type(src) ~= "string" or src == "" then
+			return src
+		end
+		if not find(src, "%-%-", 1, false) then
+			return src
+		end
+
+		local pieces, _, _, comments, ncomments = lex(src)
+		if ncomments == 0 then
+			return src
+		end
+
+		local removed = 0
+		for n = 1, ncomments do
+			local at = comments[n]
+			local text = pieces[at]
+			local noise = false
+			for m = 1, #NOISE_COMMENTS do
+				if find(text, NOISE_COMMENTS[m]) then
+					noise = true
+					break
+				end
+			end
+			if noise then
+				pieces[at] = ""
+				local before = pieces[at - 1]
+				if before and find(before, "^[ \t\r\n]*$") then
+					-- * drop the whole line when the comment sat on one of its own,
+					-- * otherwise just the spacing that led up to it
+					if find(before, "\n[ \t]*$") then
+						pieces[at - 1] = gsub(before, "\n[ \t]*$", "")
+					else
+						pieces[at - 1] = gsub(before, "[ \t]+$", "")
+					end
+				end
+				removed = removed + 1
+			end
+		end
+
+		if removed == 0 then
+			return src
+		end
+		-- * leading whitespace cannot be inside a string literal, so this is safe
+		return (gsub(concat(pieces), "^[ \t\r\n]+", ""))
+	end
 
 	function RenameDecompiledVariables(src, wantBindings)
 		if type(src) ~= "string" or #src < 8 then
@@ -3401,11 +3486,28 @@ do
 						end
 					end
 				elseif kw == "function" then
+					-- * `callback: function?` is a type annotation, not a definition. Decompilers
+					-- * emit those, and opening a scope for one would leave it unclosed.
+					if isOp(ti - 1, ":") or isOp(ti - 1, "::") then
+						ti = ti + 1
+					else
 					local fn = { paramCount = 0, bodyFrom = ti, bodyTo = ntoks }
 					local j = ti + 1
 					if toks[j] and toks[j].k == "name" then
 						fn.name = toks[j].v
-						if not isGenericName(fn.name) then
+						-- * `function u1.new()` assigns THROUGH the local `u1`, so the base
+						-- * name is an ordinary reference and has to be renamed along with
+						-- * its declaration. Only the `.field` / `:method` parts are fields.
+						local baseDecl = lookup(fn.name)
+						if baseDecl then
+							if baseDecl.tokens[1] ~= j then -- not the `local function f` name itself
+								bindOf[j] = baseDecl
+								if baseDecl.rename then
+									baseDecl.refs[#baseDecl.refs + 1] = j
+									baseDecl.tokens[#baseDecl.tokens + 1] = j
+								end
+							end
+						elseif not RESERVED[fn.name] and not isGenericName(fn.name) then
 							taken[fn.name] = true
 						end
 						j = j + 1
@@ -3457,6 +3559,7 @@ do
 						ti = close + 1
 					else
 						ti = j
+					end
 					end
 				elseif kw == "for" then
 					local names = {}
@@ -3706,6 +3809,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- DisableCompression = false, --Description: Disables compression in the binary output
 
 		RenameVariables = true,
+		StripComments = true,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -3979,6 +4083,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local TreatUnionsAsParts = OPTIONS.TreatUnionsAsParts
 
 	local RenameVariables = OPTIONS.RenameVariables
+	local StripComments = OPTIONS.StripComments
 	local RenameStats = { time = 0, count = 0 }
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
@@ -4410,6 +4515,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local output
 				if ok then
 					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+					if StripComments then
+						local stripped_ok, stripped = pcall(StripDecompilerComments, result)
+						if stripped_ok and type(stripped) == "string" and stripped ~= "" then
+							result = stripped
+						elseif __DEBUG_MODE then
+							__DEBUG_MODE("StripComments failed, keeping the original output for", script:GetFullName(), stripped)
+						end
+					end
 					if RenameVariables then
 						local renameStarted = os.clock()
 						local renamed_ok, renamed = pcall(RenameDecompiledVariables, result)
@@ -5103,7 +5216,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 											end
 										end
 
-										value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
+										-- * The credit string stays in the file header and footer either way
+										value = (StripComments and "" or "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n")
 											.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
 											.. value
 									end
