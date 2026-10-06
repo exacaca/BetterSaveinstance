@@ -1708,9 +1708,11 @@ All options are case insensitive.
   - Caches decompiled scripts, so if a script with the same bytecode appears in a game multiple times, it only needs to be decompiled once.
   - Default: true
 - decomptype: `string`
-  - "custom" - for a built-in custom decompiler.
+  - "builtin" - BetterDecompiler, included in this script: rebuilds if / elseif / while / repeat / for / break / continue, and/or expressions, `x = a and b or c`, table constructors, method calls and named functions straight from the bytecode, and never emits goto. A function whose structure cannot be rebuilt is emitted in an exact low-level form instead (marked "[low-level]"). If it cannot read a script at all (e.g. a newer bytecode version), the executor's decompiler is used for that script. Default.
+  - "executor" - your executor's own decompiler.
+  - "custom" - Konstant.
   - Uses Konstant 2.1, locally hosted instead of the API to increase speed. ([Konstant Discord Server](https://discord.gg/wyButjTMhM), [Konstant Decompiled Source Code](https://raw.githubusercontent.com/exacaca/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau))
-  - Default: Your executor's decompiler, if available. Otherwise uses "custom" if not.
+  - Default: "builtin"
 - timeout: `number`
   - If the decompilation run time exceeds this value it gets cancelled.
   - Set to -1 to disable timeout (unreliable).
@@ -1731,13 +1733,18 @@ All options are case insensitive.
     - A label immediately after a loop's `end`: every `goto` to it becomes `break`
     - The label itself is then removed
   - Only provably equivalent jumps are rewritten. The jump must be in the same function and the same loop as its label, and must be the last statement of its block, which is what Luau requires of `continue` / `break`. If even one jump to a label does not qualify, that label and all of its jumps are left exactly as they were. `repeat ... until` loops are skipped, as Luau restricts `continue` there.
-  - A `goto l0` whose label is missing entirely cannot be rewritten (the decompiler lost the loop structure); see DecompilerFallback.
+  - A `goto l0` whose label is missing entirely cannot be rewritten (the decompiler lost the loop structure); see RebuildFromBytecode.
+  - Default: true
+- RebuildFromBytecode: `boolean`
+  - Every decompiled script is compiled (never run) with loadstring to check it is valid Luau, and scanned for `until x == x` (a decompiler naming bug that makes a loop stop after one pass).
+  - Any function that fails either check is rebuilt straight from the script's bytecode and spliced into the decompiled output. The rebuilt function behaves exactly like the original (it is low level: registers are `__R[n]`, jumps set `__pc`), and the decompiler's readable attempt is kept in a comment right above it. Search the output for "rebuilt from bytecode".
+  - If the problem is in the main body of the script (not inside a function), the whole script is rebuilt this way, with the decompiler's attempt kept in a comment at the end.
+  - Invalid `p1: function` / `p1: function?` type annotations are always repaired first.
+  - Supports Luau bytecode versions 3 to 6 (plain and Roblox-encoded opcodes).
   - Default: true
 - DecompilerFallback: `boolean`
-  - Every decompiled script is compiled (never run) with loadstring to check that it is valid Luau. Invalid `p1: function` / `p1: function?` type annotations are always repaired first.
-  - If the output still does not compile, the script is decompiled again with Konstant, and Konstant's output is used only if it compiles.
-  - If neither compiles, the main decompiler's output is kept with a `-- WARNING: This decompiled script does NOT compile` header, so broken scripts are easy to search for in Studio.
-  - Has no effect when Konstant is already the main decompiler.
+  - If a script still does not compile after the function rebuild above, it is decompiled again with Konstant, and Konstant's output is used only if it compiles and Konstant reported no failed functions (KONSTANTERROR).
+  - If nothing works, the decompiler's output is kept with a `-- WARNING: This decompiled script does NOT compile` header that says why.
   - Default: true
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
@@ -1874,11 +1881,4262 @@ All options are case insensitive.
 - ) → ()
 ]=]
 
+-- * BytecodeLifter: turns Luau bytecode (v3-v6) back into Luau source that does exactly
+-- * what the bytecode does. Every register is a slot in `__R`, every jump is an assignment
+-- * to `__pc`, so ANY control flow (the kind decompilers fail on and emit `goto` for) is
+-- * reproduced exactly. Registers captured by closures live in boxes (`__X`) that are
+-- * swapped on CLOSEUPVALS, which is how the VM gives each loop iteration a fresh upvalue.
+local BytecodeLifter = {}
+do
+	local band, bor, rshift = bit32.band, bit32.bor, bit32.rshift
+	local fmt, concat, rep = string.format, table.concat, string.rep
+
+	local OP_NAMES = {
+		[0] = "NOP", "BREAK", "LOADNIL", "LOADB", "LOADN", "LOADK", "MOVE", "GETGLOBAL", "SETGLOBAL",
+		"GETUPVAL", "SETUPVAL", "CLOSEUPVALS", "GETIMPORT", "GETTABLE", "SETTABLE", "GETTABLEKS",
+		"SETTABLEKS", "GETTABLEN", "SETTABLEN", "NEWCLOSURE", "NAMECALL", "CALL", "RETURN", "JUMP",
+		"JUMPBACK", "JUMPIF", "JUMPIFNOT", "JUMPIFEQ", "JUMPIFLE", "JUMPIFLT", "JUMPIFNOTEQ",
+		"JUMPIFNOTLE", "JUMPIFNOTLT", "ADD", "SUB", "MUL", "DIV", "MOD", "POW", "ADDK", "SUBK", "MULK",
+		"DIVK", "MODK", "POWK", "AND", "OR", "ANDK", "ORK", "CONCAT", "NOT", "MINUS", "LENGTH",
+		"NEWTABLE", "DUPTABLE", "SETLIST", "FORNPREP", "FORNLOOP", "FORGLOOP", "FORGPREP_INEXT",
+		"FASTCALL3", "FORGPREP_NEXT", "NATIVECALL", "GETVARARGS", "DUPCLOSURE", "PREPVARARGS",
+		"LOADKX", "JUMPX", "FASTCALL", "COVERAGE", "CAPTURE", "SUBRK", "DIVRK", "FASTCALL1",
+		"FASTCALL2", "FASTCALL2K", "FORGPREP", "JUMPXEQKNIL", "JUMPXEQKB", "JUMPXEQKN", "JUMPXEQKS",
+		"IDIV", "IDIVK",
+	}
+	local OP = {}
+	for code = 0, #OP_NAMES do
+		OP[OP_NAMES[code]] = code
+	end
+	local OP_COUNT = #OP_NAMES + 1
+
+	local HAS_AUX = {}
+	for _, name in
+		{
+			"GETGLOBAL", "SETGLOBAL", "GETIMPORT", "GETTABLEKS", "SETTABLEKS", "NAMECALL", "JUMPIFEQ",
+			"JUMPIFLE", "JUMPIFLT", "JUMPIFNOTEQ", "JUMPIFNOTLE", "JUMPIFNOTLT", "NEWTABLE", "SETLIST",
+			"FORGLOOP", "LOADKX", "FASTCALL2", "FASTCALL2K", "FASTCALL3", "JUMPXEQKNIL", "JUMPXEQKB",
+			"JUMPXEQKN", "JUMPXEQKS",
+		}
+	do
+		HAS_AUX[OP[name]] = true
+	end
+
+	local KEYWORDS = {}
+	for word in string.gmatch(
+		"and break do else elseif end false for function if in local nil not or repeat return then true until while continue",
+		"%S+"
+	) do
+		KEYWORDS[word] = true
+	end
+
+	local function isIdent(s)
+		return type(s) == "string" and string.match(s, "^[%a_][%w_]*$") ~= nil and not KEYWORDS[s]
+	end
+	BytecodeLifter.isIdent = isIdent
+
+	--------------------------------------------------------------------------
+	-- parsing
+	--------------------------------------------------------------------------
+
+	local function parse(bytecode)
+		local buf = buffer.fromstring(bytecode)
+		local size = #bytecode
+		local pos = 0
+		local function need(n)
+			if pos + n > size then
+				error("truncated bytecode", 0)
+			end
+		end
+		local function u8()
+			need(1)
+			local v = buffer.readu8(buf, pos)
+			pos += 1
+			return v
+		end
+		local function u32()
+			need(4)
+			local v = buffer.readu32(buf, pos)
+			pos += 4
+			return v
+		end
+		local function varint()
+			local result, scale = 0, 1
+			for _ = 1, 5 do
+				local b = u8()
+				result += band(b, 127) * scale
+				if b < 128 then
+					return result
+				end
+				scale *= 128
+			end
+			error("bad varint", 0)
+		end
+
+		local version = u8()
+		if version == 0 then
+			error("the script failed to compile: " .. string.sub(bytecode, 2), 0)
+		elseif version < 3 or version > 6 then
+			error("unsupported bytecode version " .. version, 0)
+		end
+		local typesVersion = 0
+		if version >= 4 then
+			typesVersion = u8()
+			if typesVersion > 3 then
+				error("unsupported types version " .. typesVersion, 0)
+			end
+		end
+
+		local strings = {}
+		for i = 1, varint() do
+			local len = varint()
+			need(len)
+			strings[i] = buffer.readstring(buf, pos, len)
+			pos += len
+		end
+		if typesVersion == 3 then
+			local index = u8()
+			while index ~= 0 do
+				varint()
+				index = u8()
+			end
+		end
+
+		local protos = {}
+		local protoCount = varint()
+		for id = 0, protoCount - 1 do
+			local p = { id = id }
+			p.maxstack = u8()
+			p.numparams = u8()
+			p.nups = u8()
+			p.isvararg = u8() ~= 0
+			if version >= 4 then
+				p.flags = u8()
+				local typesize = varint()
+				need(typesize)
+				pos += typesize
+			end
+			local sizecode = varint()
+			p.codeOffset = pos
+			local code = {}
+			for i = 0, sizecode - 1 do
+				code[i] = u32()
+			end
+			p.code, p.sizecode = code, sizecode
+
+			local k = {}
+			for i = 0, varint() - 1 do
+				local t = u8()
+				if t == 0 then
+					k[i] = { t = "nil" }
+				elseif t == 1 then
+					k[i] = { t = "boolean", v = u8() ~= 0 }
+				elseif t == 2 then
+					need(8)
+					k[i] = { t = "number", v = buffer.readf64(buf, pos) }
+					pos += 8
+				elseif t == 3 then
+					k[i] = { t = "string", v = strings[varint()] }
+				elseif t == 4 then
+					k[i] = { t = "import", v = u32() }
+				elseif t == 5 then
+					local keys = {}
+					for j = 1, varint() do
+						keys[j] = varint()
+					end
+					k[i] = { t = "table", v = keys }
+				elseif t == 6 then
+					k[i] = { t = "closure", v = varint() }
+				elseif t == 7 then
+					need(16)
+					k[i] = {
+						t = "vector",
+						v = {
+							buffer.readf32(buf, pos),
+							buffer.readf32(buf, pos + 4),
+							buffer.readf32(buf, pos + 8),
+							buffer.readf32(buf, pos + 12),
+						},
+					}
+					pos += 16
+				else
+					error("unsupported constant type " .. t, 0)
+				end
+			end
+			p.k = k
+
+			local children = {}
+			for i = 0, varint() - 1 do
+				children[i] = varint()
+			end
+			p.p = children
+			p.linedefined = varint()
+			local debugname = varint()
+			p.debugname = debugname ~= 0 and strings[debugname] or nil
+
+			if u8() ~= 0 then -- line info
+				local gaplog2 = u8()
+				local intervals = rshift(sizecode - 1, gaplog2) + 1
+				local lineinfo, abslineinfo = {}, {}
+				local last = 0
+				for i = 0, sizecode - 1 do
+					last = (last + u8()) % 256
+					lineinfo[i] = last
+				end
+				local lastline = 0
+				for i = 0, intervals - 1 do
+					need(4)
+					lastline += buffer.readi32(buf, pos)
+					pos += 4
+					abslineinfo[i] = lastline
+				end
+				p.lineOf = function(pc)
+					local base = abslineinfo[rshift(pc, gaplog2)]
+					return base and base + lineinfo[pc] or nil
+				end
+			end
+			if u8() ~= 0 then -- debug info
+				for _ = 1, varint() do
+					varint()
+					varint()
+					varint()
+					u8()
+				end
+				for _ = 1, varint() do
+					varint()
+				end
+			end
+			protos[id] = p
+		end
+		local main = varint()
+		if not protos[main] then
+			error("bad main proto", 0)
+		end
+
+		-- * Roblox stores opcodes multiplied by 227 (mod 256). 203 is its inverse.
+		local function validWith(decode)
+			for id = 0, protoCount - 1 do
+				local p = protos[id]
+				local pc = 0
+				while pc < p.sizecode do
+					local op = decode(p.code[pc])
+					if op >= OP_COUNT then
+						return false
+					end
+					pc += HAS_AUX[op] and 2 or 1
+				end
+				if pc ~= p.sizecode then
+					return false
+				end
+			end
+			return true
+		end
+		local function vanilla(insn)
+			return band(insn, 255)
+		end
+		local function encoded(insn)
+			return (band(insn, 255) * 203) % 256
+		end
+		local first = protos[main].code[0]
+		local decode
+		if first and vanilla(first) == OP.PREPVARARGS and validWith(vanilla) then
+			decode = vanilla
+		elseif first and encoded(first) == OP.PREPVARARGS and validWith(encoded) then
+			decode = encoded
+		elseif validWith(vanilla) then
+			decode = vanilla
+		elseif validWith(encoded) then
+			decode = encoded
+		else
+			error("could not decode the opcodes", 0)
+		end
+
+		return { version = version, protos = protos, main = main, decode = decode, strings = strings }
+	end
+	BytecodeLifter.parse = parse
+
+	--------------------------------------------------------------------------
+	-- source generation
+	--------------------------------------------------------------------------
+
+	local function strLit(s)
+		return '"'
+			.. string.gsub(s, '[%c"\\]', function(c)
+				if c == "\n" then
+					return "\\n"
+				elseif c == "\t" then
+					return "\\t"
+				elseif c == "\r" then
+					return "\\r"
+				elseif c == '"' or c == "\\" then
+					return "\\" .. c
+				end
+				return fmt("\\%03d", string.byte(c))
+			end)
+			.. '"'
+	end
+
+	local function numLit(n)
+		if n ~= n then
+			return "(0/0)"
+		elseif n == math.huge then
+			return "(1/0)"
+		elseif n == -math.huge then
+			return "(-1/0)"
+		elseif n == 0 then
+			return (1 / n < 0) and "(-0)" or "0"
+		end
+		local s
+		if n == math.floor(n) and math.abs(n) < 1e15 then
+			s = fmt("%d", n)
+			return n < 0 and "(" .. s .. ")" or s
+		end
+		for digits = 1, 17 do
+			s = fmt("%." .. digits .. "g", n)
+			if tonumber(s) == n then
+				break
+			end
+		end
+		if n < 0 then
+			return "(" .. s .. ")"
+		end
+		return s
+	end
+
+	local function constText(k)
+		local t = k.t
+		if t == "nil" then
+			return "nil"
+		elseif t == "boolean" then
+			return k.v and "true" or "false"
+		elseif t == "number" then
+			return numLit(k.v)
+		elseif t == "string" then
+			return strLit(k.v)
+		elseif t == "vector" then
+			return fmt("Vector3.new(%s, %s, %s)", numLit(k.v[1]), numLit(k.v[2]), numLit(k.v[3]))
+		end
+		error("constant of type " .. t .. " used as a value", 0)
+	end
+
+	local function indexText(base, key)
+		if isIdent(key) then
+			return base .. "." .. key
+		end
+		return base .. "[" .. strLit(key) .. "]"
+	end
+
+	local function sext16(v)
+		return v >= 0x8000 and v - 0x10000 or v
+	end
+	local function sext24(v)
+		return v >= 0x800000 and v - 0x1000000 or v
+	end
+
+	-- * opts: { upnames = {[1..nups] = expression text} (top level only),
+	-- *         globals = set filled with every global name the code reads/writes }
+	local genProto
+
+	local function decodeProto(chunk, p)
+		local decode = chunk.decode
+		local insns, byPc = {}, {}
+		local pc = 0
+		while pc < p.sizecode do
+			local word = p.code[pc]
+			local op = decode(word)
+			local ins = {
+				pc = pc,
+				op = op,
+				a = band(rshift(word, 8), 255),
+				b = band(rshift(word, 16), 255),
+				c = band(rshift(word, 24), 255),
+				d = sext16(rshift(word, 16)),
+				e = sext24(rshift(word, 8)),
+			}
+			if HAS_AUX[op] then
+				ins.aux = p.code[pc + 1]
+				ins.size = 2
+			else
+				ins.size = 1
+			end
+			ins.next = pc + ins.size
+			insns[#insns + 1] = ins
+			byPc[pc] = ins
+			pc = ins.next
+		end
+		return insns, byPc
+	end
+
+	function genProto(chunk, id, opts, indent)
+		local p = chunk.protos[id]
+		local K = p.k
+		local insns, byPc = decodeProto(chunk, p)
+		local globals = opts.globals
+		local upnames = opts.upnames -- * only for the top level function
+
+		-- * registers ever captured by reference live in boxes
+		local captured, capturedList = {}, {}
+		for _, ins in insns do
+			if ins.op == OP.CAPTURE and ins.a == 1 and not captured[ins.b] then
+				captured[ins.b] = true
+				capturedList[#capturedList + 1] = ins.b
+			end
+		end
+		table.sort(capturedList)
+		local anyCaptured = #capturedList > 0
+
+		local function R(r)
+			if captured[r] then
+				return "__X[" .. r .. "].v"
+			end
+			return "__R[" .. r .. "]"
+		end
+		local function Kt(i)
+			local k = K[i]
+			if not k then
+				error("missing constant " .. tostring(i), 0)
+			end
+			if k.t == "vector" then
+				globals.Vector3 = true
+			end
+			return constText(k)
+		end
+		local function Ks(i)
+			local k = K[i]
+			if not k or k.t ~= "string" then
+				error("expected a string constant at " .. tostring(i), 0)
+			end
+			return k.v
+		end
+		local function upvalue(i)
+			if upnames then
+				local name = upnames[i + 1]
+				if not name then
+					error("no name for upvalue " .. i, 0)
+				end
+				return name
+			end
+			return "__U[" .. (i + 1) .. "].v"
+		end
+		local function upvalueBox(i)
+			if upnames then
+				local name = upvalue(i)
+				globals.setmetatable = true
+				return "setmetatable({}, { __index = function() return "
+					.. name
+					.. " end, __newindex = function(_, _, __v) "
+					.. name
+					.. " = __v end })"
+			end
+			return "__U[" .. (i + 1) .. "]"
+		end
+		local function global(name)
+			if not isIdent(name) then
+				error("global with an unusable name: " .. tostring(name), 0)
+			end
+			globals[name] = true
+			return name
+		end
+
+		-- * jump targets / block leaders
+		local leaders = { [0] = true }
+		local function target(ins, offset)
+			local t = ins.pc + 1 + offset
+			if not byPc[t] then
+				error(fmt("jump to %d from %d is not an instruction", t, ins.pc), 0)
+			end
+			leaders[t] = true
+			return t
+		end
+		local CONDITIONAL = {
+			[OP.JUMPIF] = true, [OP.JUMPIFNOT] = true, [OP.JUMPIFEQ] = true, [OP.JUMPIFLE] = true,
+			[OP.JUMPIFLT] = true, [OP.JUMPIFNOTEQ] = true, [OP.JUMPIFNOTLE] = true, [OP.JUMPIFNOTLT] = true,
+			[OP.JUMPXEQKNIL] = true, [OP.JUMPXEQKB] = true, [OP.JUMPXEQKN] = true, [OP.JUMPXEQKS] = true,
+			[OP.FORNPREP] = true, [OP.FORNLOOP] = true, [OP.FORGLOOP] = true,
+		}
+		local UNCONDITIONAL = {
+			[OP.JUMP] = true, [OP.JUMPBACK] = true, [OP.JUMPX] = true, [OP.FORGPREP] = true,
+			[OP.FORGPREP_INEXT] = true, [OP.FORGPREP_NEXT] = true,
+		}
+		local consumedCapture = {}
+		for _, ins in insns do
+			local op = ins.op
+			if CONDITIONAL[op] or UNCONDITIONAL[op] then
+				ins.target = target(ins, op == OP.JUMPX and ins.e or ins.d)
+				if ins.next < p.sizecode then
+					leaders[ins.next] = true
+				end
+			elseif op == OP.LOADB and ins.c ~= 0 then
+				ins.target = target(ins, ins.c)
+				if ins.next < p.sizecode then
+					leaders[ins.next] = true
+				end
+			elseif op == OP.RETURN then
+				if ins.next < p.sizecode then
+					leaders[ins.next] = true
+				end
+			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				local childId
+				if op == OP.NEWCLOSURE then
+					childId = p.p[ins.d]
+				else
+					local k = K[ins.d]
+					childId = k and k.t == "closure" and k.v
+				end
+				local child = childId and chunk.protos[childId]
+				if not child then
+					error("closure without a function at " .. ins.pc, 0)
+				end
+				ins.child = childId
+				ins.captures = {}
+				local cpc = ins.next
+				for n = 1, child.nups do
+					local cap = byPc[cpc]
+					if not cap or cap.op ~= OP.CAPTURE then
+						error("missing CAPTURE after closure at " .. ins.pc, 0)
+					end
+					ins.captures[n] = cap
+					consumedCapture[cpc] = true
+					cpc = cap.next
+				end
+			end
+		end
+
+		local leaderList = {}
+		for pc in leaders do
+			leaderList[#leaderList + 1] = pc
+		end
+		table.sort(leaderList)
+
+		local lines = {}
+		local function emit(depth, text)
+			lines[#lines + 1] = rep("\t", depth) .. text
+		end
+
+		-- * read the dynamic register range [from, __T - 1] as an argument list
+		local function dynamicRange(depth, from)
+			if not anyCaptured then
+				return "table.unpack(__R, " .. from .. ", __T - 1)"
+			end
+			emit(depth, "local __args = {}")
+			emit(
+				depth,
+				"for __i = "
+					.. from
+					.. ", __T - 1 do __args[__i - "
+					.. (from - 1)
+					.. "] = if __X[__i] then __X[__i].v else __R[__i] end"
+			)
+			return "table.unpack(__args, 1, __T - " .. from .. ")"
+		end
+		local function storeMany(depth, from, packed)
+			emit(depth, "__T = " .. from .. " + " .. packed .. ".n")
+			if not anyCaptured then
+				emit(depth, "table.move(" .. packed .. ", 1, " .. packed .. ".n, " .. from .. ", __R)")
+			else
+				emit(
+					depth,
+					"for __i = 1, "
+						.. packed
+						.. ".n do local __r = "
+						.. (from - 1)
+						.. " + __i if __X[__r] then __X[__r].v = "
+						.. packed
+						.. "[__i] else __R[__r] = "
+						.. packed
+						.. "[__i] end end"
+				)
+			end
+		end
+		local function argList(depth, from, count)
+			if count < 0 then
+				return dynamicRange(depth, from)
+			end
+			local parts = {}
+			for r = from, from + count - 1 do
+				parts[#parts + 1] = R(r)
+			end
+			return concat(parts, ", ")
+		end
+		local function jumpTo(depth, pc)
+			emit(depth, "__pc = " .. pc)
+		end
+		local function branch(depth, cond, ins)
+			emit(depth, "if " .. cond .. " then __pc = " .. ins.target .. " else __pc = " .. ins.next .. " end")
+		end
+		local function iterPrep(depth, a)
+			globals.type, globals.getmetatable, globals.rawget, globals.next, globals.error, globals.typeof =
+				true, true, true, true, true, true
+			emit(depth, "do")
+			emit(depth + 1, "local __f = " .. R(a))
+			emit(depth + 1, 'if type(__f) ~= "function" then')
+			emit(depth + 2, "local __mt = getmetatable(__f)")
+			emit(depth + 2, 'local __iter = type(__mt) == "table" and rawget(__mt, "__iter")')
+			emit(depth + 2, "if __iter then")
+			emit(depth + 3, "local __a, __b, __c = __iter(__f)")
+			emit(depth + 3, R(a) .. " = __a; " .. R(a + 1) .. " = __b; " .. R(a + 2) .. " = __c")
+			emit(depth + 2, 'elseif type(__f) == "table" then')
+			emit(depth + 3, R(a) .. " = next; " .. R(a + 1) .. " = __f; " .. R(a + 2) .. " = nil")
+			emit(depth + 2, "else")
+			emit(depth + 3, 'error("attempt to iterate over a " .. typeof(__f) .. " value")')
+			emit(depth + 2, "end")
+			emit(depth + 1, "end")
+			emit(depth, "end")
+		end
+
+		local function closureText(ins, depth)
+			-- * Like the VM: the new closure is stored in its register BEFORE the captures are
+			-- * read, so `local function f` can capture itself
+			-- * The child sees its upvalue boxes as `__U`, but filling them may need OUR `__U`,
+			-- * so the child's table is only named `__U` inside a nested block.
+			emit(depth, "do")
+			emit(depth + 1, "local __C = {}")
+			emit(depth + 1, "do")
+			emit(depth + 2, "local __U = __C")
+			local childText
+			if opts.childHook then
+				-- * let the caller (the decompiler) produce the child; its upvalues are our boxes
+				local names = {}
+				for n = 1, chunk.protos[ins.child].nups do
+					names[n] = "__U[" .. n .. "].v"
+				end
+				childText = opts.childHook(ins.child, names, depth + 2)
+			else
+				childText = genProto(chunk, ins.child, { globals = globals }, depth + 2)
+			end
+			emit(depth + 2, R(ins.a) .. " = function" .. childText)
+			emit(depth + 1, "end")
+			for n, cap in ins.captures do
+				local box
+				if cap.a == 0 then
+					box = "{ v = " .. R(cap.b) .. " }"
+				elseif cap.a == 1 then
+					box = "__X[" .. cap.b .. "]"
+				elseif cap.a == 2 then
+					box = upvalueBox(cap.b)
+				else
+					error("unknown capture type " .. cap.a, 0)
+				end
+				emit(depth + 1, "__C[" .. n .. "] = " .. box)
+			end
+			emit(depth, "end")
+		end
+
+		-- * returns true when the instruction ends the block (it set __pc or returned)
+		local function emitInsn(ins, depth)
+			local op, a, b, c = ins.op, ins.a, ins.b, ins.c
+			if op == OP.NOP or op == OP.BREAK or op == OP.COVERAGE or op == OP.PREPVARARGS or op == OP.NATIVECALL then
+				return false
+			elseif op == OP.FASTCALL or op == OP.FASTCALL1 or op == OP.FASTCALL2 or op == OP.FASTCALL2K or op == OP.FASTCALL3 then
+				return false -- * only an optimisation hint: the CALL that follows does the same call
+			elseif op == OP.CAPTURE then
+				if not consumedCapture[ins.pc] then
+					error("stray CAPTURE at " .. ins.pc, 0)
+				end
+				return false
+			elseif op == OP.LOADNIL then
+				emit(depth, R(a) .. " = nil")
+			elseif op == OP.LOADB then
+				emit(depth, R(a) .. " = " .. (b ~= 0 and "true" or "false"))
+				if c ~= 0 then
+					jumpTo(depth, ins.target)
+					return true
+				end
+			elseif op == OP.LOADN then
+				emit(depth, R(a) .. " = " .. numLit(ins.d))
+			elseif op == OP.LOADK then
+				emit(depth, R(a) .. " = " .. Kt(ins.d))
+			elseif op == OP.LOADKX then
+				emit(depth, R(a) .. " = " .. Kt(ins.aux))
+			elseif op == OP.MOVE then
+				emit(depth, R(a) .. " = " .. R(b))
+			elseif op == OP.GETGLOBAL then
+				emit(depth, R(a) .. " = " .. global(Ks(ins.aux)))
+			elseif op == OP.SETGLOBAL then
+				emit(depth, global(Ks(ins.aux)) .. " = " .. R(a))
+			elseif op == OP.GETUPVAL then
+				emit(depth, R(a) .. " = " .. upvalue(b))
+			elseif op == OP.SETUPVAL then
+				emit(depth, upvalue(b) .. " = " .. R(a))
+			elseif op == OP.CLOSEUPVALS then
+				for _, r in capturedList do
+					if r >= a then
+						emit(depth, "__X[" .. r .. "] = { v = __X[" .. r .. "].v }")
+					end
+				end
+			elseif op == OP.GETIMPORT then
+				local aux = ins.aux
+				local count = rshift(aux, 30)
+				local ids = { band(rshift(aux, 20), 1023), band(rshift(aux, 10), 1023), band(aux, 1023) }
+				if count < 1 or count > 3 then
+					error("bad import at " .. ins.pc, 0)
+				end
+				local text = global(Ks(ids[1]))
+				for n = 2, count do
+					text = indexText(text, Ks(ids[n]))
+				end
+				emit(depth, R(a) .. " = " .. text)
+			elseif op == OP.GETTABLE then
+				emit(depth, R(a) .. " = " .. R(b) .. "[" .. R(c) .. "]")
+			elseif op == OP.SETTABLE then
+				emit(depth, R(b) .. "[" .. R(c) .. "] = " .. R(a))
+			elseif op == OP.GETTABLEKS then
+				emit(depth, R(a) .. " = " .. indexText(R(b), Ks(ins.aux)))
+			elseif op == OP.SETTABLEKS then
+				emit(depth, indexText(R(b), Ks(ins.aux)) .. " = " .. R(a))
+			elseif op == OP.GETTABLEN then
+				emit(depth, R(a) .. " = " .. R(b) .. "[" .. (c + 1) .. "]")
+			elseif op == OP.SETTABLEN then
+				emit(depth, R(b) .. "[" .. (c + 1) .. "] = " .. R(a))
+			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				closureText(ins, depth)
+			elseif op == OP.NAMECALL then
+				emit(depth, "do local __o = " .. R(b) .. "; " .. R(a + 1) .. " = __o; " .. R(a) .. " = " .. indexText("__o", Ks(ins.aux)) .. " end")
+			elseif op == OP.CALL then
+				emit(depth, "do")
+				local args = argList(depth + 1, a + 1, b - 1)
+				local call = R(a) .. "(" .. args .. ")"
+				if c == 0 then
+					emit(depth + 1, "local __res = table.pack(" .. call .. ")")
+					storeMany(depth + 1, a, "__res")
+				elseif c == 1 then
+					emit(depth + 1, call)
+				elseif c == 2 then
+					emit(depth + 1, R(a) .. " = " .. call)
+				else
+					local names = {}
+					for n = 1, c - 1 do
+						names[n] = "__r" .. n
+					end
+					emit(depth + 1, "local " .. concat(names, ", ") .. " = " .. call)
+					for n = 1, c - 1 do
+						emit(depth + 1, R(a + n - 1) .. " = __r" .. n)
+					end
+				end
+				emit(depth, "end")
+			elseif op == OP.RETURN then
+				if b == 1 then
+					emit(depth, "do return end")
+				else
+					emit(depth, "do")
+					local values = argList(depth + 1, a, b - 1)
+					emit(depth + 1, "return " .. values)
+					emit(depth, "end")
+				end
+				return true
+			elseif op == OP.JUMP or op == OP.JUMPBACK or op == OP.JUMPX then
+				jumpTo(depth, ins.target)
+				return true
+			elseif op == OP.JUMPIF then
+				branch(depth, R(a), ins)
+				return true
+			elseif op == OP.JUMPIFNOT then
+				branch(depth, "not " .. R(a), ins)
+				return true
+			elseif op == OP.JUMPIFEQ then
+				branch(depth, R(a) .. " == " .. R(ins.aux), ins)
+				return true
+			elseif op == OP.JUMPIFNOTEQ then
+				branch(depth, R(a) .. " ~= " .. R(ins.aux), ins)
+				return true
+			elseif op == OP.JUMPIFLE then
+				branch(depth, R(a) .. " <= " .. R(ins.aux), ins)
+				return true
+			elseif op == OP.JUMPIFLT then
+				branch(depth, R(a) .. " < " .. R(ins.aux), ins)
+				return true
+			elseif op == OP.JUMPIFNOTLE then
+				branch(depth, "not (" .. R(a) .. " <= " .. R(ins.aux) .. ")", ins)
+				return true
+			elseif op == OP.JUMPIFNOTLT then
+				branch(depth, "not (" .. R(a) .. " < " .. R(ins.aux) .. ")", ins)
+				return true
+			elseif op == OP.JUMPXEQKNIL or op == OP.JUMPXEQKB or op == OP.JUMPXEQKN or op == OP.JUMPXEQKS then
+				local aux = ins.aux
+				local negate = band(aux, 0x80000000) ~= 0
+				local value
+				if op == OP.JUMPXEQKNIL then
+					value = "nil"
+				elseif op == OP.JUMPXEQKB then
+					value = band(aux, 1) ~= 0 and "true" or "false"
+				else
+					value = Kt(band(aux, 0xFFFFFF))
+				end
+				branch(depth, R(a) .. (negate and " ~= " or " == ") .. value, ins)
+				return true
+			elseif op == OP.ADD or op == OP.SUB or op == OP.MUL or op == OP.DIV or op == OP.MOD or op == OP.POW or op == OP.IDIV then
+				local sym = ({ [OP.ADD] = "+", [OP.SUB] = "-", [OP.MUL] = "*", [OP.DIV] = "/", [OP.MOD] = "%", [OP.POW] = "^", [OP.IDIV] = "//" })[op]
+				emit(depth, R(a) .. " = " .. R(b) .. " " .. sym .. " " .. R(c))
+			elseif op == OP.ADDK or op == OP.SUBK or op == OP.MULK or op == OP.DIVK or op == OP.MODK or op == OP.POWK or op == OP.IDIVK then
+				local sym = ({ [OP.ADDK] = "+", [OP.SUBK] = "-", [OP.MULK] = "*", [OP.DIVK] = "/", [OP.MODK] = "%", [OP.POWK] = "^", [OP.IDIVK] = "//" })[op]
+				emit(depth, R(a) .. " = " .. R(b) .. " " .. sym .. " " .. Kt(c))
+			elseif op == OP.SUBRK then
+				emit(depth, R(a) .. " = " .. Kt(b) .. " - " .. R(c))
+			elseif op == OP.DIVRK then
+				emit(depth, R(a) .. " = " .. Kt(b) .. " / " .. R(c))
+			elseif op == OP.AND then
+				emit(depth, R(a) .. " = " .. R(b) .. " and " .. R(c))
+			elseif op == OP.OR then
+				emit(depth, R(a) .. " = " .. R(b) .. " or " .. R(c))
+			elseif op == OP.ANDK then
+				emit(depth, R(a) .. " = " .. R(b) .. " and " .. Kt(c))
+			elseif op == OP.ORK then
+				emit(depth, R(a) .. " = " .. R(b) .. " or " .. Kt(c))
+			elseif op == OP.CONCAT then
+				local parts = {}
+				for r = b, c do
+					parts[#parts + 1] = R(r)
+				end
+				emit(depth, R(a) .. " = " .. concat(parts, " .. "))
+			elseif op == OP.NOT then
+				emit(depth, R(a) .. " = not " .. R(b))
+			elseif op == OP.MINUS then
+				emit(depth, R(a) .. " = -" .. R(b))
+			elseif op == OP.LENGTH then
+				emit(depth, R(a) .. " = #" .. R(b))
+			elseif op == OP.NEWTABLE or op == OP.DUPTABLE then
+				emit(depth, R(a) .. " = {}")
+			elseif op == OP.SETLIST then
+				local start = ins.aux
+				if c == 0 then
+					emit(depth, "do")
+					emit(depth + 1, "local __t = " .. R(a))
+					if anyCaptured then
+						emit(depth + 1, "for __i = " .. b .. ", __T - 1 do __t[__i - " .. (b - start) .. "] = if __X[__i] then __X[__i].v else __R[__i] end")
+					else
+						emit(depth + 1, "for __i = " .. b .. ", __T - 1 do __t[__i - " .. (b - start) .. "] = __R[__i] end")
+					end
+					emit(depth, "end")
+				else
+					for n = 0, c - 2 do
+						emit(depth, R(a) .. "[" .. (start + n) .. "] = " .. R(b + n))
+					end
+				end
+			elseif op == OP.GETVARARGS then
+				if b == 0 then
+					storeMany(depth, a, "__V")
+				else
+					for n = 0, b - 2 do
+						emit(depth, R(a + n) .. " = __V[" .. (n + 1) .. "]")
+					end
+				end
+			elseif op == OP.FORNPREP then
+				globals.type, globals.tonumber, globals.error = true, true, true
+				for n, what in { "limit", "step", "initial value" } do
+					local r = R(a + n - 1)
+					emit(depth, "if type(" .. r .. ') ~= "number" then ' .. r .. " = tonumber(" .. r .. ') or error("invalid \'for\' ' .. what .. ' (number expected)") end')
+				end
+				branch(
+					depth,
+					"(if " .. R(a + 1) .. " > 0 then " .. R(a + 2) .. " <= " .. R(a) .. " else " .. R(a) .. " <= " .. R(a + 2) .. ")",
+					{ target = ins.next, next = ins.target }
+				)
+				return true
+			elseif op == OP.FORNLOOP then
+				emit(depth, R(a + 2) .. " = " .. R(a + 2) .. " + " .. R(a + 1))
+				branch(
+					depth,
+					"(if " .. R(a + 1) .. " > 0 then " .. R(a + 2) .. " <= " .. R(a) .. " else " .. R(a) .. " <= " .. R(a + 2) .. ")",
+					ins
+				)
+				return true
+			elseif op == OP.FORGPREP or op == OP.FORGPREP_INEXT or op == OP.FORGPREP_NEXT then
+				iterPrep(depth, a)
+				jumpTo(depth, ins.target)
+				return true
+			elseif op == OP.FORGLOOP then
+				local count = band(ins.aux, 255)
+				local names = {}
+				for n = 1, count do
+					names[n] = "__r" .. n
+				end
+				emit(depth, "do")
+				emit(depth + 1, "local " .. concat(names, ", ") .. " = " .. R(a) .. "(" .. R(a + 1) .. ", " .. R(a + 2) .. ")")
+				for n = 1, count do
+					emit(depth + 1, R(a + 2 + n) .. " = __r" .. n)
+				end
+				emit(depth, "end")
+				emit(depth, "if " .. R(a + 3) .. " ~= nil then " .. R(a + 2) .. " = " .. R(a + 3) .. "; __pc = " .. ins.target .. " else __pc = " .. ins.next .. " end")
+				return true
+			else
+				error("unsupported opcode " .. tostring(OP_NAMES[op] or op) .. " at " .. ins.pc, 0)
+			end
+			return false
+		end
+
+		-- * blocks, dispatched with a binary search on __pc
+		local blocks = {}
+		for n, start in leaderList do
+			blocks[n] = { start = start, stop = leaderList[n + 1] or p.sizecode }
+		end
+
+		local function emitBlock(block, depth)
+			local pc = block.start
+			local ended = false
+			if p.lineOf then
+				local line = p.lineOf(pc)
+				if line then
+					emit(depth, "-- line " .. line)
+				end
+			end
+			while pc < block.stop do
+				local ins = byPc[pc]
+				ended = emitInsn(ins, depth)
+				pc = ins.next
+			end
+			if not ended then
+				if block.stop >= p.sizecode then
+					emit(depth, "do return end")
+				else
+					jumpTo(depth, block.stop)
+				end
+			end
+		end
+
+		local function tree(lo, hi, depth)
+			if lo == hi then
+				emitBlock(blocks[lo], depth)
+				return
+			end
+			local mid = (lo + hi) // 2
+			emit(depth, "if __pc < " .. blocks[mid + 1].start .. " then")
+			tree(lo, mid, depth + 1)
+			emit(depth, "else")
+			tree(mid + 1, hi, depth + 1)
+			emit(depth, "end")
+		end
+
+		local params = {}
+		for n = 0, p.numparams - 1 do
+			params[#params + 1] = "__a" .. n
+		end
+		if p.isvararg then
+			params[#params + 1] = "..."
+		end
+
+		local body = indent + 1
+		lines = {}
+		emit(body, "local __R, __T, __pc = {}, 0, 0")
+		for n = 0, p.numparams - 1 do
+			emit(body, "__R[" .. n .. "] = __a" .. n)
+		end
+		if p.isvararg then
+			emit(body, "local __V = table.pack(...)")
+		end
+		if anyCaptured then
+			emit(body, "local __X = {}")
+			for _, r in capturedList do
+				emit(body, "__X[" .. r .. "] = { v = __R[" .. r .. "] }")
+			end
+		end
+		emit(body, "while true do")
+		tree(1, #blocks, body + 1)
+		emit(body, "end")
+		local bodyLines = lines
+		globals.table = true
+
+		return "(" .. concat(params, ", ") .. ")\n" .. concat(bodyLines, "\n") .. "\n" .. rep("\t", indent) .. "end"
+	end
+
+	-- * shared with the decompiler
+	BytecodeLifter.OP = OP
+	BytecodeLifter.OP_NAMES = OP_NAMES
+	BytecodeLifter.HAS_AUX = HAS_AUX
+	BytecodeLifter.decodeProto = decodeProto
+	BytecodeLifter.constText = constText
+	BytecodeLifter.numLit = numLit
+	BytecodeLifter.strLit = strLit
+	BytecodeLifter.indexText = indexText
+	BytecodeLifter.KEYWORDS = KEYWORDS
+
+	-- * Lifts one function. `upnames[i]` is the source text of upvalue i (1-based). Returns
+	-- * "(params) ... end" (to put right after `function`) and the set of global names used.
+	function BytecodeLifter.liftFunction(chunk, protoId, upnames, indent, childHook)
+		local globals = {}
+		local text = genProto(chunk, protoId, { upnames = upnames or {}, globals = globals, childHook = childHook }, indent or 0)
+		return text, globals
+	end
+
+	-- * Lifts a whole script (the main function) as top level code.
+	function BytecodeLifter.liftScript(chunk, childHook)
+		local globals = {}
+		local text = genProto(chunk, chunk.main, { upnames = {}, globals = globals, childHook = childHook }, -1)
+		-- * strip "(...)\n" and the final "end": the main function becomes the chunk itself
+		local body = string.match(text, "^%b()\n(.*)\nend$")
+		if not body then
+			error("could not unwrap the main function", 0)
+		end
+		return body, globals
+	end
+end
+
+-- * BetterDecompiler: a structured Luau decompiler written in Luau.
+-- *
+-- * bytecode -> data flow (which register writes/reads belong to the same variable)
+-- *          -> control flow (if / elseif / while / repeat / for / break / continue, and/or conditions)
+-- *          -> expressions (single use temporaries are folded back, in the order the compiler emits them)
+-- *          -> variables (declared in the innermost block that needs them, hoisted out of loops only
+-- *             when their value or an open upvalue survives into the next iteration)
+-- *          -> source
+-- *
+-- * Every jump in the bytecode must be explained by the structure that is built, otherwise the
+-- * function is rebuilt with BytecodeLifter instead (exact, but low level). It never emits goto.
+local BetterDecompiler = {}
+do
+	local Lifter = BytecodeLifter
+	local OP = Lifter.OP
+	local band, rshift = bit32.band, bit32.rshift
+	local concat, insert, remove, rep = table.concat, table.insert, table.remove, string.rep
+	local isIdent, strLit, numLit = Lifter.isIdent, Lifter.strLit, Lifter.numLit
+
+	local FAIL = "BetterDecompiler: "
+	local function fail(msg)
+		error(FAIL .. msg, 0)
+	end
+
+	local CONDITIONAL = {
+		[OP.JUMPIF] = true, [OP.JUMPIFNOT] = true, [OP.JUMPIFEQ] = true, [OP.JUMPIFLE] = true,
+		[OP.JUMPIFLT] = true, [OP.JUMPIFNOTEQ] = true, [OP.JUMPIFNOTLE] = true, [OP.JUMPIFNOTLT] = true,
+		[OP.JUMPXEQKNIL] = true, [OP.JUMPXEQKB] = true, [OP.JUMPXEQKN] = true, [OP.JUMPXEQKS] = true,
+	}
+	local TWO_REG_COMPARE = {
+		[OP.JUMPIFEQ] = "==", [OP.JUMPIFLE] = "<=", [OP.JUMPIFLT] = "<",
+		[OP.JUMPIFNOTEQ] = "~=", [OP.JUMPIFNOTLE] = "<=", [OP.JUMPIFNOTLT] = "<",
+	}
+	local NEGATED_COMPARE = { [OP.JUMPIFNOTLE] = true, [OP.JUMPIFNOTLT] = true }
+	local UNCONDITIONAL = { [OP.JUMP] = true, [OP.JUMPBACK] = true, [OP.JUMPX] = true }
+	local FORGPREPS = { [OP.FORGPREP] = true, [OP.FORGPREP_INEXT] = true, [OP.FORGPREP_NEXT] = true }
+	local NOOPS = {
+		[OP.NOP] = true, [OP.BREAK] = true, [OP.COVERAGE] = true, [OP.PREPVARARGS] = true, [OP.NATIVECALL] = true,
+		[OP.FASTCALL] = true, [OP.FASTCALL1] = true, [OP.FASTCALL2] = true, [OP.FASTCALL2K] = true, [OP.FASTCALL3] = true,
+	}
+	local ARITH = {
+		[OP.ADD] = "+", [OP.SUB] = "-", [OP.MUL] = "*", [OP.DIV] = "/", [OP.MOD] = "%", [OP.POW] = "^", [OP.IDIV] = "//",
+	}
+	local ARITHK = {
+		[OP.ADDK] = "+", [OP.SUBK] = "-", [OP.MULK] = "*", [OP.DIVK] = "/", [OP.MODK] = "%", [OP.POWK] = "^", [OP.IDIVK] = "//",
+	}
+
+	--------------------------------------------------------------------------
+	-- expressions
+	--------------------------------------------------------------------------
+	-- * k: const | var | upval | global | index | call | method | binop | unop | and | or | not
+	-- *    | concat | vararg | closure | table | paren
+	local function E(k, t)
+		t = t or {}
+		t.k = k
+		return t
+	end
+	local TRUE = E("const", { text = "true" })
+
+	-- * (a or (b or (c or T))) -> (a or b or c), when T is the rightmost operand of a chain of `op`
+	-- * (and/or regroup freely: same values, same evaluation order)
+	local function splitTail(node, op, target)
+		if node.k ~= op then
+			return nil
+		end
+		if node.r == target then
+			return node.l
+		end
+		local rest = splitTail(node.r, op, target)
+		if rest then
+			return { k = op, l = node.l, r = rest, el = node.el }
+		end
+		return nil
+	end
+
+	local function isSideEffectFree(e)
+		local k = e.k
+		return k == "const" or k == "var" or k == "upval" or k == "global" or k == "closure"
+			or (k == "table" and #e.entries == 0)
+	end
+
+	-- * `not` in a boolean context (if / while / until)
+	local function boolNot(e)
+		if e.k == "not" then
+			return e.e
+		elseif e.k == "binop" and e.op == "==" then
+			return E("binop", { op = "~=", l = e.l, r = e.r })
+		elseif e.k == "binop" and e.op == "~=" then
+			return E("binop", { op = "==", l = e.l, r = e.r })
+		elseif e.k == "and" then
+			return E("or", { l = boolNot(e.l), r = boolNot(e.r) })
+		elseif e.k == "or" then
+			return E("and", { l = boolNot(e.l), r = boolNot(e.r) })
+		end
+		return E("not", { e = e })
+	end
+
+	--------------------------------------------------------------------------
+	-- analysis: jumps, closures, boolean materialisation, multret, data flow
+	--------------------------------------------------------------------------
+	local function analyze(chunk, p)
+		local insns, byPc = Lifter.decodeProto(chunk, p)
+		local K = p.k
+		local size = p.sizecode
+
+		for i, ins in insns do
+			ins.index = i
+			local op = ins.op
+			if CONDITIONAL[op] or UNCONDITIONAL[op] or op == OP.FORNPREP or op == OP.FORNLOOP or op == OP.FORGLOOP or FORGPREPS[op] then
+				ins.target = ins.pc + 1 + (op == OP.JUMPX and ins.e or ins.d)
+			elseif op == OP.LOADB and ins.c ~= 0 then
+				ins.target = ins.pc + 1 + ins.c
+			end
+			if ins.target and not byPc[ins.target] then
+				fail("jump outside the function")
+			end
+			if op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				local childId
+				if op == OP.NEWCLOSURE then
+					childId = p.p[ins.d]
+				else
+					local k = K[ins.d]
+					childId = k and k.t == "closure" and k.v
+				end
+				local child = childId and chunk.protos[childId]
+				if not child then
+					fail("closure without a function")
+				end
+				ins.child = childId
+				ins.captures = {}
+				local cpc = ins.next
+				for n = 1, child.nups do
+					local cap = byPc[cpc]
+					if not cap or cap.op ~= OP.CAPTURE then
+						fail("missing CAPTURE")
+					end
+					cap.consumed = true
+					ins.captures[n] = cap
+					cpc = cap.next
+				end
+			end
+		end
+
+		local incoming = {}
+		for _, ins in insns do
+			if ins.target then
+				local list = incoming[ins.target]
+				if not list then
+					list = {}
+					incoming[ins.target] = list
+				end
+				list[#list + 1] = ins
+			end
+		end
+
+		-- * `x = a == b` is compiled as: JUMPIFEQ a b L; LOADB x 0 +1; L: LOADB x 1
+		for _, ins in insns do
+			if CONDITIONAL[ins.op] and not ins.absorbed then
+				local l1 = byPc[ins.next]
+				local l2 = l1 and byPc[l1.next]
+				if l1 and l2 and l1.op == OP.LOADB and l1.c == 1 and ins.target == l1.next
+					and l2.op == OP.LOADB and l2.c == 0 and l2.a == l1.a and l1.target == l2.next
+					and (l1.b ~= 0) ~= (l2.b ~= 0)
+					and not incoming[l1.pc] and incoming[l2.pc] and #incoming[l2.pc] == 1
+				then
+					ins.boolmat = { reg = l1.a, whenJump = l2.b ~= 0 }
+					ins.next = l2.next
+					l1.absorbed, l2.absorbed = true, true
+					incoming[l2.pc] = nil
+					local into = incoming[l2.next]
+					if into then
+						for n = #into, 1, -1 do
+							if into[n] == l1 then
+								remove(into, n)
+							end
+						end
+						if #into == 0 then
+							incoming[l2.next] = nil
+						end
+					end
+				end
+			end
+		end
+
+		-- * code that can never run (the compiler leaves some, e.g. after `x and true or false`)
+		do
+			local reached = {}
+			local stack = { 0 }
+			while #stack > 0 do
+				local pc = remove(stack)
+				local ins = byPc[pc]
+				if ins and not reached[pc] then
+					reached[pc] = true
+					local op = ins.op
+					local function go(t)
+						if t and t < size and not reached[t] then
+							stack[#stack + 1] = t
+						end
+					end
+					if ins.boolmat then
+						go(ins.next)
+					elseif UNCONDITIONAL[op] or FORGPREPS[op] or (op == OP.LOADB and ins.c ~= 0) then
+						go(ins.target)
+					elseif op == OP.RETURN then
+						-- * nothing
+					else
+						go(ins.next)
+						go(ins.target)
+					end
+				end
+			end
+			for _, ins in insns do
+				if not reached[ins.pc] and not ins.absorbed and not ins.consumed then
+					ins.unreachable = true
+					-- * an unreachable unconditional jump still marks structure (e.g. where an else
+					-- * begins) and is never executed, so it stays; other dead code is dropped
+					if not UNCONDITIONAL[ins.op] then
+						ins.dead = true
+					end
+				end
+			end
+			-- * dead instructions do not count as jumps into anything
+			for t, list in incoming do
+				for n = #list, 1, -1 do
+					if list[n].dead then
+						remove(list, n)
+					end
+				end
+				if #list == 0 then
+					incoming[t] = nil
+				end
+			end
+		end
+
+		-- * the effective instruction sequence (live code only)
+		local seq, prevOf = {}, {}
+		do
+			local pc, prev = 0, nil
+			while pc < size do
+				local ins = byPc[pc]
+				if not ins then
+					fail("broken instruction stream")
+				end
+				if not ins.dead then
+					seq[#seq + 1] = ins
+					prevOf[pc] = prev
+					prev = ins
+				end
+				pc = ins.next
+			end
+			-- * `lastBefore(pc)` for a pc after dead code: the last live instruction before it
+			local lastLive
+			pc = 0
+			while pc < size do
+				local ins = byPc[pc]
+				if ins.dead then
+					prevOf[pc] = lastLive
+				else
+					lastLive = ins
+				end
+				pc = ins.next
+			end
+		end
+		local function nextLive(pc)
+			while pc < size and byPc[pc] and byPc[pc].dead do
+				pc = byPc[pc].next
+			end
+			return pc
+		end
+
+		-- * multret pairs: CALL C=0 / GETVARARGS B=0 feeding CALL B=0 / RETURN B=0 / SETLIST C=0
+		do
+			local producer
+			for _, ins in seq do
+				local op = ins.op
+				local consumes = (op == OP.CALL and ins.b == 0) or (op == OP.RETURN and ins.b == 0) or (op == OP.SETLIST and ins.c == 0)
+				if consumes then
+					if not producer then
+						fail("multret without a producer at " .. ins.pc)
+					end
+					ins.multretFrom = producer
+					producer.multretTo = ins
+				end
+				if (op == OP.CALL and ins.c == 0) or (op == OP.GETVARARGS and ins.b == 0) then
+					producer = ins
+				elseif consumes then
+					producer = nil
+				elseif not NOOPS[op] and op ~= OP.CLOSEUPVALS then
+					-- * `f(g())` with a builtin f loads f between g's call and f's call
+					local loadsBelow = producer and ins.a < producer.a
+						and (op == OP.GETIMPORT or op == OP.GETGLOBAL or op == OP.MOVE or op == OP.GETUPVAL)
+					if not loadsBelow then
+						producer = nil
+					end
+				end
+			end
+			for _, ins in seq do
+				if ((ins.op == OP.CALL and ins.c == 0) or (ins.op == OP.GETVARARGS and ins.b == 0)) and not ins.multretTo then
+					fail("unused multret")
+				end
+			end
+		end
+
+		-- * `FASTCALL ...; GETIMPORT f; CALL f`: the function is loaded after the arguments
+		for i, ins in seq do
+			if ins.op == OP.CALL and i > 2 then
+				local before = seq[i - 2]
+				if before.op == OP.FASTCALL or before.op == OP.FASTCALL1 or before.op == OP.FASTCALL2
+					or before.op == OP.FASTCALL2K or before.op == OP.FASTCALL3
+				then
+					ins.fnLast = true
+				end
+			end
+		end
+
+		-- * register reads (in the order the compiler emits them) and writes
+		local function rangeTo(ins, from)
+			if ins.multretFrom then
+				return ins.multretFrom.a - 1
+			end
+			return nil
+		end
+		for _, ins in seq do
+			local op, a, b, c = ins.op, ins.a, ins.b, ins.c
+			local uses, defs = {}, {}
+			local function use(r)
+				uses[#uses + 1] = r
+			end
+			local function def(r)
+				defs[#defs + 1] = r
+			end
+			if ins.boolmat then
+				use(a)
+				if TWO_REG_COMPARE[op] then
+					use(ins.aux)
+				end
+				def(ins.boolmat.reg)
+			elseif CONDITIONAL[op] then
+				use(a)
+				if TWO_REG_COMPARE[op] then
+					use(ins.aux)
+				end
+			elseif op == OP.LOADNIL or op == OP.LOADB or op == OP.LOADN or op == OP.LOADK or op == OP.LOADKX
+				or op == OP.GETGLOBAL or op == OP.GETUPVAL or op == OP.GETIMPORT or op == OP.NEWTABLE or op == OP.DUPTABLE
+			then
+				def(a)
+			elseif op == OP.MOVE then
+				use(b)
+				def(a)
+			elseif op == OP.SETGLOBAL or op == OP.SETUPVAL then
+				use(a)
+			elseif op == OP.GETTABLE then
+				use(b)
+				use(c)
+				def(a)
+			elseif op == OP.SETTABLE then
+				use(b)
+				use(c)
+				use(a)
+			elseif op == OP.GETTABLEKS or op == OP.GETTABLEN then
+				use(b)
+				def(a)
+			elseif op == OP.SETTABLEKS or op == OP.SETTABLEN then
+				use(b)
+				use(a)
+			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				def(a)
+				for _, cap in ins.captures do
+					if cap.a == 0 or cap.a == 1 then
+						use(cap.b)
+					end
+				end
+			elseif op == OP.NAMECALL then
+				use(b)
+				def(a)
+				def(a + 1)
+			elseif op == OP.CALL then
+				local last = b > 0 and a + b - 1 or rangeTo(ins)
+				for r = a, last do
+					use(r)
+				end
+				if c >= 2 then
+					for r = a, a + c - 2 do
+						def(r)
+					end
+				end
+			elseif op == OP.RETURN then
+				local last = b > 0 and a + b - 2 or rangeTo(ins)
+				for r = a, last do
+					use(r)
+				end
+			elseif ARITH[op] or op == OP.AND or op == OP.OR then
+				use(b)
+				use(c)
+				def(a)
+			elseif ARITHK[op] or op == OP.ANDK or op == OP.ORK or op == OP.NOT or op == OP.MINUS or op == OP.LENGTH then
+				use(b)
+				def(a)
+			elseif op == OP.SUBRK or op == OP.DIVRK then
+				use(c)
+				def(a)
+			elseif op == OP.CONCAT then
+				for r = b, c do
+					use(r)
+				end
+				def(a)
+			elseif op == OP.SETLIST then
+				use(a)
+				local last = c > 0 and b + c - 2 or rangeTo(ins)
+				for r = b, last do
+					use(r)
+				end
+			elseif op == OP.GETVARARGS then
+				if b >= 2 then
+					for r = a, a + b - 2 do
+						def(r)
+					end
+				end
+			elseif op == OP.FORNPREP then
+				use(a + 2)
+				use(a)
+				use(a + 1)
+			elseif FORGPREPS[op] then
+				use(a)
+				use(a + 1)
+				use(a + 2)
+			elseif op == OP.CAPTURE or op == OP.CLOSEUPVALS or UNCONDITIONAL[op] or NOOPS[op] or op == OP.FORNLOOP or op == OP.FORGLOOP then
+				-- * loop instructions are modelled below
+			else
+				fail("unsupported opcode " .. tostring(Lifter.OP_NAMES[op] or op))
+			end
+			ins.uses, ins.defs = uses, defs
+		end
+
+		-- * basic blocks
+		local leaders = { [0] = true }
+		local function isTerminator(ins)
+			local op = ins.op
+			if ins.boolmat then
+				return false
+			end
+			return CONDITIONAL[op] or UNCONDITIONAL[op] or op == OP.RETURN or op == OP.FORNPREP or op == OP.FORNLOOP
+				or FORGPREPS[op] or op == OP.FORGLOOP or (op == OP.LOADB and ins.c ~= 0)
+		end
+		for _, ins in seq do
+			if isTerminator(ins) then
+				if ins.target then
+					leaders[ins.target] = true
+				end
+				if ins.next < size then
+					leaders[ins.next] = true
+				end
+			end
+		end
+		local blocks, blockAt = {}, {}
+		for _, ins in seq do
+			if leaders[ins.pc] then
+				local block = { id = #blocks + 1, start = ins.pc, insns = {}, succ = {}, pred = {} }
+				blocks[#blocks + 1] = block
+				blockAt[ins.pc] = block
+			end
+			local block = blocks[#blocks]
+			block.insns[#block.insns + 1] = ins
+			ins.block = block
+		end
+		for _, block in blocks do
+			local last = block.insns[#block.insns]
+			local op = last.op
+			local targets = {}
+			if last.boolmat or not isTerminator(last) then
+				targets = { last.next }
+			elseif CONDITIONAL[op] or op == OP.FORNPREP or op == OP.FORNLOOP or op == OP.FORGLOOP then
+				targets = { last.target, last.next }
+			elseif UNCONDITIONAL[op] or FORGPREPS[op] or op == OP.LOADB then
+				targets = { last.target }
+			end
+			for _, t in targets do
+				local succ = blockAt[t]
+				if succ then
+					block.succ[#block.succ + 1] = succ
+					succ.pred[#succ.pred + 1] = block
+				end
+			end
+		end
+
+		-- * definitions
+		local parent = {}
+		local defInfo = {}
+		local function newDef(kind, ins, reg)
+			local id = #defInfo + 1
+			defInfo[id] = { kind = kind, ins = ins, reg = reg }
+			parent[id] = id
+			return id
+		end
+		local function find(x)
+			while parent[x] ~= x do
+				parent[x] = parent[parent[x]]
+				x = parent[x]
+			end
+			return x
+		end
+		local function union(x, y)
+			x, y = find(x), find(y)
+			if x ~= y then
+				parent[y] = x
+			end
+		end
+
+		local paramDefs = {}
+		for r = 0, p.numparams - 1 do
+			paramDefs[r] = newDef("param", nil, r)
+		end
+		local prepOfBody = {}
+		for _, ins in seq do
+			ins.defIds = {}
+			for _, r in ins.defs do
+				ins.defIds[r] = newDef("normal", ins, r)
+			end
+			if ins.op == OP.FORNPREP then
+				ins.lvDef = newDef("loopvar", ins, ins.a + 2)
+				ins.defIds[ins.a + 2] = ins.lvDef
+				ins.defIds[ins.a] = newDef("hidden", ins, ins.a)
+				ins.defIds[ins.a + 1] = newDef("hidden", ins, ins.a + 1)
+				prepOfBody[ins.next] = ins
+			elseif FORGPREPS[ins.op] then
+				for r = ins.a, ins.a + 2 do
+					ins.defIds[r] = newDef("hidden", ins, r)
+				end
+			end
+		end
+		for _, ins in seq do
+			if ins.op == OP.FORNLOOP then
+				local prep = prepOfBody[ins.target]
+				if not prep or prep.a ~= ins.a then
+					fail("FORNLOOP without its FORNPREP")
+				end
+				ins.defIds[ins.a + 2] = prep.lvDef
+				ins.defIds[ins.a] = newDef("hidden", ins, ins.a)
+				ins.defIds[ins.a + 1] = newDef("hidden", ins, ins.a + 1)
+			elseif ins.op == OP.FORGLOOP then
+				local count = band(ins.aux, 255)
+				ins.lvDefs = {}
+				for n = 1, count do
+					local r = ins.a + 2 + n
+					ins.lvDefs[n] = newDef("loopvar", ins, r)
+					ins.defIds[r] = ins.lvDefs[n]
+				end
+				if not ins.defIds[ins.a + 2] then
+					ins.defIds[ins.a + 2] = newDef("hidden", ins, ins.a + 2)
+				end
+			end
+		end
+
+		-- * reaching definitions per block: OUT[reg] = last def in block, or IN[reg]
+		local gen = {}
+		for _, block in blocks do
+			local g = {}
+			for _, ins in block.insns do
+				for r, id in ins.defIds do
+					g[r] = id
+				end
+			end
+			gen[block] = g
+		end
+		local IN, OUT = {}, {}
+		for _, block in blocks do
+			IN[block], OUT[block] = {}, {}
+		end
+		do
+			local entry = blocks[1]
+			for r, id in paramDefs do
+				IN[entry][r] = { [id] = true }
+			end
+			local work, queued = {}, {}
+			for _, block in blocks do
+				work[#work + 1] = block
+				queued[block] = true
+			end
+			while #work > 0 do
+				local block = remove(work)
+				queued[block] = nil
+				-- * the entry block can be a loop header too: parameters AND its predecessors
+				local inSet = {}
+				if block == entry then
+					for r, id in paramDefs do
+						inSet[r] = { [id] = true }
+					end
+				end
+				do
+					for _, pred in block.pred do
+						for r, set in OUT[pred] do
+							local mine = inSet[r]
+							if not mine then
+								mine = {}
+								inSet[r] = mine
+							end
+							for id in set do
+								mine[id] = true
+							end
+						end
+					end
+					IN[block] = inSet
+				end
+				local out = {}
+				for r, set in inSet do
+					out[r] = set
+				end
+				for r, id in gen[block] do
+					out[r] = { [id] = true }
+				end
+				local changed = false
+				local old = OUT[block]
+				for r, set in out do
+					local o = old[r]
+					if not o then
+						changed = true
+						break
+					end
+					for id in set do
+						if not o[id] then
+							changed = true
+							break
+						end
+					end
+					if changed then
+						break
+					end
+				end
+				if changed then
+					OUT[block] = out
+					for _, succ in block.succ do
+						if not queued[succ] then
+							queued[succ] = true
+							work[#work + 1] = succ
+						end
+					end
+				end
+			end
+		end
+
+		-- * resolve every read to the definitions that reach it
+		local uses = {} -- list of { ins, reg, def }
+		for _, block in blocks do
+			local cur = {}
+			for r, set in IN[block] do
+				cur[r] = set
+			end
+			for _, ins in block.insns do
+				ins.useDef = {}
+				local function resolveUses()
+					for _, r in ins.uses do
+						if ins.useDef[r] == nil then
+							local set = cur[r]
+							local first
+							if set then
+								for id in set do
+									if first then
+										union(first, id)
+									else
+										first = id
+									end
+								end
+							end
+							if not first then
+								first = newDef("undefined", ins, r)
+							end
+							ins.useDef[r] = first
+							uses[#uses + 1] = { ins = ins, reg = r, def = first }
+						end
+					end
+				end
+				local function applyDefs()
+					for r, id in ins.defIds do
+						cur[r] = { [id] = true }
+					end
+				end
+				if ins.op == OP.NEWCLOSURE or ins.op == OP.DUPCLOSURE then
+					applyDefs()
+					resolveUses()
+				else
+					resolveUses()
+					applyDefs()
+				end
+			end
+		end
+
+		-- * a register captured by reference is ONE variable from the capture until CLOSEUPVALS:
+		-- * every write and read of it in that window belongs to the same variable
+		local openIn = {}
+		do
+			local function transfer(state, ins, onTouch)
+				if onTouch then
+					for _, r in ins.uses do
+						local open = state[r]
+						if open then
+							for cid in open do
+								onTouch(ins.useDef[r], cid)
+							end
+						end
+					end
+					for r, id in ins.defIds do
+						local open = state[r]
+						if open then
+							for cid in open do
+								onTouch(id, cid)
+							end
+						end
+					end
+				end
+				if ins.op == OP.NEWCLOSURE or ins.op == OP.DUPCLOSURE then
+					for _, cap in ins.captures do
+						if cap.a == 1 then
+							local r = cap.b
+							local set = {}
+							if state[r] then
+								for cid in state[r] do
+									set[cid] = true
+								end
+							end
+							set[ins.useDef[r]] = true
+							state[r] = set
+						end
+					end
+				elseif ins.op == OP.CLOSEUPVALS then
+					for r in state do
+						if r >= ins.a then
+							state[r] = nil
+						end
+					end
+				end
+			end
+			local outState = {}
+			local work, queued = {}, {}
+			for _, block in blocks do
+				work[#work + 1] = block
+				queued[block] = true
+				outState[block] = {}
+			end
+			while #work > 0 do
+				local block = remove(work, 1)
+				queued[block] = nil
+				local state = {}
+				for _, pred in block.pred do
+					for r, set in outState[pred] do
+						local mine = state[r]
+						if not mine then
+							mine = {}
+							state[r] = mine
+						end
+						for cid in set do
+							mine[cid] = true
+						end
+					end
+				end
+				local snapshot = {}
+				for r, set in state do
+					local copy = {}
+					for cid in set do
+						copy[cid] = true
+					end
+					snapshot[r] = copy
+				end
+				openIn[block] = snapshot
+				for _, ins in block.insns do
+					transfer(state, ins)
+				end
+				local old = outState[block]
+				local changed = false
+				for r, set in state do
+					for cid in set do
+						if not (old[r] and old[r][cid]) then
+							changed = true
+						end
+					end
+				end
+				if changed then
+					outState[block] = state
+					for _, succ in block.succ do
+						if not queued[succ] then
+							queued[succ] = true
+							work[#work + 1] = succ
+						end
+					end
+				end
+			end
+			for _, block in blocks do
+				local state = {}
+				for r, set in openIn[block] do
+					local copy = {}
+					for cid in set do
+						copy[cid] = true
+					end
+					state[r] = copy
+				end
+				for _, ins in block.insns do
+					transfer(state, ins, union)
+				end
+			end
+		end
+
+		-- * webs (= variables)
+		local webs = {}
+		local function web(id)
+			local root = find(id)
+			local w = webs[root]
+			if not w then
+				w = { id = root, defs = {}, uses = {}, captured = false, kinds = {} }
+				webs[root] = w
+			end
+			return w
+		end
+		for id, info in defInfo do
+			local w = web(id)
+			w.defs[#w.defs + 1] = id
+			w.kinds[info.kind] = true
+		end
+		for _, u in uses do
+			local w = web(u.def)
+			w.uses[#w.uses + 1] = u
+			if (u.ins.op == OP.NEWCLOSURE or u.ins.op == OP.DUPCLOSURE) then
+				w.captured = true
+			end
+		end
+		local function webOf(id)
+			return webs[find(id)]
+		end
+
+		-- * a temporary: written once, read once, in the same block, never captured
+		for _, w in webs do
+			local onlyDef = #w.defs == 1 and defInfo[w.defs[1]]
+			local tempish = onlyDef and onlyDef.kind == "normal" and not w.captured and #w.uses >= 1
+			if tempish then
+				for _, u in w.uses do
+					if u.ins.block ~= onlyDef.ins.block or u.ins.index <= onlyDef.ins.index then
+						tempish = false
+					end
+				end
+			end
+			w.tempish = tempish
+			w.temp = tempish and #w.uses == 1
+			w.useLeft = #w.uses
+		end
+
+		-- * liveness of variables at block entries (for hoisting declarations out of loops)
+		local liveIn = {}
+		do
+			local useB, defB = {}, {}
+			for _, block in blocks do
+				local u, d = {}, {}
+				for _, ins in block.insns do
+					local function doUses()
+						for _, r in ins.uses do
+							local w = webOf(ins.useDef[r])
+							if not d[w] then
+								u[w] = true
+							end
+						end
+					end
+					local function doDefs()
+						for _, id in ins.defIds do
+							d[webOf(id)] = true
+						end
+					end
+					if ins.op == OP.NEWCLOSURE or ins.op == OP.DUPCLOSURE then
+						doDefs()
+						doUses()
+					else
+						doUses()
+						doDefs()
+					end
+				end
+				useB[block], defB[block] = u, d
+				liveIn[block] = {}
+			end
+			local changed = true
+			while changed do
+				changed = false
+				for n = #blocks, 1, -1 do
+					local block = blocks[n]
+					local live = {}
+					for _, succ in block.succ do
+						for w in liveIn[succ] do
+							live[w] = true
+						end
+					end
+					for w in defB[block] do
+						live[w] = nil
+					end
+					for w in useB[block] do
+						live[w] = true
+					end
+					local old = liveIn[block]
+					for w in live do
+						if not old[w] then
+							changed = true
+							break
+						end
+					end
+					liveIn[block] = live
+				end
+			end
+		end
+
+		local openWebsAt = {}
+		for _, block in blocks do
+			local set = {}
+			for _, cids in openIn[block] do
+				for cid in cids do
+					set[webOf(cid)] = true
+				end
+			end
+			openWebsAt[block.start] = set
+		end
+
+		local backSources = {}
+		for _, ins in seq do
+			ins.nextLive = nextLive(ins.next)
+			if ins.target and ins.target <= ins.pc and (UNCONDITIONAL[ins.op] or CONDITIONAL[ins.op]) and not ins.boolmat then
+				local list = backSources[ins.target]
+				if not list then
+					list = {}
+					backSources[ins.target] = list
+				end
+				list[#list + 1] = ins
+			end
+		end
+
+		return {
+			p = p, K = K, seq = seq, byPc = byPc, prevOf = prevOf, incoming = incoming, blocks = blocks,
+			blockAt = blockAt, webOf = webOf, webs = webs, defInfo = defInfo, liveIn = liveIn,
+			openWebsAt = openWebsAt, backSources = backSources, paramDefs = paramDefs,
+		}
+	end
+
+	--------------------------------------------------------------------------
+	-- structuring
+	--------------------------------------------------------------------------
+	local function structure(A)
+		local byPc, seq = A.byPc, A.seq
+		local size = A.p.sizecode
+
+		local function insAt(pc)
+			return byPc[pc]
+		end
+		local function lastBefore(pc)
+			return A.prevOf[pc]
+		end
+
+		-- * jumps into `pc` from anywhere except the listed instructions
+		local function externalIncoming(pc, allowed)
+			local list = A.incoming[pc]
+			if not list then
+				return false
+			end
+			for _, ins in list do
+				if not allowed[ins] then
+					return true
+				end
+			end
+			return false
+		end
+
+		-- * an instruction whose only effect is a temporary that is read inside [from, to]
+		local function isTempDef(ins, from, to)
+			if NOOPS[ins.op] then
+				return true -- * FASTCALL hints have no effect of their own
+			end
+			if (ins.op == OP.CALL and ins.c == 0) or (ins.op == OP.GETVARARGS and ins.b == 0) then
+				-- * a multret value consumed in the same range
+				return ins.multretTo ~= nil and ins.multretTo.pc >= from and ins.multretTo.pc <= to
+			end
+			if ins.boolmat or ins.target or #ins.defs == 0 then
+				return false
+			end
+			if ins.op == OP.CALL and ins.c ~= 2 then
+				return false
+			end
+			for r, id in ins.defIds do
+				local w = A.webOf(id)
+				if not w.temp then
+					return false
+				end
+				local u = w.uses[1].ins
+				if u.pc < from or u.pc > to then
+					return false
+				end
+			end
+			return true
+		end
+
+		local structRange
+
+		-- * jumping to an unconditional jump is the same as jumping to where it goes (the compiler
+		-- * threads jumps: a loop followed by `JUMP x` may exit straight to x)
+		local function canonical(pc)
+			for _ = 1, 16 do
+				local ins = insAt(pc)
+				if ins and UNCONDITIONAL[ins.op] then
+					pc = ins.target
+				else
+					break
+				end
+			end
+			return pc
+		end
+
+		-- * a chain of conditional jumps forming one and/or condition
+		local function buildChains(first, e, preFirst)
+			local segs = { { pre = preFirst or {}, jump = first, start = (preFirst and preFirst[1] and preFirst[1].pc) or first.pc } }
+			local candidates = {}
+			local function consistent()
+				local n = #segs
+				local tthen, telse = segs[n].jump.next, segs[n].jump.target
+				local starts = {}
+				for k = 2, n do
+					starts[segs[k].start] = k
+				end
+				for i = 1, n - 1 do
+					local t = segs[i].jump.target
+					local k = starts[t]
+					if not (t == tthen or t == telse or (k and k > i)) then
+						return false
+					end
+				end
+				-- * nothing outside the chain may jump into its later segments
+				local chainJumps = {}
+				for k = 1, n do
+					chainJumps[segs[k].jump] = true
+				end
+				for k = 2, n do
+					if externalIncoming(segs[k].start, chainJumps) then
+						return false
+					end
+					for _, ins in segs[k].pre do
+						if ins.pc ~= segs[k].start and externalIncoming(ins.pc, {}) then
+							return false
+						end
+					end
+					if segs[k].jump.pc ~= segs[k].start and externalIncoming(segs[k].jump.pc, {}) then
+						return false
+					end
+				end
+				return true
+			end
+			if consistent() then
+				candidates[#candidates + 1] = #segs
+			end
+			for _ = 1, 64 do
+				local last = segs[#segs].jump
+				local pc = last.next
+				local startPc = pc
+				local pre = {}
+				local ins = insAt(pc)
+				while ins and pc < e and not CONDITIONAL[ins.op] and isTempDef(ins, startPc, size) do
+					pre[#pre + 1] = ins
+					pc = ins.next
+					ins = insAt(pc)
+				end
+				if not ins or pc >= e or not CONDITIONAL[ins.op] or ins.boolmat or A.backSources[startPc] then
+					break
+				end
+				for _, p in pre do
+					for _, id in p.defIds do
+						local u = A.webOf(id).uses[1].ins
+						if u.pc < startPc or u.pc > ins.pc then
+							return candidates, segs
+						end
+					end
+				end
+				segs[#segs + 1] = { pre = pre, jump = ins, start = startPc }
+				if consistent() then
+					candidates[#candidates + 1] = #segs
+				end
+			end
+			return candidates, segs
+		end
+
+		-- * condition tree for "execution reaches tthen" of segs[1..n]
+		local function chainCondition(segs, n)
+			local tthen, telse = segs[n].jump.next, segs[n].jump.target
+			local f = {}
+			f[n + 1] = TRUE
+			local startIndex = {}
+			for k = 2, n do
+				startIndex[segs[k].start] = k
+			end
+			for i = n, 1, -1 do
+				local leaf = E("cond", { seg = segs[i] })
+				local t = segs[i].jump.target
+				local nextF = f[i + 1]
+				local function andF(x, y)
+					if y == TRUE then
+						return x
+					end
+					return E("and", { l = x, r = y })
+				end
+				if t == tthen and t == telse then
+					f[i] = E("or", { l = leaf, r = nextF }) -- * degenerate, keeps the evaluation
+				elseif t == tthen then
+					f[i] = nextF == TRUE and E("or", { l = leaf, r = TRUE }) or E("or", { l = leaf, r = nextF })
+				elseif t == telse then
+					f[i] = andF(E("not", { e = leaf }), nextF)
+				else
+					local k = startIndex[t]
+					local fk = f[k]
+					local andHead = splitTail(nextF, "and", fk)
+					local orHead = not andHead and splitTail(nextF, "or", fk)
+					if andHead then
+						f[i] = E("and", { l = E("or", { l = leaf, r = andHead }), r = fk })
+					elseif orHead then
+						f[i] = E("or", { l = E("and", { l = E("not", { e = leaf }), r = orHead }), r = fk })
+					else
+						return nil
+					end
+				end
+			end
+			return f[1]
+		end
+
+		local function loopTargets(ctx, target)
+			-- * jumping to `return` (with no values) is the same as returning right there
+			local final = insAt(canonical(target))
+			if final and final.op == OP.RETURN and final.b == 1 then
+				return "return"
+			end
+			local loop = ctx.loop
+			if not loop then
+				return nil
+			end
+			local t = canonical(target)
+			if target == loop.exit or t == canonical(loop.exit) then
+				return "break"
+			end
+			for c in loop.conts do
+				if target == c or t == canonical(c) then
+					return "continue"
+				end
+			end
+			return nil
+		end
+
+		-- * try one chain length; returns the node and the pc to continue at
+		local function tryIf(segs, n, e, ctx)
+			local cond = chainCondition(segs, n)
+			if not cond then
+				return nil
+			end
+			local last = segs[n].jump
+			local tthen, telse = last.next, last.target
+			-- * threaded jump past the end of the enclosing range: same as jumping to its end
+			if telse > e and canonical(e) == canonical(telse) then
+				telse = e
+			end
+			local chain = { segs = { table.unpack(segs, 1, n) }, cond = cond }
+			if telse == tthen then
+				return { kind = "if", chain = chain, thenB = { items = {} } }, tthen
+			end
+			if telse > tthen and telse <= e then
+				local lastThen = lastBefore(telse)
+				if lastThen and lastThen.pc >= tthen and UNCONDITIONAL[lastThen.op] and lastThen.op ~= OP.JUMPBACK then
+					local E2 = lastThen.target
+					if E2 > e and canonical(e) == canonical(E2) then
+						E2 = e
+					end
+					if E2 > telse and E2 <= e then
+						local ok1, thenB = pcall(structRange, tthen, lastThen.pc, ctx)
+						local ok2, elseB
+						if ok1 then
+							ok2, elseB = pcall(structRange, telse, E2, ctx)
+						end
+						if ok1 and ok2 then
+							return { kind = "if", chain = chain, thenB = thenB, elseB = elseB }, E2
+						end
+						-- * the jump may instead be a break / continue / return with no else
+						if not loopTargets(ctx, E2) then
+							return nil, ok1 and elseB or thenB
+						end
+					elseif not loopTargets(ctx, E2) then
+						return nil, "jump out of an if"
+					end
+				end
+				local ok, thenB = pcall(structRange, tthen, telse, ctx)
+				if not ok then
+					return nil, thenB
+				end
+				return { kind = "if", chain = chain, thenB = thenB }, telse
+			end
+			local action = loopTargets(ctx, telse)
+			if action then
+				return { kind = "condjump", chain = chain, action = action }, tthen
+			end
+			return nil, "conditional jump to " .. telse .. " cannot be structured"
+		end
+
+		-- * `x = a and b or c` and friends: conditional jumps plus value "leaves" that all write one
+		-- * register R, ending at one join point. Rebuilt as an and/or expression (or `if c then a
+		-- * else b` when allowCond), only when every test and leaf is used exactly once.
+		local function tryValueExpr(first, e, items, allowCond)
+			local elements = {}
+			local R
+			local pc = first.pc
+			local Jn = first.target
+			local positions = {}
+			local regionJumps = {}
+			local guard = 0
+			while pc < Jn do
+				guard += 1
+				if guard > 256 then
+					return nil
+				end
+				local ins = insAt(pc)
+				if not ins or pc >= e then
+					return nil
+				end
+				if CONDITIONAL[ins.op] and not ins.boolmat then
+					if ins.target <= ins.pc or ins.target > e then
+						return nil
+					end
+					positions[pc] = #elements + 1
+					elements[#elements + 1] = { kind = "test", seg = { pre = {}, jump = ins }, startPc = pc }
+					regionJumps[ins] = true
+					if ins.target > Jn then
+						Jn = ins.target
+					end
+					pc = ins.next
+				else
+					local startPc = pc
+					local run = {}
+					while ins and pc < e and pc < Jn and not (CONDITIONAL[ins.op] and not ins.boolmat) and (pc == startPc or not A.incoming[pc]) do
+						local multretOk = ((ins.op == OP.CALL and ins.c == 0) or (ins.op == OP.GETVARARGS and ins.b == 0))
+						if (ins.target and not ins.boolmat) or (#ins.defs == 0 and not NOOPS[ins.op] and not multretOk) then
+							return nil
+						end
+						run[#run + 1] = ins
+						pc = ins.next
+						ins = insAt(pc)
+					end
+					if #run == 0 then
+						return nil
+					end
+					-- * split off trailing setup for the next test (temporaries it reads)
+					local preStart = #run + 1
+					local nextIsTest = ins and CONDITIONAL[ins.op] and not ins.boolmat and pc < Jn and not A.incoming[pc]
+					if nextIsTest then
+						while preStart > 1 and isTempDef(run[preStart - 1], run[preStart - 1].pc, ins.pc) do
+							preStart -= 1
+						end
+					end
+					local isPre = nextIsTest and preStart == 1
+					if nextIsTest and preStart > 1 and preStart <= #run then
+						-- * value first, then the test's setup
+						local valueRun = { table.unpack(run, 1, preStart - 1) }
+						local preRun = { table.unpack(run, preStart) }
+						local lastValue = valueRun[#valueRun]
+						if #lastValue.defs ~= 1 then
+							return nil
+						end
+						local reg = lastValue.defs[1]
+						if R and R ~= reg then
+							return nil
+						end
+						R = reg
+						for n2 = 1, #valueRun - 1 do
+							if not isTempDef(valueRun[n2], startPc, lastValue.pc) then
+								return nil
+							end
+						end
+						positions[startPc] = #elements + 1
+						elements[#elements + 1] = { kind = "leaf", run = valueRun, startPc = startPc }
+						if ins.target <= ins.pc or ins.target > e then
+							return nil
+						end
+						local preStartPc = preRun[1].pc
+						positions[preStartPc] = #elements + 1
+						elements[#elements + 1] = { kind = "test", seg = { pre = preRun, jump = ins }, startPc = preStartPc }
+						regionJumps[ins] = true
+						if ins.target > Jn then
+							Jn = ins.target
+						end
+						pc = ins.next
+					elseif isPre then
+						if ins.target <= ins.pc or ins.target > e then
+							return nil
+						end
+						positions[startPc] = #elements + 1
+						elements[#elements + 1] = { kind = "test", seg = { pre = run, jump = ins }, startPc = startPc }
+						regionJumps[ins] = true
+						if ins.target > Jn then
+							Jn = ins.target
+						end
+						pc = ins.next
+					else
+						local lastRun = run[#run]
+						if #lastRun.defs ~= 1 then
+							return nil
+						end
+						local reg = lastRun.defs[1]
+						if R and R ~= reg then
+							return nil
+						end
+						R = reg
+						for n = 1, #run - 1 do
+							if not isTempDef(run[n], startPc, lastRun.pc) then
+								return nil
+							end
+						end
+						positions[startPc] = #elements + 1
+						elements[#elements + 1] = { kind = "leaf", run = run, startPc = startPc }
+					end
+				end
+			end
+			if pc ~= Jn or #elements < 2 or not R or elements[#elements].kind ~= "leaf" then
+				return nil
+			end
+			for _, el in elements do
+				if el.kind == "test" then
+					local j = el.seg.jump
+					if (j.op == OP.JUMPIF or j.op == OP.JUMPIFNOT) and j.a == R then
+						if #el.seg.pre > 0 then
+							return nil
+						end
+						el.rtest = j.op == OP.JUMPIF and "truthy" or "falsy"
+					end
+					if j.target ~= Jn and not positions[j.target] then
+						return nil
+					end
+				end
+				if el.startPc ~= first.pc and externalIncoming(el.startPc, regionJumps) then
+					return nil
+				end
+			end
+
+			-- * the value tree, built backwards from the join point
+			local CUR = { k = "cur" }
+			local FIELDS = { "l", "r", "a", "b", "c" }
+			local function countCur(t)
+				if t == CUR then
+					return 1
+				end
+				local n = 0
+				for _, f in FIELDS do
+					if t[f] then
+						n += countCur(t[f])
+					end
+				end
+				return n
+			end
+			local function subst(t, leaf)
+				if t == CUR then
+					return leaf
+				end
+				if countCur(t) == 0 then
+					return t -- * keep shared subtrees shared
+				end
+				local copy = table.clone(t)
+				for _, f in FIELDS do
+					if t[f] then
+						copy[f] = subst(t[f], leaf)
+					end
+				end
+				return copy
+			end
+			local F = {}
+			local m = #elements
+			F[m + 1] = CUR
+			local hasCond = false
+			-- * `x = c and v` compiled as `x = false; if c then x = v end`. The constant may sit before
+			-- * the first test's own setup code (it has no side effects, so that is fine).
+			local falseIndex = #items
+			while falseIndex >= 1 and items[falseIndex].kind == "ins" and isTempDef(items[falseIndex].ins, items[falseIndex].ins.pc, first.pc) do
+				falseIndex -= 1
+			end
+			local prevItem = items[falseIndex]
+			local startsFalse = prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 0
+				and prevItem.ins.c == 0 and prevItem.ins.a == R
+			local usedFalse = false
+			for k = m, 1, -1 do
+				local el = elements[k]
+				if el.kind == "leaf" then
+					if countCur(F[k + 1]) ~= 1 then
+						return nil
+					end
+					F[k] = subst(F[k + 1], { k = "leaf", el = el })
+				else
+					local t = el.seg.jump.target
+					local Ft = t == Jn and CUR or F[positions[t]]
+					local Fn = F[k + 1]
+					if el.rtest then
+						if Ft == CUR then
+							if countCur(Fn) ~= 0 then
+								return nil
+							end
+							F[k] = { k = el.rtest == "truthy" and "or" or "and", l = CUR, r = Fn, el = el }
+						elseif el.rtest == "truthy" and splitTail(Fn, "and", Ft) then
+							F[k] = { k = "and", l = { k = "or", l = CUR, r = splitTail(Fn, "and", Ft), el = el }, r = Ft, el = Fn.el }
+						elseif el.rtest == "falsy" and splitTail(Fn, "or", Ft) then
+							F[k] = { k = "or", l = { k = "and", l = CUR, r = splitTail(Fn, "or", Ft), el = el }, r = Ft, el = Fn.el }
+						else
+							return nil
+						end
+					elseif Ft == CUR and startsFalse and countCur(Fn) == 0 then
+						F[k] = { k = "and", l = { k = "fall", el = el }, r = Fn }
+						usedFalse = true
+					elseif Ft ~= CUR and splitTail(Fn, "or", Ft) then
+						-- * c' ? (X or W) : W  ==  (c' and X) or W
+						F[k] = { k = "or", l = { k = "and", l = { k = "fallc", el = el }, r = splitTail(Fn, "or", Ft) }, r = Ft, el = Fn.el }
+					else
+						F[k] = { k = "cond", c = { k = "taken", el = el }, a = Ft, b = Fn }
+						hasCond = true
+					end
+				end
+			end
+			local tree = F[1]
+			local seen, dup = {}, false
+			local function walk(t)
+				if t.el then
+					if seen[t.el] then
+						dup = true
+					end
+					seen[t.el] = true
+				end
+				for _, f in FIELDS do
+					if t[f] then
+						walk(t[f])
+					end
+				end
+			end
+			walk(tree)
+			if dup then
+				return nil
+			end
+			for _, el in elements do
+				if not seen[el] then
+					return nil
+				end
+			end
+			-- * c ? false : x  is  (not c) and x  -- not a real if-expression
+			local realCond = false
+			local function isFalseLeaf(t)
+				return t.k == "leaf" and #t.el.run == 1 and t.el.run[1].op == OP.LOADB and t.el.run[1].b == 0 and t.el.run[1].c == 0
+			end
+			local function scanCond(t)
+				if t.k == "cond" and not isFalseLeaf(t.a) and not (t.a == CUR and startsFalse) then
+					realCond = true
+				end
+				for _, f in FIELDS do
+					if t[f] and t[f] ~= CUR then
+						scanCond(t[f])
+					end
+				end
+			end
+			scanCond(tree)
+			if realCond and not allowCond then
+				return nil
+			end
+			local leaf0, leaf0Index
+			local cur = countCur(tree)
+			if cur > 1 then
+				return nil
+			elseif cur == 1 then
+				local prev = items[#items]
+				leaf0Index = #items
+				if not (prev and prev.kind == "ins" and #prev.ins.defs == 1 and prev.ins.defs[1] == R
+					and not (prev.ins.target and not prev.ins.boolmat) and prev.ins.next == first.pc)
+				then
+					return nil
+				end
+				leaf0 = prev.ins
+			end
+			local dropLeaf0 = false
+			if cur == 0 and usedFalse then
+				leaf0, dropLeaf0, leaf0Index = prevItem.ins, true, falseIndex
+			end
+			local firstTest = elements[1].kind == "test" and (not leaf0 or dropLeaf0) and elements[1] or nil
+			-- * everything the expression is built from, for "is the result only used once, right after?"
+			local regionIns = {}
+			for _, el in elements do
+				for _, i2 in (el.run or el.seg.pre) do
+					regionIns[i2] = true
+				end
+				if el.seg then
+					regionIns[el.seg.jump] = true
+				end
+			end
+			if leaf0 then
+				regionIns[leaf0] = true
+			end
+			return { kind = "valexpr", reg = R, tree = tree, cur = CUR, leaf0 = leaf0, leaf0Index = leaf0Index, dropLeaf0 = dropLeaf0, firstTest = firstTest, regionIns = regionIns, join = Jn }, Jn
+		end
+
+		-- * Last resort for forward jumps to a common point J (inlined functions' early returns):
+		-- * `repeat ... until true` runs once, and `break` jumps to J.
+		local function tryBreakBlock(s0, e)
+			local targets, list = {}, {}
+			local pc = s0
+			while pc < e do
+				local i = insAt(pc)
+				if not i then
+					break
+				end
+				if i.target and not i.boolmat and i.target > s0 and i.target <= e and not targets[i.target] then
+					targets[i.target] = true
+					list[#list + 1] = i.target
+				end
+				pc = i.next
+			end
+			table.sort(list)
+			for n, J in list do
+				if n > 12 then
+					break
+				end
+				local blockLoop = { header = s0, exit = J, conts = {}, isBlock = true }
+				local ok, body = pcall(structRange, s0, J, { loop = blockLoop })
+				if ok then
+					return { kind = "breakblock", body = body, loop = blockLoop }, J
+				end
+			end
+			return nil
+		end
+
+		local function handleIf(first, e, ctx)
+			local candidates, segs = buildChains(first, e)
+			local lastErr = "no usable condition"
+			for c = #candidates, 1, -1 do
+				local node, nextPc = tryIf(segs, candidates[c], e, ctx)
+				if node then
+					return node, nextPc
+				end
+				lastErr = nextPc or lastErr
+			end
+			if string.find(tostring(lastErr), FAIL, 1, true) then
+				error(lastErr, 0)
+			end
+			fail(lastErr)
+		end
+
+		-- * memo + budget: the fallbacks (shorter chains, break blocks) retry sub-ranges, which
+		-- * must not blow up on large functions
+		local memo = {}
+		local budget = 4000
+		local rawStructRange
+		function structRange(s, e, ctx)
+			local loop = ctx.loop
+			local key = s .. ":" .. e
+			if loop then
+				local conts = {}
+				for c in loop.conts do
+					conts[#conts + 1] = c
+				end
+				table.sort(conts)
+				key ..= ":" .. tostring(loop.exit) .. ":" .. tostring(loop.header) .. ":" .. concat(conts, ",") .. (loop.isBlock and ":b" or "")
+			end
+			local hit = memo[key]
+			if hit then
+				if hit.err then
+					error(hit.err, 0)
+				end
+				return hit.block
+			end
+			budget -= 1
+			if budget < 0 then
+				fail("function too complex to structure")
+			end
+			memo[key] = { err = FAIL .. "range is already being structured" } -- * no retrying itself
+			local ok, result = pcall(rawStructRange, s, e, ctx)
+			if ok then
+				memo[key] = { block = result }
+				return result
+			end
+			memo[key] = { err = result }
+			error(result, 0)
+		end
+
+		function rawStructRange(s, e, ctx)
+			local block = { items = {} }
+			local items = block.items
+			local pc = s
+			while pc < e do
+				local ins = insAt(pc)
+				if not ins then
+					fail("no instruction at " .. pc)
+				end
+				if ins.dead or (ins.unreachable and UNCONDITIONAL[ins.op]) then
+					pc = ins.next
+					continue
+				end
+				-- * while / repeat loop with header here
+				local sources = A.backSources[pc]
+				local B
+				if sources then
+					for _, src in sources do
+						if src.pc < e and src.pc >= pc and (not B or src.pc > B.pc) then
+							B = src
+						end
+					end
+				end
+				if B and not (ctx.loop and ctx.loop.conts[pc]) then
+					if not UNCONDITIONAL[B.op] then
+						fail("conditional backward jump")
+					end
+					local exit = B.next
+					local loop = { header = pc, exit = exit, conts = { [pc] = true, [B.pc] = true }, backPc = B.pc }
+					local loopCtx = { loop = loop }
+					local node
+					-- * `while cond do`: the loop starts with a condition that jumps to the exit
+					local pre, scan = {}, pc
+					local first = insAt(scan)
+					while first and scan < B.pc and not CONDITIONAL[first.op] and isTempDef(first, pc, B.pc) do
+						pre[#pre + 1] = first
+						scan = first.next
+						first = insAt(scan)
+					end
+					if first and CONDITIONAL[first.op] and not first.boolmat and scan < B.pc then
+						local candidates, segs = buildChains(first, B.pc, pre)
+						segs[1].start = pc
+						for c = #candidates, 1, -1 do
+							local n = candidates[c]
+							local last = segs[n].jump
+							if (last.target == exit or canonical(last.target) == canonical(exit)) and last.next <= B.pc then
+								local cond = chainCondition(segs, n)
+								if cond then
+									local ok, body = pcall(structRange, last.next, B.pc, loopCtx)
+									if ok then
+										local header = pc
+										node = {
+											kind = "while", chain = { segs = { table.unpack(segs, 1, n) }, cond = cond }, body = body, loop = loop,
+											fullBody = function()
+												return structRange(header, B.pc, { loop = loop })
+											end,
+										}
+										break
+									end
+								end
+							end
+						end
+					end
+					if not node then
+						local body = structRange(pc, B.pc, { loop = loop, inLoopBody = true })
+						node = { kind = "while", body = body, loop = loop }
+					end
+					items[#items + 1] = node
+					pc = exit
+				elseif ins.op == OP.FORNPREP then
+					local exit = ins.target
+					local loopIns = lastBefore(exit)
+					if not loopIns or loopIns.op ~= OP.FORNLOOP or loopIns.target ~= ins.next or loopIns.a ~= ins.a or exit > e then
+						fail("malformed numeric for")
+					end
+					local loop = { header = ins.next, exit = exit, conts = { [loopIns.pc] = true } }
+					local body = structRange(ins.next, loopIns.pc, { loop = loop })
+					items[#items + 1] = { kind = "numfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
+					pc = exit
+				elseif FORGPREPS[ins.op] then
+					local loopIns = insAt(ins.target)
+					if not loopIns or loopIns.op ~= OP.FORGLOOP or loopIns.target ~= ins.next or loopIns.a ~= ins.a or loopIns.next > e then
+						fail("malformed generic for")
+					end
+					local loop = { header = ins.next, exit = loopIns.next, conts = { [loopIns.pc] = true } }
+					local body = structRange(ins.next, loopIns.pc, { loop = loop })
+					items[#items + 1] = { kind = "genfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
+					pc = loopIns.next
+				elseif CONDITIONAL[ins.op] and not ins.boolmat then
+					-- * prefer `x = a and b or c`, then if statements, then `if c then a else b` values
+					local node, nextPc = tryValueExpr(ins, e, items, false)
+					if not node then
+						local ok, n2, p2 = pcall(handleIf, ins, e, ctx)
+						if ok then
+							node, nextPc = n2, p2
+						else
+							node, nextPc = tryValueExpr(ins, e, items, true)
+							if not node then
+								node, nextPc = tryBreakBlock(ins.pc, e)
+							end
+							if not node then
+								error(n2, 0)
+							end
+						end
+					end
+					if node.kind == "valexpr" and node.leaf0 then
+						remove(items, node.leaf0Index) -- * its first value is part of the expression
+					end
+					items[#items + 1] = node
+					pc = nextPc
+				elseif UNCONDITIONAL[ins.op] and ins.target > ins.pc and (function()
+					local q = ins.next
+					while q < ins.target do
+						local i2 = insAt(q)
+						if not i2 or not i2.unreachable then
+							return false
+						end
+						q = i2.next
+					end
+					return q == ins.target
+				end)() then
+					pc = ins.target -- * jumps over code that never runs: a no-op
+				elseif UNCONDITIONAL[ins.op] then
+					local action = loopTargets(ctx, ins.target)
+					if not action then
+						fail("unstructured jump from " .. ins.pc .. " to " .. ins.target)
+					end
+					items[#items + 1] = { kind = action }
+					pc = ins.next
+				elseif ins.op == OP.FORNLOOP or ins.op == OP.FORGLOOP or (ins.op == OP.LOADB and ins.c ~= 0) then
+					fail("stray loop/jump instruction")
+				else
+					items[#items + 1] = { kind = "ins", ins = ins }
+					pc = ins.next
+				end
+			end
+			if pc ~= e then
+				fail("range overrun")
+			end
+			return block
+		end
+
+		return structRange(0, size, {})
+	end
+
+	--------------------------------------------------------------------------
+	-- intermediate representation with folded expressions
+	--------------------------------------------------------------------------
+	local function buildIR(A, ast, ctx)
+		local K = A.K
+		local webOf = A.webOf
+		local materialized = {}
+
+		local function newBlock(parent, loopStmt)
+			return { stmts = {}, parent = parent, depth = parent and parent.depth + 1 or 0, loop = loopStmt }
+		end
+
+		local function constExpr(k)
+			if k.t == "nil" then
+				return E("const", { text = "nil" })
+			end
+			return E("const", { text = Lifter.constText(k), value = k })
+		end
+		local function K_(i)
+			local k = K[i]
+			if not k then
+				fail("missing constant")
+			end
+			if k.t == "vector" then
+				ctx.globals.Vector3 = true
+			end
+			return constExpr(k)
+		end
+		local function Ks(i)
+			local k = K[i]
+			if not k or k.t ~= "string" then
+				fail("expected a string constant")
+			end
+			return k.v
+		end
+
+		local function varExpr(w)
+			materialized[w] = true
+			w.noFold = true
+			return E("var", { w = w })
+		end
+
+		-- * Fold operands back into expressions. A temporary is folded only if it is the most recent
+		-- * unfolded statement (skipping constants), taking candidates in reverse order of the
+		-- * instruction that computed them. That keeps every side effect in its original order,
+		-- * whatever order the compiler chose for this construct (built-in calls load the function
+		-- * last, method calls compute the arguments before NAMECALL, ...).
+		local function takeOperands(block, ins, regs, multret, allowNamed)
+			local stmts = block.stmts
+			local exprs = {}
+			local cands = {}
+			local n = #regs + (multret and 1 or 0)
+			for i, r in regs do
+				local w
+				if type(r) == "table" then
+					w = webOf(r.ins.useDef[r.reg])
+				else
+					w = webOf(ins.useDef[r])
+				end
+				if w.tempish and w.useLeft == 1 and not w.noFold then
+					cands[#cands + 1] = { slot = i, w = w, at = A.defInfo[w.defs[1]].ins.index }
+				else
+					exprs[i] = varExpr(w)
+				end
+				w.useLeft -= 1
+			end
+			if multret then
+				cands[#cands + 1] = { slot = n, multret = multret, at = multret.index }
+			end
+			table.sort(cands, function(x, y)
+				return x.at > y.at
+			end)
+			local j = #stmts
+			local blocked = false
+			for _, cand in cands do
+				local found
+				if not blocked then
+					local k = j
+					while k >= 1 do
+						local st = stmts[k]
+						if (cand.multret and st.multretOf == cand.multret) or (cand.w and st.tempWeb == cand.w) then
+							if cand.w and st.namedClosure and not allowNamed then
+								break
+							end
+							found = k
+							break
+						end
+						if st.pure and st.tempWeb then
+							k -= 1
+						else
+							break
+						end
+					end
+				end
+				if found then
+					exprs[cand.slot] = stmts[found].value
+					remove(stmts, found)
+					j = found - 1
+				else
+					blocked = true
+					-- * constants can be moved freely
+					local moved = false
+					if cand.w then
+						for k = #stmts, 1, -1 do
+							local st = stmts[k]
+							if st.tempWeb == cand.w and st.pure then
+								exprs[cand.slot] = st.value
+								remove(stmts, k)
+								if k <= j then
+									j -= 1
+								end
+								moved = true
+								break
+							end
+						end
+					end
+					if not moved then
+						if cand.multret then
+							fail("multret value could not be placed")
+						end
+						exprs[cand.slot] = varExpr(cand.w)
+					end
+				end
+			end
+			return exprs
+		end
+
+		-- * does the expression read the variable `w` (e.g. `t.self = t`)?
+		local function mentions(e, w)
+			local found = false
+			local function visit(x)
+				if found or not x then
+					return
+				end
+				if x.k == "var" and x.w == w then
+					found = true
+					return
+				end
+				if x.k == "closure" then
+					for _, cap in x.caps do
+						if type(cap) == "table" and cap.w == w then
+							found = true
+						end
+					end
+				end
+				for _, f in { "obj", "key", "fn", "l", "r", "e", "c", "a", "b" } do
+					if type(x[f]) == "table" then
+						visit(x[f])
+					end
+				end
+				for _, list in { x.args, x.list } do
+					if list then
+						for _, y in list do
+							visit(y)
+						end
+					end
+				end
+				if x.entries then
+					for _, entry in x.entries do
+						visit(entry.key)
+						visit(entry.value)
+					end
+				end
+			end
+			visit(e)
+			return found
+		end
+
+		local function pushDef(block, ins, reg, value, pure)
+			local w = webOf(ins.defIds[reg])
+			local st = { k = "assign", targets = { { k = "var", w = w } }, values = { value }, value = value, pure = pure }
+			if w.tempish then
+				st.tempWeb = w
+			else
+				materialized[w] = true
+			end
+			insert(block.stmts, st)
+			return st
+		end
+
+		local function pushStmt(block, st)
+			insert(block.stmts, st)
+			return st
+		end
+
+		local function condLeaf(block, seg)
+			local ins = seg.jump
+			local op = ins.op
+			local regs = { ins.a }
+			if TWO_REG_COMPARE[op] then
+				regs[2] = ins.aux
+			end
+			local ex = takeOperands(block, ins, regs)
+			local taken
+			if op == OP.JUMPIF then
+				taken = ex[1]
+			elseif op == OP.JUMPIFNOT then
+				taken = E("not", { e = ex[1] })
+			elseif TWO_REG_COMPARE[op] then
+				local cmp = E("binop", { op = TWO_REG_COMPARE[op], l = ex[1], r = ex[2] })
+				taken = NEGATED_COMPARE[op] and E("not", { e = cmp }) or cmp
+			else
+				local aux = ins.aux
+				local value
+				if op == OP.JUMPXEQKNIL then
+					value = E("const", { text = "nil" })
+				elseif op == OP.JUMPXEQKB then
+					value = E("const", { text = band(aux, 1) ~= 0 and "true" or "false" })
+				else
+					value = K_(band(aux, 0xFFFFFF))
+				end
+				taken = E("binop", { op = band(aux, 0x80000000) ~= 0 and "~=" or "==", l = ex[1], r = value })
+			end
+			return taken
+		end
+
+		local emitIns
+		local buildBlock
+
+		-- * condition expression; later segments' setup code must fold away completely
+		local function buildCondition(block, chain, loopFirst)
+			local function walk(node)
+				if node.k == "cond" then
+					local seg = node.seg
+					local target = block
+					local scratch
+					if seg ~= chain.segs[1] or loopFirst then
+						scratch = newBlock(block)
+						scratch.stmts = {}
+						for _, ins in seg.pre do
+							emitIns(scratch, ins)
+						end
+						target = scratch
+					end
+					local taken = condLeaf(target, seg)
+					if scratch and #scratch.stmts > 0 then
+						fail("condition with side statements")
+					end
+					return taken
+				elseif node.k == "and" or node.k == "or" then
+					local l = walk(node.l)
+					local r = walk(node.r)
+					return E(node.k, { l = l, r = r })
+				elseif node.k == "not" then
+					return boolNot(walk(node.e))
+				elseif node == TRUE or node.k == "const" then
+					return node
+				end
+				fail("bad condition node")
+			end
+			-- * the tree is built so that a left-to-right walk visits segments in code order
+			local cond = walk(chain.cond)
+			return cond
+		end
+
+		local function simplifyCond(e)
+			if e.k == "not" then
+				return boolNot(simplifyCond(e.e))
+			elseif e.k == "and" or e.k == "or" then
+				return E(e.k, { l = simplifyCond(e.l), r = simplifyCond(e.r) })
+			end
+			return e
+		end
+
+		function emitIns(block, ins)
+			local op, a, b, c = ins.op, ins.a, ins.b, ins.c
+			if NOOPS[op] or op == OP.CAPTURE or op == OP.CLOSEUPVALS then
+				return
+			end
+			if ins.boolmat then
+				local seg = { jump = ins }
+				local taken = condLeaf(block, seg)
+				local value
+				local isBool = not (op == OP.JUMPIF or op == OP.JUMPIFNOT)
+				if ins.boolmat.whenJump then
+					value = isBool and taken or E("not", { e = E("not", { e = taken }) })
+				else
+					value = E("not", { e = taken })
+				end
+				pushDef(block, ins, ins.boolmat.reg, value, false)
+				return
+			end
+			if op == OP.LOADNIL then
+				pushDef(block, ins, a, E("const", { text = "nil" }), true)
+			elseif op == OP.LOADB then
+				pushDef(block, ins, a, E("const", { text = b ~= 0 and "true" or "false" }), true)
+			elseif op == OP.LOADN then
+				pushDef(block, ins, a, E("const", { text = numLit(ins.d) }), true)
+			elseif op == OP.LOADK then
+				pushDef(block, ins, a, K_(ins.d), true)
+			elseif op == OP.LOADKX then
+				pushDef(block, ins, a, K_(ins.aux), true)
+			elseif op == OP.MOVE then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, ex[1], false)
+			elseif op == OP.GETGLOBAL then
+				local name = Ks(ins.aux)
+				if not isIdent(name) then
+					fail("global with an unusable name")
+				end
+				ctx.globals[name] = true
+				pushDef(block, ins, a, E("global", { name = name }), false)
+			elseif op == OP.SETGLOBAL then
+				local name = Ks(ins.aux)
+				if not isIdent(name) then
+					fail("global with an unusable name")
+				end
+				ctx.globals[name] = true
+				local ex = takeOperands(block, ins, { a }, nil, true)
+				pushStmt(block, { k = "assign", targets = { E("global", { name = name }) }, values = ex })
+			elseif op == OP.GETUPVAL then
+				pushDef(block, ins, a, E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue") }), false)
+			elseif op == OP.SETUPVAL then
+				local ex = takeOperands(block, ins, { a })
+				pushStmt(block, { k = "assign", targets = { E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue") }) }, values = ex })
+			elseif op == OP.GETIMPORT then
+				local aux = ins.aux
+				local count = rshift(aux, 30)
+				local ids = { band(rshift(aux, 20), 1023), band(rshift(aux, 10), 1023), band(aux, 1023) }
+				local root = Ks(ids[1])
+				if not isIdent(root) or count < 1 or count > 3 then
+					fail("unusable import")
+				end
+				ctx.globals[root] = true
+				local ex = E("global", { name = root })
+				for n = 2, count do
+					ex = E("index", { obj = ex, key = E("const", { text = strLit(Ks(ids[n])), str = Ks(ids[n]) }) })
+				end
+				pushDef(block, ins, a, ex, false)
+			elseif op == OP.GETTABLE then
+				local ex = takeOperands(block, ins, { b, c })
+				pushDef(block, ins, a, E("index", { obj = ex[1], key = ex[2] }), false)
+			elseif op == OP.GETTABLEKS then
+				local ex = takeOperands(block, ins, { b })
+				local key = Ks(ins.aux)
+				pushDef(block, ins, a, E("index", { obj = ex[1], key = E("const", { text = strLit(key), str = key }) }), false)
+			elseif op == OP.GETTABLEN then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E("index", { obj = ex[1], key = E("const", { text = tostring(c + 1) }) }), false)
+			elseif op == OP.SETTABLE or op == OP.SETTABLEKS or op == OP.SETTABLEN then
+				-- * value (and key) first, then the table: it may be a table constructor still being filled
+				local keyExpr, valueExpr
+				if op == OP.SETTABLE then
+					local ex = takeOperands(block, ins, { c, a }, nil, true)
+					keyExpr, valueExpr = ex[1], ex[2]
+				else
+					local ex = takeOperands(block, ins, { a }, nil, true)
+					valueExpr = ex[1]
+					if op == OP.SETTABLEKS then
+						local key = Ks(ins.aux)
+						keyExpr = E("const", { text = strLit(key), str = key })
+					else
+						keyExpr = E("const", { text = tostring(c + 1) })
+					end
+				end
+				local tw = webOf(ins.useDef[b])
+				local tail = block.stmts[#block.stmts]
+				if tail and tail.tableCtor and tail.ctorWeb == tw and not tail.closedCtor
+					and not mentions(keyExpr, tw) and not mentions(valueExpr, tw)
+				then
+					insert(tail.value.entries, { key = keyExpr, value = valueExpr })
+					tail.pure = false
+					tw.useLeft -= 1
+				else
+					local ex = takeOperands(block, ins, { b })
+					pushStmt(block, { k = "assign", targets = { E("index", { obj = ex[1], key = keyExpr }) }, values = { valueExpr } })
+				end
+			elseif op == OP.NEWTABLE or op == OP.DUPTABLE then
+				local st = pushDef(block, ins, a, E("table", { entries = {}, nextIndex = 1 }), true)
+				st.tableCtor = true
+				-- * fills right after creation go into the constructor, even for a variable
+				st.ctorWeb = webOf(ins.defIds[a])
+			elseif op == OP.SETLIST then
+				local regs = {}
+				local last = c > 0 and b + c - 2 or ins.multretFrom.a - 1
+				for r = b, last do
+					regs[#regs + 1] = r
+				end
+				local values = takeOperands(block, ins, regs, c == 0 and ins.multretFrom or nil)
+				local tw = webOf(ins.useDef[a])
+				local tail = block.stmts[#block.stmts]
+				local selfRef = false
+				for _, v in values do
+					if mentions(v, tw) then
+						selfRef = true
+					end
+				end
+				if tail and tail.tableCtor and tail.ctorWeb == tw and not tail.closedCtor and tail.value.nextIndex == ins.aux and not selfRef then
+					for _, v in values do
+						insert(tail.value.entries, { value = v })
+					end
+					tail.value.nextIndex += #values
+					tail.pure = false
+					if c == 0 then
+						tail.closedCtor = true -- * a multret item must stay the last field
+					end
+					tw.useLeft -= 1
+				else
+					if c == 0 then
+						fail("SETLIST with multret outside a table constructor")
+					end
+					local ex = takeOperands(block, ins, { a })
+					for n, v in values do
+						pushStmt(block, { k = "assign", targets = { E("index", { obj = ex[1], key = E("const", { text = tostring(ins.aux + n - 1) }) }) }, values = { v } })
+					end
+				end
+			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				local caps = {}
+				for n, cap in ins.captures do
+					if cap.a == 2 then
+						caps[n] = ctx.upnames[cap.b + 1] or fail("unknown upvalue")
+					else
+						caps[n] = { w = webOf(ins.useDef[cap.b]) }
+						materialized[caps[n].w] = true
+						caps[n].w.useLeft -= 1
+					end
+				end
+				local selfW = webOf(ins.defIds[a])
+				local st = pushDef(block, ins, a, E("closure", { child = ins.child, caps = caps, selfW = selfW }), false)
+				if ctx.chunk.protos[ins.child].debugname then
+					st.namedClosure = true -- * only folded into `t.name = ...`, otherwise `local function`
+				end
+			elseif op == OP.NAMECALL then
+				pushStmt(block, { k = "namecall", ins = ins })
+			elseif op == OP.CALL then
+				local tail = block.stmts[#block.stmts]
+				local argRegs = {}
+				local isMethod = tail and tail.k == "namecall" and tail.ins.a == a
+				local first = isMethod and a + 2 or a + 1
+				local last = b > 0 and a + b - 1 or ins.multretFrom.a - 1
+				for r = first, last do
+					argRegs[#argRegs + 1] = r
+				end
+				local expr
+				if isMethod then
+					local nc = tail.ins
+					remove(block.stmts)
+					-- * emitted as: object, arguments, NAMECALL, CALL
+					local regs = { { ins = nc, reg = nc.b } }
+					for _, r in argRegs do
+						regs[#regs + 1] = r
+					end
+					local ex = takeOperands(block, ins, regs, b == 0 and ins.multretFrom or nil)
+					local obj = remove(ex, 1)
+					expr = E("method", { obj = obj, name = Ks(nc.aux), args = ex })
+				else
+					local regs = { a }
+					for _, r in argRegs do
+						regs[#regs + 1] = r
+					end
+					local ex = takeOperands(block, ins, regs, b == 0 and ins.multretFrom or nil)
+					local fn = remove(ex, 1)
+					expr = E("call", { fn = fn, args = ex })
+				end
+				if c == 1 then
+					pushStmt(block, { k = "call", expr = expr })
+				elseif c == 2 then
+					pushDef(block, ins, a, expr, false)
+				elseif c == 0 then
+					expr.multret = true
+					pushStmt(block, { k = "assign", tempWeb = true, multretOf = ins, value = expr, pure = false })
+				else
+					local targets = {}
+					for r = a, a + c - 2 do
+						targets[#targets + 1] = varExpr(webOf(ins.defIds[r]))
+					end
+					expr.multret = true
+					pushStmt(block, { k = "assign", targets = targets, values = { expr } })
+				end
+			elseif op == OP.RETURN then
+				local regs = {}
+				local last = b > 0 and a + b - 2 or ins.multretFrom.a - 1
+				for r = a, last do
+					regs[#regs + 1] = r
+				end
+				local ex = takeOperands(block, ins, regs, b == 0 and ins.multretFrom or nil)
+				pushStmt(block, { k = "return", values = ex })
+			elseif ARITH[op] then
+				local ex = takeOperands(block, ins, { b, c })
+				pushDef(block, ins, a, E("binop", { op = ARITH[op], l = ex[1], r = ex[2] }), false)
+			elseif ARITHK[op] then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E("binop", { op = ARITHK[op], l = ex[1], r = K_(c) }), false)
+			elseif op == OP.SUBRK or op == OP.DIVRK then
+				local ex = takeOperands(block, ins, { c })
+				pushDef(block, ins, a, E("binop", { op = op == OP.SUBRK and "-" or "/", l = K_(b), r = ex[1] }), false)
+			elseif op == OP.AND or op == OP.OR then
+				local ex = takeOperands(block, ins, { b, c })
+				if not isSideEffectFree(ex[2]) then
+					-- * the instruction evaluates both sides; `a and f()` would not
+					local w = webOf(ins.useDef[c])
+					fail("and/or with a side effect on the right (" .. tostring(w.id) .. ")")
+				end
+				pushDef(block, ins, a, E(op == OP.AND and "and" or "or", { l = ex[1], r = ex[2] }), false)
+			elseif op == OP.ANDK or op == OP.ORK then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E(op == OP.ANDK and "and" or "or", { l = ex[1], r = K_(c) }), false)
+			elseif op == OP.CONCAT then
+				local regs = {}
+				for r = b, c do
+					regs[#regs + 1] = r
+				end
+				local ex = takeOperands(block, ins, regs)
+				pushDef(block, ins, a, E("concat", { list = ex }), false)
+			elseif op == OP.NOT then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E("not", { e = ex[1] }), false)
+			elseif op == OP.MINUS then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E("unop", { op = "-", e = ex[1] }), false)
+			elseif op == OP.LENGTH then
+				local ex = takeOperands(block, ins, { b })
+				pushDef(block, ins, a, E("unop", { op = "#", e = ex[1] }), false)
+			elseif op == OP.GETVARARGS then
+				if b == 0 then
+					pushStmt(block, { k = "assign", tempWeb = true, multretOf = ins, value = E("vararg", { multret = true }), pure = false })
+				elseif b == 2 then
+					pushDef(block, ins, a, E("vararg"), false)
+				elseif b > 2 then
+					local targets = {}
+					for r = a, a + b - 2 do
+						targets[#targets + 1] = varExpr(webOf(ins.defIds[r]))
+					end
+					pushStmt(block, { k = "assign", targets = targets, values = { E("vararg", { multret = true }) } })
+				end
+			else
+				fail("cannot express " .. tostring(Lifter.OP_NAMES[op]))
+			end
+		end
+
+		function buildBlock(astBlock, parent, loopStmt)
+			local block = newBlock(parent, loopStmt)
+			for _, item in astBlock.items do
+				local kind = item.kind
+				if kind == "ins" then
+					emitIns(block, item.ins)
+				elseif kind == "if" or kind == "condjump" then
+					local cond = buildCondition(block, item.chain, false)
+					if kind == "condjump" then
+						cond = E("not", { e = cond })
+					end
+					cond = simplifyCond(cond)
+					local st = { k = "if", cond = cond, refBlock = block }
+					if kind == "condjump" then
+						st.thenB = newBlock(block)
+						st.thenB.stmts = { item.action == "return" and { k = "return", values = {} } or { k = item.action } }
+					else
+						st.thenB = buildBlock(item.thenB, block)
+						if item.elseB then
+							st.elseB = buildBlock(item.elseB, block)
+						end
+					end
+					pushStmt(block, st)
+				elseif kind == "while" then
+					local st = { k = "while", loop = item.loop, refBlock = block }
+					local bodyAst = item.body
+					if item.chain then
+						local scratch = newBlock(block)
+						local ok, cond = pcall(buildCondition, scratch, item.chain, true)
+						if ok and #scratch.stmts == 0 then
+							st.cond = simplifyCond(cond)
+						elseif not ok and not string.find(tostring(cond), FAIL, 1, true) then
+							error(cond, 0)
+						else
+							bodyAst = item.fullBody()
+						end
+					end
+					st.body = buildBlock(bodyAst, block, st)
+					pushStmt(block, st)
+				elseif kind == "numfor" then
+					local prep = item.prep
+					local ex = takeOperands(block, prep, { prep.a + 2, prep.a, prep.a + 1 })
+					local st = { k = "numfor", init = ex[1], limit = ex[2], step = ex[3], loop = item.loop, refBlock = block }
+					st.var = webOf(prep.lvDef)
+					materialized[st.var] = true
+					st.body = buildBlock(item.body, block, st)
+					pushStmt(block, st)
+				elseif kind == "genfor" then
+					local prep, loopIns = item.prep, item.loopIns
+					local st = { k = "genfor", loop = item.loop, refBlock = block }
+					-- * `for k, v in pairs(t)`: one call producing the three iterator values
+					local tail = block.stmts[#block.stmts]
+					local regs = { prep.a, prep.a + 1, prep.a + 2 }
+					local usedCall = false
+					if tail and tail.k == "assign" and #tail.targets == 3 and #tail.values == 1 and tail.values[1].k == "call" then
+						local ok = true
+						for n = 1, 3 do
+							local t = tail.targets[n]
+							if not (t.k == "var" and t.w == webOf(prep.useDef[regs[n]]) and #t.w.uses == 1 and #t.w.defs == 1) then
+								ok = false
+							end
+						end
+						if ok then
+							remove(block.stmts)
+							for n = 1, 3 do
+								materialized[tail.targets[n].w] = nil
+							end
+							st.exprs = { tail.values[1] }
+							usedCall = true
+						end
+					end
+					if not usedCall then
+						local ex = takeOperands(block, prep, regs)
+						while #ex > 1 and ex[#ex].k == "const" and ex[#ex].text == "nil" do
+							remove(ex)
+						end
+						st.exprs = ex
+					end
+					st.vars = {}
+					for n, id in loopIns.lvDefs do
+						st.vars[n] = webOf(id)
+						materialized[st.vars[n]] = true
+					end
+					st.body = buildBlock(item.body, block, st)
+					pushStmt(block, st)
+				elseif kind == "valexpr" then
+					local function leafValue(target, insList)
+						local before = #target.stmts
+						for _, i2 in insList do
+							emitIns(target, i2)
+						end
+						-- * folding may remove earlier statements of `target`, never add more than the value
+						if #target.stmts > before + 1 or #target.stmts == 0 then
+							fail("value with side statements")
+						end
+						local st = remove(target.stmts)
+						if st.k ~= "assign" or #st.targets ~= 1 or st.targets[1].k ~= "var" or #st.values ~= 1 then
+							fail("unexpected value statement")
+						end
+						return st.values[1], st.targets[1].w
+					end
+					local curValue, Rw
+					if item.leaf0 and not item.dropLeaf0 then
+						curValue, Rw = leafValue(block, { item.leaf0 })
+					end
+					-- * `not` in a value context: only flips what is already a boolean
+					local function valueNot(x)
+						if x.k == "not" and x.e.k == "binop" and (x.e.op == "==" or x.e.op == "~=" or x.e.op == "<" or x.e.op == "<=") then
+							return x.e
+						elseif x.k == "binop" and x.op == "==" then
+							return E("binop", { op = "~=", l = x.l, r = x.r })
+						elseif x.k == "binop" and x.op == "~=" then
+							return E("binop", { op = "==", l = x.l, r = x.r })
+						end
+						return E("not", { e = x })
+					end
+					local function isBoolean(x)
+						return x.k == "not" or (x.k == "binop" and (x.op == "==" or x.op == "~=" or x.op == "<" or x.op == "<="))
+							or (x.k == "const" and (x.text == "true" or x.text == "false"))
+					end
+					local function build(t)
+						local k = t.k
+						if k == "cur" then
+							if not curValue then
+								fail("value expression without its first value")
+							end
+							return curValue
+						elseif k == "leaf" then
+							local scratch = newBlock(block)
+							local v, w = leafValue(scratch, t.el.run)
+							if Rw and Rw ~= w then
+								fail("value expression writes two variables")
+							end
+							Rw = w
+							return v
+						elseif k == "taken" or k == "fall" or k == "fallc" then
+							-- * the first test of the expression may fold what was computed just before it
+							local scratch = t.el == item.firstTest and block or newBlock(block)
+							local before = #scratch.stmts
+							for _, i2 in t.el.seg.pre do
+								emitIns(scratch, i2)
+							end
+							local taken = condLeaf(scratch, t.el.seg)
+							if scratch ~= block and #scratch.stmts > 0 then
+								fail("condition with side statements")
+							end
+							if k == "taken" then
+								return taken
+							elseif k == "fallc" then
+								return boolNot(taken)
+							end
+							return valueNot(taken)
+						elseif k == "and" or k == "or" then
+							local l = build(t.l)
+							local r = build(t.r)
+							return E(k, { l = l, r = r })
+						elseif k == "cond" then
+							local c = build(t.c)
+							local a = build(t.a)
+							local b = build(t.b)
+							if a.k == "const" and a.text == "false" then
+								return E("and", { l = valueNot(c), r = b })
+							elseif a.k == "const" and a.text == "true" and isBoolean(c) then
+								return E("or", { l = c, r = b })
+							end
+							return E("ifexpr", { c = c, a = a, b = b })
+						end
+						fail("bad value tree")
+					end
+					local value = build(item.tree)
+					if not Rw then
+						fail("value expression without a target")
+					end
+					local st = pushStmt(block, { k = "assign", targets = { E("var", { w = Rw }) }, values = { value }, value = value })
+					-- * used exactly once, right after, and only written here: fold it like a temporary
+					local outside = {}
+					for _, u in Rw.uses do
+						if not item.regionIns[u.ins] then
+							outside[#outside + 1] = u
+						end
+					end
+					local ownDefs = true
+					for _, id in Rw.defs do
+						local info = A.defInfo[id]
+						if not (info.ins and item.regionIns[info.ins]) then
+							ownDefs = false
+						end
+					end
+					if ownDefs and not Rw.captured and #outside == 1 and outside[1].ins.block == A.blockAt[item.join] and not Rw.noFold then
+						Rw.tempish = true
+						Rw.useLeft = 1
+						st.tempWeb = Rw
+					else
+						materialized[Rw] = true
+					end
+
+				elseif kind == "break" or kind == "continue" then
+					pushStmt(block, { k = kind })
+				elseif kind == "return" then
+					pushStmt(block, { k = "return", values = {} })
+				elseif kind == "breakblock" then
+					local st = { k = "repeat", loop = item.loop, untilCond = E("const", { text = "true" }), isBlock = true }
+					st.body = buildBlock(item.body, block, st)
+					pushStmt(block, st)
+				else
+					fail("unknown node " .. tostring(kind))
+				end
+			end
+			return block
+		end
+
+		local root = buildBlock(ast, nil, nil)
+		local function markTargets(block)
+			for _, st in block.stmts do
+				if st.k == "assign" then
+					for _, t in st.targets do
+						if t.k == "var" then
+							materialized[t.w] = true
+						end
+					end
+				end
+				for _, child in { st.thenB or false, st.elseB or false, st.body or false } do
+					if child then
+						markTargets(child)
+					end
+				end
+			end
+		end
+		markTargets(root)
+		-- * `return` with no values at the very end of a function is implicit
+		local last = root.stmts[#root.stmts]
+		if last and last.k == "return" and #last.values == 0 then
+			remove(root.stmts)
+		end
+		return root, materialized
+	end
+
+	--------------------------------------------------------------------------
+	-- variables: names and declarations
+	--------------------------------------------------------------------------
+	local function forEachExpr(e, fn)
+		if not e then
+			return
+		end
+		fn(e)
+		local k = e.k
+		if k == "index" then
+			forEachExpr(e.obj, fn)
+			forEachExpr(e.key, fn)
+		elseif k == "call" then
+			forEachExpr(e.fn, fn)
+			for _, a in e.args do
+				forEachExpr(a, fn)
+			end
+		elseif k == "method" then
+			forEachExpr(e.obj, fn)
+			for _, a in e.args do
+				forEachExpr(a, fn)
+			end
+		elseif k == "binop" or k == "and" or k == "or" then
+			forEachExpr(e.l, fn)
+			forEachExpr(e.r, fn)
+		elseif k == "unop" or k == "not" then
+			forEachExpr(e.e, fn)
+		elseif k == "ifexpr" then
+			forEachExpr(e.c, fn)
+			forEachExpr(e.a, fn)
+			forEachExpr(e.b, fn)
+		elseif k == "concat" then
+			for _, a in e.list do
+				forEachExpr(a, fn)
+			end
+		elseif k == "table" then
+			for _, entry in e.entries do
+				forEachExpr(entry.key, fn)
+				forEachExpr(entry.value, fn)
+			end
+		end
+	end
+
+	-- * webs referenced by a statement (not inside nested blocks), and nested blocks
+	local function stmtRefs(st, fn)
+		local function ex(e)
+			forEachExpr(e, function(x)
+				if x.k == "var" then
+					fn(x.w)
+				elseif x.k == "closure" then
+					for _, cap in x.caps do
+						if type(cap) == "table" then
+							fn(cap.w)
+						end
+					end
+				end
+			end)
+		end
+		local k = st.k
+		if k == "assign" then
+			for _, t in st.targets do
+				ex(t)
+			end
+			for _, v in st.values do
+				ex(v)
+			end
+		elseif k == "call" then
+			ex(st.expr)
+		elseif k == "return" then
+			for _, v in st.values do
+				ex(v)
+			end
+		elseif k == "if" then
+			ex(st.cond)
+		elseif k == "numfor" then
+			ex(st.init)
+			ex(st.limit)
+			ex(st.step)
+		elseif k == "genfor" then
+			for _, v in st.exprs do
+				ex(v)
+			end
+		end
+	end
+	local function childBlocks(st)
+		local k = st.k
+		if k == "if" then
+			return st.thenB, st.elseB
+		elseif k == "while" or k == "numfor" or k == "genfor" or k == "repeat" then
+			return st.body
+		end
+	end
+
+	-- * `while true do ... if c then break end end` without continue -> `repeat ... until c`
+	local function makeRepeats(block)
+		for _, st in block.stmts do
+			local a, b = childBlocks(st)
+			if a then
+				makeRepeats(a)
+			end
+			if b then
+				makeRepeats(b)
+			end
+			if st.k == "while" and not st.cond then
+				local body = st.body.stmts
+				local last = body[#body]
+				if last and last.k == "if" and not last.elseB and #last.thenB.stmts == 1 and last.thenB.stmts[1].k == "break" then
+					local hasContinue = false
+					local function scan(b2)
+						for _, s in b2.stmts do
+							if s.k == "continue" then
+								hasContinue = true
+							end
+							if s.k ~= "while" and s.k ~= "numfor" and s.k ~= "genfor" and s.k ~= "repeat" then
+								local x, y = childBlocks(s)
+								if x then
+									scan(x)
+								end
+								if y then
+									scan(y)
+								end
+							end
+						end
+					end
+					scan(st.body)
+					if not hasContinue then
+						remove(body)
+						st.k = "repeat"
+						st.untilCond = last.cond
+					end
+				end
+			end
+		end
+	end
+
+	local function makeIfExpressions(block)
+		for i, st in block.stmts do
+			local a, b = childBlocks(st)
+			if a then
+				makeIfExpressions(a)
+			end
+			if b then
+				makeIfExpressions(b)
+			end
+			if st.k == "if" and st.elseB and #st.thenB.stmts == 1 and #st.elseB.stmts == 1 then
+				local x, y = st.thenB.stmts[1], st.elseB.stmts[1]
+				if x.k == "assign" and y.k == "assign" and #x.targets == 1 and #y.targets == 1 and #x.values == 1 and #y.values == 1
+					and x.targets[1].k == "var" and y.targets[1].k == "var" and x.targets[1].w == y.targets[1].w
+					and x.values[1].k ~= "closure" and y.values[1].k ~= "closure"
+				then
+					block.stmts[i] = { k = "assign", targets = { x.targets[1] }, values = { E("ifexpr", { c = st.cond, a = x.values[1], b = y.values[1] }) } }
+				end
+			end
+		end
+	end
+
+	local function placeDeclarations(A, root, materialized, ctx)
+		-- * parents of blocks / loop info
+		local refsByWeb = {} -- w -> list of { block, index }
+		local function visit(block)
+			for i, st in block.stmts do
+				local function note(w)
+					local list = refsByWeb[w]
+					if not list then
+						list = {}
+						refsByWeb[w] = list
+					end
+					list[#list + 1] = { block = block, index = i }
+				end
+				stmtRefs(st, note)
+				if st.k == "repeat" and st.untilCond then
+					forEachExpr(st.untilCond, function(x)
+						if x.k == "var" then
+							local list = refsByWeb[x.w]
+							if not list then
+								list = {}
+								refsByWeb[x.w] = list
+							end
+							list[#list + 1] = { block = st.body, index = #st.body.stmts + 1 }
+						end
+					end)
+				end
+				if st.k == "while" and st.cond then
+					forEachExpr(st.cond, function(x)
+						if x.k == "var" then
+							local list = refsByWeb[x.w]
+							if not list then
+								list = {}
+								refsByWeb[x.w] = list
+							end
+							list[#list + 1] = { block = st.body, index = 0 }
+						end
+					end)
+				end
+				local a, b = childBlocks(st)
+				if a then
+					a.parent, a.parentStmt, a.parentIndex = block, st, i
+					a.depth = block.depth + 1
+					visit(a)
+				end
+				if b then
+					b.parent, b.parentStmt, b.parentIndex = block, st, i
+					b.depth = block.depth + 1
+					visit(b)
+				end
+			end
+		end
+		root.depth = 0
+		visit(root)
+
+		local function lca(x, y)
+			while x.depth > y.depth do
+				x = x.parent
+			end
+			while y.depth > x.depth do
+				y = y.parent
+			end
+			while x ~= y do
+				x, y = x.parent, y.parent
+			end
+			return x
+		end
+		-- * index of the statement in `ancestor` that contains `block`
+		local function indexIn(ancestor, block, index)
+			while block ~= ancestor do
+				index = block.parentIndex
+				block = block.parent
+			end
+			return index
+		end
+		local function loopEntryBlock(st)
+			local loop = st.loop
+			return loop and A.blockAt[loop.header]
+		end
+
+		local decls = {} -- block -> list of { index, w }
+		for w in materialized do
+			local kinds = w.kinds
+			if kinds.hidden or kinds.undefined then
+				fail("reads a register that has no value")
+			end
+			local refs = refsByWeb[w]
+			if kinds.param or kinds.loopvar then
+				-- * a generic for's variables may be reassigned in the body (the iteration state is a
+				-- * separate copy); a numeric for's may not
+				if kinds.loopvar and (kinds.normal or kinds.param) then
+					for _, id in w.defs do
+						local info = A.defInfo[id]
+						if info.kind == "loopvar" and info.ins.op ~= OP.FORGLOOP then
+							fail("numeric loop variable is assigned")
+						end
+						if info.kind == "param" then
+							fail("loop variable merged with a parameter")
+						end
+					end
+				end
+			elseif refs then
+				local target = refs[1].block
+				for n = 2, #refs do
+					target = lca(target, refs[n].block)
+				end
+				-- * hoist out of every loop it must survive across
+				local b = target
+				while b do
+					if b.parentStmt and (b.parentStmt.k == "while" or b.parentStmt.k == "repeat" or b.parentStmt.k == "numfor" or b.parentStmt.k == "genfor") and b == b.parentStmt.body then
+						local entry = loopEntryBlock(b.parentStmt)
+						local live = entry and (A.liveIn[entry][w] or (A.openWebsAt[entry.start] and A.openWebsAt[entry.start][w]))
+						if live then
+							target = b.parent
+						end
+					end
+					b = b.parent
+				end
+				local first = math.huge
+				for _, ref in refs do
+					local blk, idx = ref.block, ref.index
+					local depthOk = true
+					local cur = blk
+					while cur and cur ~= target do
+						cur = cur.parent
+					end
+					if not cur then
+						depthOk = false
+					end
+					if depthOk then
+						local i = indexIn(target, blk, idx)
+						if i < first then
+							first = i
+						end
+					end
+				end
+				if first == math.huge then
+					first = 1
+				end
+				first = math.max(first, 1)
+				local list = decls[target]
+				if not list then
+					list = {}
+					decls[target] = list
+				end
+				list[#list + 1] = { index = first, w = w }
+			end
+		end
+		-- * make the declarations: `local x = value` when possible
+		local count = 0
+		for block, list in decls do
+			table.sort(list, function(x, y)
+				if x.index ~= y.index then
+					return x.index > y.index
+				end
+				return x.w.id < y.w.id
+			end)
+			for _, d in list do
+				count += 1
+				local st = block.stmts[d.index]
+				local merged = false
+				if st and st.k == "assign" and #st.targets == 1 and st.targets[1].k == "var" and st.targets[1].w == d.w and not st.isLocal then
+					local selfRef = false
+					forEachExpr(st.values[1], function(x)
+						if x.k == "var" and x.w == d.w then
+							selfRef = true
+						end
+					end)
+					local v = st.values[1]
+					if v.k == "closure" then
+						for _, cap in v.caps do
+							if type(cap) == "table" and cap.w == d.w then
+								selfRef = "function"
+							end
+						end
+					end
+					if selfRef == "function" then
+						st.isLocalFunction = true
+						merged = true
+					elseif not selfRef then
+						st.isLocal = true
+						merged = true
+					end
+				elseif st and st.k == "assign" and #st.targets > 1 and not st.isLocal then
+					-- * `local a, b = f()` when every target is declared here
+					local all = true
+					for _, t in st.targets do
+						if t.k ~= "var" then
+							all = false
+						end
+					end
+					if all then
+						st.pendingLocal = st.pendingLocal or {}
+						st.pendingLocal[d.w] = true
+						local n = 0
+						for _ in st.pendingLocal do
+							n += 1
+						end
+						if n == #st.targets then
+							st.isLocal = true
+						end
+						merged = true
+					end
+				end
+				if not merged then
+					insert(block.stmts, d.index, { k = "local", w = d.w })
+				end
+			end
+		end
+		-- * multi-target assignments that only got some of their targets declared there
+		local function fixPartial(block)
+			local n = 1
+			while n <= #block.stmts do
+				local st = block.stmts[n]
+				if st.k == "assign" and st.pendingLocal and not st.isLocal then
+					for w in st.pendingLocal do
+						insert(block.stmts, n, { k = "local", w = w })
+						n += 1
+					end
+					st.pendingLocal = nil
+				end
+				local a, b = childBlocks(st)
+				if a then
+					fixPartial(a)
+				end
+				if b then
+					fixPartial(b)
+				end
+				n += 1
+			end
+		end
+		fixPartial(root)
+		if count > 180 then
+			fail("too many locals")
+		end
+	end
+
+	--------------------------------------------------------------------------
+	-- printing
+	--------------------------------------------------------------------------
+	local PREC = {
+		["or"] = 1, ["and"] = 2,
+		["<"] = 3, [">"] = 3, ["<="] = 3, [">="] = 3, ["~="] = 3, ["=="] = 3,
+		[".."] = 4, ["+"] = 5, ["-"] = 5, ["*"] = 6, ["/"] = 6, ["//"] = 6, ["%"] = 6,
+	}
+	local RIGHT = { [".."] = true, ["^"] = true }
+	local UNARY_PREC = 7
+	PREC["^"] = 8
+
+	local Printer = {}
+	Printer.__index = Printer
+
+	local function exprPrec(e)
+		local k = e.k
+		if k == "binop" then
+			return PREC[e.op]
+		elseif k == "and" or k == "or" then
+			return PREC[k]
+		elseif k == "concat" then
+			return PREC[".."]
+		elseif k == "unop" or k == "not" then
+			return UNARY_PREC
+		elseif k == "ifexpr" then
+			return 0
+		elseif k == "const" and e.text:sub(1, 1) == "(" then
+			return 10
+		elseif k == "closure" or k == "table" or k == "const" or k == "vararg" then
+			return 9
+		end
+		return 10
+	end
+
+	local decompileFunction -- forward
+
+	function Printer:name(w)
+		local n = self.names[w]
+		if not n then
+			fail("variable without a name")
+		end
+		return n
+	end
+
+	function Printer:expr(e, indent)
+		local k = e.k
+		if k == "const" then
+			return e.text
+		elseif k == "var" then
+			return self:name(e.w)
+		elseif k == "upval" or k == "global" then
+			return e.name
+		elseif k == "vararg" then
+			return "..."
+		elseif k == "index" then
+			local obj = self:prefix(e.obj, indent)
+			if e.key.str and isIdent(e.key.str) then
+				return obj .. "." .. e.key.str
+			end
+			return obj .. "[" .. self:expr(e.key, indent) .. "]"
+		elseif k == "call" then
+			return self:prefix(e.fn, indent) .. "(" .. self:list(e.args, indent) .. ")"
+		elseif k == "method" then
+			return self:prefix(e.obj, indent) .. ":" .. e.name .. "(" .. self:list(e.args, indent) .. ")"
+		elseif k == "binop" or k == "and" or k == "or" then
+			local op = k == "binop" and e.op or k
+			local p = PREC[op]
+			local l = self:expr(e.l, indent)
+			local r = self:expr(e.r, indent)
+			local lp, rp = exprPrec(e.l), exprPrec(e.r)
+			if lp < p or (lp == p and RIGHT[op]) then
+				l = "(" .. l .. ")"
+			end
+			local sameAssociative = (op == "and" or op == "or") and e.r.k == op
+			if rp < p or (rp == p and not RIGHT[op] and not sameAssociative) then
+				r = "(" .. r .. ")"
+			end
+			return l .. " " .. op .. " " .. r
+		elseif k == "concat" then
+			local parts = {}
+			for n, x in e.list do
+				local s = self:expr(x, indent)
+				local xp = exprPrec(x)
+				if xp < PREC[".."] or (xp == PREC[".."] and n < #e.list) then
+					s = "(" .. s .. ")"
+				end
+				parts[n] = s
+			end
+			return concat(parts, " .. ")
+		elseif k == "unop" or k == "not" then
+			local op = k == "not" and "not " or e.op
+			local inner = self:expr(e.e, indent)
+			local ip = exprPrec(e.e)
+			if ip < UNARY_PREC or (op == "-" and (inner:sub(1, 1) == "-")) then
+				inner = "(" .. inner .. ")"
+			end
+			return op .. inner
+		elseif k == "table" then
+			if #e.entries == 0 then
+				return "{}"
+			end
+			local parts = {}
+			for n, entry in e.entries do
+				local v = self:expr(entry.value, indent)
+				if entry.key then
+					if entry.key.str and isIdent(entry.key.str) then
+						parts[n] = entry.key.str .. " = " .. v
+					else
+						parts[n] = "[" .. self:expr(entry.key, indent) .. "] = " .. v
+					end
+				else
+					if n == #e.entries and (entry.value.k == "call" or entry.value.k == "method" or entry.value.k == "vararg") and not entry.value.multret then
+						v = "(" .. v .. ")"
+					end
+					parts[n] = v
+				end
+			end
+			return "{ " .. concat(parts, ", ") .. " }"
+		elseif k == "ifexpr" then
+			return "if " .. self:expr(e.c, indent) .. " then " .. self:expr(e.a, indent) .. " else " .. self:expr(e.b, indent)
+		elseif k == "closure" then
+			local upnames = {}
+			for n, cap in e.caps do
+				upnames[n] = type(cap) == "string" and cap or self:name(cap.w)
+			end
+			return "function" .. decompileFunction(self.chunk, e.child, upnames, indent, self.ctx)
+		end
+		fail("cannot print " .. tostring(k))
+	end
+
+	function Printer:prefix(e, indent)
+		local k = e.k
+		local s = self:expr(e, indent)
+		if k == "var" or k == "upval" or k == "global" or k == "index" or k == "call" or k == "method" then
+			return s
+		end
+		return "(" .. s .. ")"
+	end
+
+	-- * a list where only the last element may expand to several values
+	function Printer:list(exprs, indent, noExpand)
+		local parts = {}
+		for n, x in exprs do
+			local s = self:expr(x, indent)
+			if not noExpand and n == #exprs and (x.k == "call" or x.k == "method" or x.k == "vararg") and not x.multret then
+				s = "(" .. s .. ")"
+			end
+			parts[n] = s
+		end
+		return concat(parts, ", ")
+	end
+
+	function Printer:block(block, indent, out)
+		local tab = rep("\t", indent)
+		local n = #block.stmts
+		for i, st in block.stmts do
+			local k = st.k
+			local isLast = i == n
+			if k == "local" then
+				out[#out + 1] = tab .. "local " .. self:name(st.w)
+			elseif k == "assign" then
+				local targets = {}
+				for t, x in st.targets do
+					targets[t] = self:expr(x, indent)
+				end
+				local function values()
+					return #st.values >= #st.targets and self:list(st.values, indent, true) or self:list(st.values, indent)
+				end
+				local v1 = st.values[1]
+				local t1 = st.targets[1]
+				local sugarName
+				if #st.targets == 1 and #st.values == 1 and v1.k == "closure" and not st.isLocal and not st.isLocalFunction then
+					local debugname = self.chunk.protos[v1.child].debugname
+					local function path(x)
+						if x.k == "global" or x.k == "upval" then
+							return x.name
+						elseif x.k == "var" then
+							return self:name(x.w)
+						elseif x.k == "index" and x.key.str and isIdent(x.key.str) then
+							local base = path(x.obj)
+							return base and base .. "." .. x.key.str
+						end
+						return nil
+					end
+					local last = (t1.k == "index" and t1.key.str) or ((t1.k == "global" or t1.k == "upval") and t1.name)
+					if debugname and last == debugname then
+						sugarName = path(t1)
+					end
+				end
+				if sugarName then
+					local upnames = {}
+					for m, cap in v1.caps do
+						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
+					end
+					out[#out + 1] = tab .. "function " .. sugarName .. decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true)
+				elseif st.isLocalFunction then
+					local v = st.values[1]
+					local upnames = {}
+					for m, cap in v.caps do
+						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
+					end
+					out[#out + 1] = tab .. "local function " .. targets[1] .. decompileFunction(self.chunk, v.child, upnames, indent, self.ctx, true)
+				elseif st.isLocal and #st.targets == 1 and v1.k == "closure" and self.chunk.protos[v1.child].debugname then
+					local upnames = {}
+					for m, cap in v1.caps do
+						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
+					end
+					out[#out + 1] = tab .. "local function " .. targets[1] .. decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true)
+				elseif st.isLocal then
+					out[#out + 1] = tab .. "local " .. concat(targets, ", ") .. " = " .. values()
+				else
+					-- * x = x + y  ->  x += y
+					local v = st.values[1]
+					local t1 = st.targets[1]
+					local sameTarget = v and v.k == "binop" and #st.targets == 1
+						and ((t1.k == "var" and v.l.k == "var" and v.l.w == t1.w) or (t1.k == "upval" and v.l.k == "upval" and v.l.name == t1.name))
+					if sameTarget
+						and (v.op == "+" or v.op == "-" or v.op == "*" or v.op == "/" or v.op == "//" or v.op == "%" or v.op == "^")
+					then
+						local r = self:expr(v.r, indent)
+						out[#out + 1] = tab .. targets[1] .. " " .. v.op .. "= " .. r
+					elseif #st.targets == 1 and st.targets[1].k == "var" and v and v.k == "concat" and v.list[1].k == "var" and v.list[1].w == st.targets[1].w then
+						local rest = { k = "concat", list = { table.unpack(v.list, 2) } }
+						if #rest.list == 1 then
+							rest = rest.list[1]
+						end
+						out[#out + 1] = tab .. targets[1] .. " ..= " .. self:expr(rest, indent)
+					else
+						out[#out + 1] = tab .. concat(targets, ", ") .. " = " .. values()
+					end
+				end
+			elseif k == "call" then
+				out[#out + 1] = tab .. self:expr(st.expr, indent)
+			elseif k == "return" or k == "break" or k == "continue" then
+				local text = k
+				if k == "return" and #st.values > 0 then
+					text = "return " .. self:list(st.values, indent)
+				end
+				if isLast then
+					out[#out + 1] = tab .. text
+				else
+					out[#out + 1] = tab .. "do " .. text .. " end"
+				end
+			elseif k == "if" then
+				local cur = st
+				local first = true
+				while true do
+					out[#out + 1] = tab .. (first and "if " or "elseif ") .. self:expr(cur.cond, indent) .. " then"
+					self:block(cur.thenB, indent + 1, out)
+					first = false
+					local elseB = cur.elseB
+					if elseB and #elseB.stmts == 1 and elseB.stmts[1].k == "if" then
+						cur = elseB.stmts[1]
+					else
+						if elseB and #elseB.stmts > 0 then
+							out[#out + 1] = tab .. "else"
+							self:block(elseB, indent + 1, out)
+						end
+						break
+					end
+				end
+				out[#out + 1] = tab .. "end"
+			elseif k == "while" then
+				out[#out + 1] = tab .. "while " .. (st.cond and self:expr(st.cond, indent) or "true") .. " do"
+				self:block(st.body, indent + 1, out)
+				out[#out + 1] = tab .. "end"
+			elseif k == "repeat" then
+				out[#out + 1] = tab .. "repeat"
+				self:block(st.body, indent + 1, out)
+				out[#out + 1] = tab .. "until " .. self:expr(st.untilCond, indent)
+			elseif k == "numfor" then
+				local head = self:name(st.var) .. " = " .. self:expr(st.init, indent) .. ", " .. self:expr(st.limit, indent)
+				if not (st.step.k == "const" and st.step.text == "1") then
+					head ..= ", " .. self:expr(st.step, indent)
+				end
+				out[#out + 1] = tab .. "for " .. head .. " do"
+				self:block(st.body, indent + 1, out)
+				out[#out + 1] = tab .. "end"
+			elseif k == "genfor" then
+				local names = {}
+				for m, w in st.vars do
+					names[m] = self:name(w)
+				end
+				out[#out + 1] = tab .. "for " .. concat(names, ", ") .. " in " .. self:list(st.exprs, indent) .. " do"
+				self:block(st.body, indent + 1, out)
+				out[#out + 1] = tab .. "end"
+			else
+				fail("cannot print statement " .. tostring(k))
+			end
+		end
+	end
+
+	--------------------------------------------------------------------------
+	-- one function
+	--------------------------------------------------------------------------
+	local function structured(chunk, protoId, upnames, indent, ctx)
+		local p = chunk.protos[protoId]
+		local A = analyze(chunk, p)
+		local ast = structure(A)
+		local irCtx = { upnames = upnames, globals = ctx.globals, chunk = chunk }
+		local root, materialized = buildIR(A, ast, irCtx)
+		makeRepeats(root)
+		makeIfExpressions(root)
+		placeDeclarations(A, root, materialized, ctx)
+
+		local names = {}
+		local params = {}
+		for r = 0, p.numparams - 1 do
+			local w = A.webOf(A.paramDefs[r])
+			ctx.counter += 1
+			local name = "p" .. ctx.counter
+			names[w] = name
+			params[#params + 1] = name
+		end
+		if p.isvararg then
+			params[#params + 1] = "..."
+		end
+		for w in materialized do
+			if not names[w] then
+				ctx.counter += 1
+				names[w] = "v" .. ctx.counter
+			end
+		end
+		local printer = setmetatable({ names = names, chunk = chunk, ctx = ctx }, Printer)
+		local out = {}
+		printer:block(root, indent + 1, out)
+		return params, out
+	end
+
+	function decompileFunction(chunk, protoId, upnames, indent, ctx, named)
+		if BetterDecompiler.onFunction then
+			BetterDecompiler.onFunction() -- * lets the caller yield on very large scripts
+		end
+		local p = chunk.protos[protoId]
+		local ok, params, out = pcall(structured, chunk, protoId, upnames, indent, ctx)
+		local header = (p.debugname and not named) and (" -- " .. p.debugname) or ""
+		if ok then
+			ctx.structured += 1
+			return "(" .. concat(params, ", ") .. ")" .. header .. "\n" .. concat(out, "\n") .. (#out > 0 and "\n" or "") .. rep("\t", indent) .. "end"
+		end
+		if not string.find(tostring(params), FAIL, 1, true) then
+			ctx.internalErrors[#ctx.internalErrors + 1] = tostring(params)
+		end
+		ctx.lifted += 1
+		ctx.reasons[#ctx.reasons + 1] = ("%s (function %s, line %d, proto %d)"):format(tostring(params), tostring(p.debugname or "anonymous"), p.linedefined, protoId)
+		local text, globals = Lifter.liftFunction(chunk, protoId, upnames, indent, function(childId, childUpnames, childIndent)
+			return decompileFunction(chunk, childId, childUpnames, childIndent, ctx)
+		end)
+		text = string.gsub(text, "^(%b())\n", function(params)
+			return params .. header .. "\n" .. rep("\t", indent + 1)
+				.. "-- [low-level] the structure of this function could not be rebuilt; this is its exact behaviour (registers are __R[n], jumps set __pc)\n"
+		end, 1)
+		for g in globals do
+			ctx.globals[g] = true
+		end
+		return text
+	end
+
+	-- * decompiles a whole script; returns source text and stats
+	function BetterDecompiler.decompile(chunk)
+		local ctx = { counter = 0, globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {} }
+		local main = chunk.protos[chunk.main]
+		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
+		local body
+		if ok then
+			ctx.structured += 1
+			body = concat(out, "\n")
+		else
+			ctx.lifted += 1
+			ctx.reasons[#ctx.reasons + 1] = "main: " .. tostring(params)
+			body = Lifter.liftScript(chunk, function(childId, childUpnames, childIndent)
+				return decompileFunction(chunk, childId, childUpnames, childIndent, ctx)
+			end)
+		end
+		-- * our generated names must not hide a global the script uses
+		for g in ctx.globals do
+			if string.match(g, "^[pv]%d+$") then
+				error("the script uses a global named " .. g .. ", which clashes with generated names", 0)
+			end
+		end
+		return body, ctx
+	end
+end
+
 -- * Renames generic decompiler output names (v14, p1, s1, arg3, ...) into names
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables, FixGotoStatements, FixFunctionTypeAnnotations
+local RenameDecompiledVariables, FixGotoStatements, FixFunctionTypeAnnotations, RebuildBrokenFunctions, FindSuspiciousLines
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -2705,6 +6963,333 @@ do
 			return src
 		end
 		return concat(pieces)
+	end
+
+	-- * Lines with `until x == x`: always true, so the loop runs once. Real code never says
+	-- * that; it is the decompiler giving two different variables the same name (e.g.
+	-- * `until next == next` for `until effect == firstEffect`). It compiles, but is wrong.
+	function FindSuspiciousLines(src)
+		local lines = {}
+		if type(src) ~= "string" or not find(src, "until", 1, true) then
+			return lines
+		end
+		local pieces, toks, ntoks = lex(src)
+		local pieceLine, line = {}, 1
+		for n = 1, #pieces do
+			pieceLine[n] = line
+			local _, newlines = gsub(pieces[n], "\n", "")
+			line += newlines
+		end
+		local ACCESS = { ["."] = true, [":"] = true, ["["] = true, ["("] = true }
+		for t = 1, ntoks - 3 do
+			local kw, left, op, right, after = toks[t], toks[t + 1], toks[t + 2], toks[t + 3], toks[t + 4]
+			if kw.k == "kw" and kw.v == "until"
+				and left.k == "name" and right.k == "name" and left.v == right.v
+				and op.k == "op" and op.v == "=="
+				and not (after and after.k == "op" and ACCESS[after.v])
+			then
+				lines[#lines + 1] = pieceLine[kw.i]
+			end
+		end
+		return lines
+	end
+
+	-- * Replaces the top level functions that contain `badLines` (line numbers in `src`) with
+	-- * versions rebuilt from bytecode. Everything else stays exactly as the decompiler wrote
+	-- * it. Returns the new source and how many functions were rebuilt, or nil and a reason
+	-- * (e.g. when a bad line is in the main body of the script, not inside a function).
+	function RebuildBrokenFunctions(src, chunk, badLines)
+		local pieces, toks, ntoks = lex(src)
+
+		-- * byte offset and line of every piece
+		local pieceStart, pieceLine = {}, {}
+		do
+			local offset, line = 1, 1
+			for n = 1, #pieces do
+				pieceStart[n], pieceLine[n] = offset, line
+				local piece = pieces[n]
+				offset += #piece
+				local _, newlines = gsub(piece, "\n", "")
+				line += newlines
+			end
+		end
+		local function tokStart(t)
+			return pieceStart[toks[t].i]
+		end
+		local function tokEnd(t)
+			return pieceStart[toks[t].i] + #pieces[toks[t].i] - 1
+		end
+		local function tokLine(t)
+			return pieceLine[toks[t].i]
+		end
+		local function isOp(t, v)
+			local tok = toks[t]
+			return tok ~= nil and tok.k == "op" and tok.v == v
+		end
+
+		-- * function spans and the locals declared directly in the main body
+		local spans = {}
+		local mainLocals = {} -- name -> first token index it is declared at
+		local blocks, pendingLoop, pendingIf = {}, false, {}
+		local funcDepth = 0
+
+		local function statementIf(t)
+			local tok = toks[t]
+			if tok.nl then
+				return true
+			end
+			local prev = toks[t - 1]
+			if not prev then
+				return true
+			end
+			if prev.k == "op" and prev.v == ";" then
+				return true
+			end
+			return prev.k == "kw"
+				and (prev.v == "then" or prev.v == "else" or prev.v == "do" or prev.v == "repeat" or prev.v == "end")
+		end
+		local function noteLocal(name, t)
+			if mainLocals[name] == nil then
+				mainLocals[name] = t
+			end
+		end
+		local function readLocalNames(t)
+			-- * `local a, b: T, c = ...`
+			local j = t + 1
+			while toks[j] and toks[j].k == "name" do
+				noteLocal(toks[j].v, j)
+				j += 1
+				if isOp(j, ":") then
+					local nesting = 0
+					j += 1
+					while toks[j] do
+						local tok = toks[j]
+						if tok.k == "op" then
+							if tok.v == "(" or tok.v == "{" or tok.v == "[" or tok.v == "<" then
+								nesting += 1
+							elseif tok.v == ")" or tok.v == "}" or tok.v == "]" or tok.v == ">" then
+								nesting -= 1
+							elseif nesting <= 0 and (tok.v == "," or tok.v == "=") then
+								break
+							end
+						elseif nesting <= 0 and (tok.nl or tok.k == "kw") then
+							break
+						end
+						j += 1
+					end
+				end
+				if isOp(j, ",") then
+					j += 1
+				else
+					break
+				end
+			end
+		end
+
+		for t = 1, ntoks do
+			local tok = toks[t]
+			if tok.k == "kw" then
+				local kw = tok.v
+				if kw == "local" and funcDepth == 0 then
+					if toks[t + 1] and toks[t + 1].k == "kw" and toks[t + 1].v == "function" then
+						if toks[t + 2] and toks[t + 2].k == "name" then
+							noteLocal(toks[t + 2].v, t + 2)
+						end
+					else
+						readLocalNames(t)
+					end
+				elseif kw == "for" or kw == "while" then
+					pendingLoop = true
+				elseif kw == "do" then
+					if pendingLoop then
+						pendingLoop = false
+					end
+					blocks[#blocks + 1] = { kind = "do" }
+				elseif kw == "repeat" then
+					blocks[#blocks + 1] = { kind = "repeat" }
+				elseif kw == "function" then
+					if not (isOp(t - 1, ":") or isOp(t - 1, "::") or isOp(t - 1, "->")) then
+						blocks[#blocks + 1] = { kind = "func", start = t, depth = funcDepth + 1 }
+						funcDepth += 1
+					end
+				elseif kw == "if" then
+					pendingIf[#pendingIf + 1] = statementIf(t)
+				elseif kw == "then" then
+					local isStmt = true
+					if #pendingIf > 0 then
+						isStmt = pendingIf[#pendingIf]
+						pendingIf[#pendingIf] = nil
+					end
+					blocks[#blocks + 1] = { kind = isStmt and "then" or "thenexpr" }
+				elseif kw == "else" then
+					local top = blocks[#blocks]
+					blocks[#blocks] = nil
+					if not (top and top.kind == "thenexpr") then
+						blocks[#blocks + 1] = { kind = "then" }
+					end
+				elseif kw == "elseif" then
+					local top = blocks[#blocks]
+					blocks[#blocks] = nil
+					pendingIf[#pendingIf + 1] = not (top and top.kind == "thenexpr")
+				elseif kw == "end" then
+					while blocks[#blocks] and blocks[#blocks].kind == "thenexpr" do
+						blocks[#blocks] = nil
+					end
+					local closed = blocks[#blocks]
+					blocks[#blocks] = nil
+					if closed and closed.kind == "func" then
+						funcDepth -= 1
+						spans[#spans + 1] = { start = closed.start, stop = t, depth = closed.depth }
+					end
+				elseif kw == "until" then
+					while blocks[#blocks] and blocks[#blocks].kind == "thenexpr" do
+						blocks[#blocks] = nil
+					end
+					blocks[#blocks] = nil
+				end
+			end
+		end
+
+		-- * which top level functions contain the bad lines
+		local targets, seen = {}, {}
+		for _, line in badLines do
+			local found
+			for _, span in spans do
+				if span.depth == 1 and tokLine(span.start) <= line and line <= tokLine(span.stop) then
+					found = span
+					break
+				end
+			end
+			if not found then
+				return nil, "line " .. line .. " is in the main body of the script, not inside a function"
+			end
+			if not seen[found] then
+				seen[found] = true
+				targets[#targets + 1] = found
+			end
+		end
+		table.sort(targets, function(a, b)
+			return a.start > b.start -- * splice from the end so earlier offsets stay valid
+		end)
+
+		local main = chunk.protos[chunk.main]
+		local out = src
+		for _, span in targets do
+			-- * `(` ... `)` of the parameter list
+			local open = span.start + 1
+			while toks[open] and not isOp(open, "(") do
+				open += 1
+			end
+			local close, nesting = open, 0
+			while toks[close] do
+				if isOp(close, "(") then
+					nesting += 1
+				elseif isOp(close, ")") then
+					nesting -= 1
+					if nesting == 0 then
+						break
+					end
+				end
+				close += 1
+			end
+			if not toks[close] or close > span.stop then
+				return nil, "could not read a function header"
+			end
+
+			-- * the decompiler's comments right after the header: "-- Line: N, Name: X" / "-- upvalues: ..."
+			local headerComments = sub(src, tokEnd(close) + 1, tokStart(close + 1) - 1)
+			local lineDefined = tonumber(match(headerComments, "Line:%s*(%d+)"))
+			local debugName = match(headerComments, "Name:%s*([%a_][%w_]*)")
+			if not debugName then
+				local nameTok = open - 1
+				if toks[nameTok] and toks[nameTok].k == "name" then
+					debugName = toks[nameTok].v
+				end
+			end
+
+			local protoId
+			local candidates = {}
+			for _, id in main.p do
+				local proto = chunk.protos[id]
+				if lineDefined and proto.linedefined == lineDefined or not lineDefined and debugName and proto.debugname == debugName then
+					candidates[#candidates + 1] = id
+				end
+			end
+			if #candidates ~= 1 then
+				return nil, "could not match function at line " .. tokLine(span.start) .. " to its bytecode (" .. #candidates .. " candidates)"
+			end
+			protoId = candidates[1]
+			local proto = chunk.protos[protoId]
+
+			-- * upvalue i -> the name the decompiler gave that variable
+			local upnames = {}
+			local upvalueList = match(headerComments, "upvalues:%s*([^\n]*)")
+			if upvalueList then
+				for item in string.gmatch(upvalueList, "[^,]+") do
+					local name = match(item, "^%s*([%a_][%w_]*)%s*%(")
+					if not name then
+						return nil, "unreadable upvalue list: " .. upvalueList
+					end
+					upnames[#upnames + 1] = name
+				end
+			end
+			if #upnames ~= proto.nups then
+				return nil, "upvalue count mismatch for function at line " .. tokLine(span.start)
+			end
+			for _, name in upnames do
+				local declared = mainLocals[name]
+				if not declared or declared >= span.start then
+					return nil, "upvalue '" .. name .. "' is not a local declared before the function"
+				end
+			end
+
+			-- * the line the function starts on (`x = function(` does not start with `function`)
+			local lineStart = tokStart(span.start)
+			while lineStart > 1 and sub(src, lineStart - 1, lineStart - 1) ~= "\n" do
+				lineStart -= 1
+			end
+			local indentText = match(src, "^[ \t]*", lineStart) or ""
+			local indent = 0
+			for _ in string.gmatch(indentText, "\t") do
+				indent += 1
+			end
+			local _, spaces = gsub(indentText, " ", "")
+			indent += spaces // 4
+
+			local liftedOk, lifted, globals = pcall(BytecodeLifter.liftFunction, chunk, protoId, upnames, indent)
+			if not liftedOk then
+				return nil, "could not rebuild function at line " .. tokLine(span.start) .. ": " .. tostring(lifted)
+			end
+			for name in globals do
+				local declared = mainLocals[name]
+				if declared and declared < span.start then
+					return nil, "global '" .. name .. "' is shadowed by a local of the same name"
+				end
+			end
+
+			-- * keep the decompiler's (broken) attempt as a comment, it is still the readable one
+			local original = sub(src, tokStart(span.start), tokEnd(span.stop))
+			local level = ""
+			while find(original, "]" .. level .. "]", 1, true) do
+				level ..= "="
+			end
+			local note = indentText
+				.. "--[" .. level .. "[ [BetterSaveinstance] The decompiler's version of the function below was broken, so it was rebuilt\n"
+				.. indentText .. "     straight from the bytecode: it behaves exactly like the original (registers are __R[n],\n"
+				.. indentText .. "     jumps set __pc). The decompiler's attempt, for reading:\n\n"
+				.. original
+				.. "\n" .. indentText .. "]" .. level .. "]\n"
+
+			lifted = gsub(lifted, "^(%b())", function(params)
+				return params .. " -- Line: " .. proto.linedefined .. (proto.debugname and ", Name: " .. proto.debugname or "") .. " (rebuilt from bytecode)"
+			end, 1)
+			out = sub(out, 1, lineStart - 1)
+				.. note
+				.. sub(out, lineStart, tokStart(open) - 1)
+				.. lifted
+				.. sub(out, tokEnd(span.stop) + 1)
+		end
+		return out, #targets
 	end
 
 	--------------------------------------------------------------------------
@@ -4097,7 +8682,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		mode = "optimized",
 		noscripts = false,
 		scriptcache = true,
-		decomptype = "",
+		decomptype = "builtin",
 		timeout = 10,
 		-- * New:
 		__DEBUG_MODE = false,
@@ -4111,6 +8696,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		RenameVariables = true,
 		FixGoto = true,
 		DecompilerFallback = true,
+		RebuildFromBytecode = true,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -4386,6 +8972,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local RenameVariables = OPTIONS.RenameVariables
 	local FixGoto = OPTIONS.FixGoto
 	local DecompilerFallback = OPTIONS.DecompilerFallback
+	local RebuildFromBytecode = OPTIONS.RebuildFromBytecode
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
 		OPTIONS.scriptcache = true
@@ -4760,14 +9347,46 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return KonstantModule or nil
 	end
 
+	-- * "builtin" (default): BetterDecompiler, in this file. "executor": the executor's own
+	-- * `decompile`. "custom": Konstant.
+	local DecompType = string.lower(tostring(OPTIONS.decomptype or ""))
+	if DecompType == "" then
+		DecompType = "builtin"
+	end
+	local ExecutorDecompiler = decompile
 	local UsingKonstant = false
 	if getscriptbytecode then
-		if (decompile == nil and OPTIONS.decomptype == "") or OPTIONS.decomptype == "custom" then
+		if DecompType == "custom" or (DecompType == "executor" and ExecutorDecompiler == nil) then
 			local konstant = GetKonstant()
 			if konstant then
-				GLOBAL_ENV.decompile = konstant.decompile
+				ExecutorDecompiler = konstant.decompile
 				UsingKonstant = true
 			end
+		end
+	end
+
+	local BuiltinDecompile
+	if DecompType == "builtin" and getscriptbytecode then
+		local lastYield = os.clock()
+		BetterDecompiler.onFunction = function()
+			-- * pure Luau: give the game a frame now and then on very large scripts
+			if task and os.clock() - lastYield > 1 / 30 then
+				task.wait()
+				lastYield = os.clock()
+			end
+		end
+		BuiltinDecompile = function(script)
+			local bytecode = getscriptbytecode(script)
+			if type(bytecode) ~= "string" or bytecode == "" then
+				error("could not read the script's bytecode", 0)
+			end
+			local chunk = BytecodeLifter.parse(bytecode)
+			local text, stats = BetterDecompiler.decompile(chunk)
+			local header = "-- Decompiled with BetterSaveinstance's built-in decompiler (" .. stats.structured + stats.lifted .. " functions"
+			if stats.lifted > 0 then
+				header ..= ", " .. stats.lifted .. " rebuilt low-level: search for \"[low-level]\""
+			end
+			return header .. ")\n\n" .. text
 		end
 	end
 
@@ -4801,7 +9420,21 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	do
-		local Decompiler = decompile --OPTIONS.decomptype == "custom" and custom_decompiler or decompile or custom_decompiler
+		local Decompiler = ExecutorDecompiler
+		if BuiltinDecompile then
+			Decompiler = function(script)
+				local ok, result = pcall(BuiltinDecompile, script)
+				if ok then
+					return result
+				end
+				-- * e.g. a bytecode version it does not know yet: let the executor's decompiler try
+				if ExecutorDecompiler then
+					return "-- NOTE: the built-in decompiler could not read this script (" .. tostring(result) .. "), so the executor's decompiler was used\n\n"
+						.. tostring(ExecutorDecompiler(script))
+				end
+				error(result, 0)
+			end
+		end
 
 		-- if Decompiler == custom_decompiler then -- Cope
 		-- 	local key = "DecompileTimeout"
@@ -4848,7 +9481,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					return nil
 				end
 				local ok, result = run_with_loading("Retrying with Konstant " .. script.Name, true, nil, fallback_decomp, bytecode)
-				if not ok or type(result) ~= "string" or result == "" or string.find(result, "^KONSTANTERROR") then
+				-- * Konstant marks every function it could not analyse with KONSTANTERROR and leaves
+				-- * it empty or partial. That still compiles, so it must be rejected explicitly.
+				if not ok or type(result) ~= "string" or result == "" or string.find(result, "KONSTANTERROR", 1, true) then
 					return nil
 				end
 				result = RepairDecompiledSource(result)
@@ -4856,6 +9491,54 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					return nil
 				end
 				return result
+			end
+
+			local function GetChunk(script)
+				if not RebuildFromBytecode then
+					return nil, "RebuildFromBytecode is disabled"
+				end
+				if not getbytecode then
+					return nil, "no getscriptbytecode"
+				end
+				local s, bytecode = getbytecode(script)
+				if not s or type(bytecode) ~= "string" or bytecode == "" then
+					return nil, "could not read the bytecode"
+				end
+				local parsed, chunk = pcall(BytecodeLifter.parse, bytecode)
+				if not parsed then
+					return nil, tostring(chunk)
+				end
+				return chunk
+			end
+
+			-- * Rebuilds, from bytecode, every top level function that does not compile or
+			-- * contains `until x == x`. Returns the new source, how many functions were
+			-- * rebuilt, and why it stopped if something is still wrong.
+			local function RebuildFunctions(chunk, source)
+				local rebuilt = 0
+				for _ = 1, 64 do
+					local lines
+					local syntax_error = GetSyntaxError(source)
+					if syntax_error then
+						local line = tonumber(string.match(syntax_error, ":(%d+):"))
+						if not line then
+							return source, rebuilt, "no line number in: " .. syntax_error
+						end
+						lines = { line }
+					else
+						lines = FindSuspiciousLines(source)
+						if #lines == 0 then
+							return source, rebuilt
+						end
+					end
+					local new, count = RebuildBrokenFunctions(source, chunk, lines)
+					if not new then
+						return source, rebuilt, count
+					end
+					source = new
+					rebuilt += count
+				end
+				return source, rebuilt, "too many broken functions"
 			end
 
 			ldecompile = function(script)
@@ -4903,15 +9586,55 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 					local syntax_error = GetSyntaxError(result)
 					local note
-					if syntax_error then
-						local fallback = TryFallbackDecompiler(script)
-						if fallback then
-							note = "-- NOTE: The main decompiler's output did not compile (" .. syntax_error .. "), so this script was decompiled with Konstant instead.\n\n"
-							result, syntax_error = fallback, nil
-						else
+					if syntax_error or #FindSuspiciousLines(result) > 0 then
+						local original_error = syntax_error
+						local chunk, why = GetChunk(script)
+
+						-- * 1. rebuild just the broken functions, the rest stays as decompiled
+						if chunk then
+							local fixed, count, reason = RebuildFunctions(chunk, result)
+							why = reason
+							if count > 0 then
+								result = fixed
+								syntax_error = GetSyntaxError(result)
+								note = "-- NOTE: The decompiler got " .. count .. " function(s) in this script wrong; they were rebuilt from bytecode\n"
+									.. "-- and behave exactly like the original (search for \"rebuilt from bytecode\").\n\n"
+							end
+						end
+
+						if syntax_error then
+							original_error = original_error or syntax_error
+							-- * 2. Konstant, if it decompiles the whole script cleanly
+							local fallback = TryFallbackDecompiler(script)
+							if fallback then
+								note = "-- NOTE: The main decompiler's output did not compile (" .. original_error .. "), so this script was decompiled with Konstant instead.\n\n"
+								result, syntax_error = fallback, nil
+							elseif chunk then
+								-- * 3. rebuild the whole script (the problem is in its main body)
+								local whole_ok, whole = pcall(BytecodeLifter.liftScript, chunk)
+								if whole_ok and not GetSyntaxError(whole) then
+									local level = "="
+									while string.find(result, "]" .. level .. "]", 1, true) do
+										level ..= "="
+									end
+									note = "-- NOTE: The decompiler's output did not compile (" .. original_error .. ") and the problem is in the\n"
+										.. "-- main body of the script, so the whole script was rebuilt from bytecode. It behaves exactly like\n"
+										.. "-- the original but is low level (registers are __R[n], jumps set __pc). The decompiler's\n"
+										.. "-- readable attempt is kept in a comment at the end of the script.\n\n"
+									result = whole
+										.. "\n\n--[" .. level .. "[ The decompiler's output, for reading (does not compile: " .. original_error .. "):\n\n"
+										.. result .. "\n]" .. level .. "]\n"
+									syntax_error = nil
+								elseif not whole_ok then
+									why = tostring(whole)
+								end
+							end
+						end
+
+						if syntax_error then
 							note = "-- WARNING: This decompiled script does NOT compile: " .. syntax_error .. "\n"
-								.. "-- A leftover `goto` means the decompiler could not rebuild a loop there; that function has to be fixed by hand.\n\n"
-							warn("Decompiled script does not compile:", script:GetFullName(), syntax_error)
+								.. "-- It could not be repaired automatically" .. (why and " (" .. why .. ")" or "") .. ".\n\n"
+							warn("Decompiled script does not compile:", script:GetFullName(), syntax_error, why)
 						end
 					end
 
