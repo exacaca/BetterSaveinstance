@@ -711,7 +711,8 @@ do
 	Binary_Descriptors.NumberSequence = Binary_Descriptors.__SEQUENCE
 end
 
-local ESCAPES_PATTERN = "[&<>\"'\0\1-\9\11-\12\14-\31\127-\255]" -- * The safe way is to escape all five characters in text. However, the three characters " ' and > needn't be escaped in text
+-- ! Bytes 128-255 must NOT be escaped: they are pieces of UTF-8 characters, and `&#195;&#169;` would load as "Ã©" instead of "é" (every accent/emoji/non-English text got corrupted whenever a string or script contained "]]>")
+local ESCAPES_PATTERN = "[&<>\"'\0\1-\9\11-\12\14-\31\127]" -- * The safe way is to escape all five characters in text. However, the three characters " ' and > needn't be escaped in text
 -- %z (\0 aka NULL) might not be needed as Roblox automatically converts it to space everywhere it seems like
 -- Characters from: https://create.roblox.com/docs/en-us/ui/rich-text#escape-forms
 -- * EscapesPattern should be ordered from most common to least common characters for sake of speed
@@ -1730,6 +1731,13 @@ All options are case insensitive.
     - A label immediately after a loop's `end`: every `goto` to it becomes `break`
     - The label itself is then removed
   - Only provably equivalent jumps are rewritten. The jump must be in the same function and the same loop as its label, and must be the last statement of its block, which is what Luau requires of `continue` / `break`. If even one jump to a label does not qualify, that label and all of its jumps are left exactly as they were. `repeat ... until` loops are skipped, as Luau restricts `continue` there.
+  - A `goto l0` whose label is missing entirely cannot be rewritten (the decompiler lost the loop structure); see DecompilerFallback.
+  - Default: true
+- DecompilerFallback: `boolean`
+  - Every decompiled script is compiled (never run) with loadstring to check that it is valid Luau. Invalid `p1: function` / `p1: function?` type annotations are always repaired first.
+  - If the output still does not compile, the script is decompiled again with Konstant, and Konstant's output is used only if it compiles.
+  - If neither compiles, the main decompiler's output is kept with a `-- WARNING: This decompiled script does NOT compile` header, so broken scripts are easy to search for in Studio.
+  - Has no effect when Konstant is already the main decompiler.
   - Default: true
 - DecompileJobless: `boolean`
   - Includes already decompiled code in the output. No new scripts are decompiled.
@@ -1870,7 +1878,7 @@ All options are case insensitive.
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables, FixGotoStatements
+local RenameDecompiledVariables, FixGotoStatements, FixFunctionTypeAnnotations
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -2651,6 +2659,45 @@ do
 				blankRange(toks[label.tokStart].i, toks[labelStop(label)].i)
 				dropLeadingBlank(toks[label.tokStart].i)
 				fixed = fixed + 1
+			end
+		end
+
+		if fixed == 0 then
+			return src
+		end
+		return concat(pieces)
+	end
+
+	-- * Decompilers emit `p1: function` / `p1: function?`, which Luau refuses to parse
+	-- * ("Using 'function' as a type annotation is not supported"). Types are erased at
+	-- * runtime, so swapping in `(...any) -> ...any` changes nothing but makes it parse.
+	-- * A `function` keyword right after `:` `::` `->` can only be a type: methods are
+	-- * called as `obj:name(...)` and `function` is never a valid name.
+	local FUNCTION_TYPE = "(...any) -> ...any"
+	function FixFunctionTypeAnnotations(src)
+		if type(src) ~= "string" or src == "" or not find(src, "function", 1, true) then
+			return src
+		end
+
+		local pieces, toks, ntoks = lex(src)
+		local fixed = 0
+		for n = 2, ntoks do
+			local t = toks[n]
+			if t.k == "kw" and t.v == "function" then
+				local prev = toks[n - 1]
+				local nxt = toks[n + 1]
+				local isType = prev.k == "op" and (prev.v == ":" or prev.v == "::" or prev.v == "->")
+				if not isType and prev.k == "op" and (prev.v == "|" or prev.v == "&") then
+					isType = not (nxt and nxt.k == "op" and nxt.v == "(")
+				end
+				if isType then
+					if (nxt and nxt.k == "op" and (nxt.v == "?" or nxt.v == "|" or nxt.v == "&")) or prev.v == "|" or prev.v == "&" then
+						pieces[t.i] = "(" .. FUNCTION_TYPE .. ")"
+					else
+						pieces[t.i] = FUNCTION_TYPE
+					end
+					fixed = fixed + 1
+				end
 			end
 		end
 
@@ -4063,6 +4110,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		RenameVariables = true,
 		FixGoto = true,
+		DecompilerFallback = true,
 		DecompileJobless = false,
 		DecompileIgnore = { -- * Clean these up (merged Old Syn and New Syn)
 			-- "Chat",
@@ -4337,6 +4385,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local RenameVariables = OPTIONS.RenameVariables
 	local FixGoto = OPTIONS.FixGoto
+	local DecompilerFallback = OPTIONS.DecompilerFallback
 	local DecompileJobless = OPTIONS.DecompileJobless
 	if DecompileJobless then
 		OPTIONS.scriptcache = true
@@ -4619,7 +4668,6 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local function construct_TimeoutHandler(timeout, f, timeout_ret)
-		wait(1)
 		return timeout < 0 and function(script)
 			return pcall(f, script)
 		end or function(script) -- TODO Ideally use ... (vararg) instead of `script` in case this is reused for something other than `decompile` & `getscriptbytecode`
@@ -4627,32 +4675,36 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				if Crashlog then Crashlog("  Getting bytecode for "..script:GetFullName()) end
 			end
 			local thread = coroutine.running()
-			local timeoutThread, isCancelled
+			local finished, waiting, timedOut, timeoutThread
+			local ok, result
 
-			timeoutThread = task.delay(timeout, function()
-				isCancelled = true -- TODO task.cancel
-				coroutine.resume(thread, nil, timeout_ret)
-			end)
-
+			-- * task.spawn runs the worker right away. Native decompilers / getscriptbytecode
+			-- * never yield, so they are already finished when task.spawn returns and we hand
+			-- * the result back in the same frame. Only a call that actually yields (HTTP or
+			-- * Luau-based decompilers) has to wait, and only then is the timeout armed.
 			task.spawn(function()
-				-- * One frame is enough: this only has to let the caller below reach
-				-- * coroutine.yield() first, and the `status ~= "suspended"` loop further
-				-- * down already guarantees that. A full second here cost ~1s per script.
-				task.wait()
-
-				local ok, result = pcall(f, script)
-
-				if isCancelled then
+				local o, r = pcall(f, script)
+				if timedOut then
 					return
 				end
-
-				task.cancel(timeoutThread)
-
-				while coroutine.status(thread) ~= "suspended" do
-					task.wait()
+				finished, ok, result = true, o, r
+				if waiting then
+					task.cancel(timeoutThread)
+					task.spawn(thread, o, r)
 				end
+			end)
 
-				coroutine.resume(thread, ok, result)
+			if finished then
+				return ok, result
+			end
+
+			waiting = true
+			timeoutThread = task.delay(timeout, function()
+				if finished then
+					return
+				end
+				timedOut = true
+				task.spawn(thread, nil, timeout_ret)
 			end)
 
 			return coroutine.yield()
@@ -4689,15 +4741,65 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 	end
+	local KONSTANT_URL = "https://raw.githubusercontent.com/exacaca/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau"
+	local KonstantModule -- * nil = not tried yet, false = failed to load
+	local function GetKonstant()
+		if KonstantModule == nil then
+			KonstantModule = false
+			if __DEBUG_MODE then __DEBUG_MODE("Attempting to load Konstant Decompiler. If there is an error/crash after this, set the option decomptype to any string other than custom") end
+			local ok, konstant = pcall(function()
+				return loadstring(game:HttpGet(KONSTANT_URL, true), "Konstant")()
+			end)
+			if ok and type(konstant) == "table" and type(konstant.decompile) == "function" then
+				KonstantModule = konstant
+				if __DEBUG_MODE then __DEBUG_MODE("Konstant Decompiler loaded") end
+			else
+				warn("Failed to load the Konstant decompiler:", konstant)
+			end
+		end
+		return KonstantModule or nil
+	end
+
+	local UsingKonstant = false
 	if getscriptbytecode then
 		if (decompile == nil and OPTIONS.decomptype == "") or OPTIONS.decomptype == "custom" then
-			if __DEBUG_MODE then __DEBUG_MODE("Attempting to load Konstant Decompiler. If there is an error/crash after this, set the option decomptype to any string other than custom") end
-			local url = "https://raw.githubusercontent.com/exacaca/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau"
-			local konstant = loadstring(game:HttpGet(url, true))()
-			GLOBAL_ENV.decompile = konstant.decompile
-			if __DEBUG_MODE then __DEBUG_MODE("Konstant Decompiler loaded") end
+			local konstant = GetKonstant()
+			if konstant then
+				GLOBAL_ENV.decompile = konstant.decompile
+				UsingKonstant = true
+			end
 		end
 	end
+
+	-- * Compiles without running anything. Returns the error message, or nil when the
+	-- * source parses (or when there is no way to check it).
+	local function GetSyntaxError(source)
+		if not loadstring then
+			return nil
+		end
+		local called, f, err = pcall(loadstring, source, "=decompiled")
+		if not called or f then
+			return nil
+		end
+		return (string.gsub(tostring(err or "unknown syntax error"), "[\r\n]+", " "))
+	end
+
+	-- * Repairs that cannot change what the script does, only whether it parses
+	local function RepairDecompiledSource(source)
+		source = string.gsub(source, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
+		local annotations_ok, annotated = pcall(FixFunctionTypeAnnotations, source)
+		if annotations_ok and type(annotated) == "string" and annotated ~= "" then
+			source = annotated
+		end
+		if FixGoto then
+			local goto_ok, gotoed = pcall(FixGotoStatements, source)
+			if goto_ok and type(gotoed) == "string" and gotoed ~= "" then
+				source = gotoed
+			end
+		end
+		return source
+	end
+
 	do
 		local Decompiler = decompile --OPTIONS.decomptype == "custom" and custom_decompiler or decompile or custom_decompiler
 
@@ -4724,9 +4826,37 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				return output
 			end
 		elseif Decompiler then
-			wait(1)
-			
 			local decomp = construct_TimeoutHandler(Timeout, Decompiler, "Decompiler timed out")
+			local fallback_decomp -- * Konstant, only built the first time a script needs it
+
+			-- * Second opinion for scripts whose output does not compile (e.g. a `goto l0`
+			-- * with no label, which happens when the decompiler cannot rebuild a loop).
+			-- * Returns repaired Konstant output only if THAT one compiles.
+			local function TryFallbackDecompiler(script)
+				if not DecompilerFallback or UsingKonstant or not getbytecode then
+					return nil
+				end
+				if fallback_decomp == nil then
+					local konstant = GetKonstant()
+					fallback_decomp = konstant and construct_TimeoutHandler(Timeout, konstant.decompile, "Decompiler timed out") or false
+				end
+				if not fallback_decomp then
+					return nil
+				end
+				local s, bytecode = getbytecode(script)
+				if not s or type(bytecode) ~= "string" or bytecode == "" then
+					return nil
+				end
+				local ok, result = run_with_loading("Retrying with Konstant " .. script.Name, true, nil, fallback_decomp, bytecode)
+				if not ok or type(result) ~= "string" or result == "" or string.find(result, "^KONSTANTERROR") then
+					return nil
+				end
+				result = RepairDecompiledSource(result)
+				if GetSyntaxError(result) then
+					return nil
+				end
+				return result
+			end
 
 			ldecompile = function(script)
 				if Crashlog then Crashlog("  Decompiling "..script:GetFullName()) end
@@ -4765,23 +4895,40 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				end
 
 				local output
+				if ok and type(result) ~= "string" then
+					ok, result = false, "Decompiler returned " .. typeof(result)
+				end
 				if ok then
-					result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-					if FixGoto then
-						local goto_ok, gotoed = pcall(FixGotoStatements, result)
-						if goto_ok and type(gotoed) == "string" and gotoed ~= "" then
-							result = gotoed
+					result = RepairDecompiledSource(result)
+
+					local syntax_error = GetSyntaxError(result)
+					local note
+					if syntax_error then
+						local fallback = TryFallbackDecompiler(script)
+						if fallback then
+							note = "-- NOTE: The main decompiler's output did not compile (" .. syntax_error .. "), so this script was decompiled with Konstant instead.\n\n"
+							result, syntax_error = fallback, nil
+						else
+							note = "-- WARNING: This decompiled script does NOT compile: " .. syntax_error .. "\n"
+								.. "-- A leftover `goto` means the decompiler could not rebuild a loop there; that function has to be fixed by hand.\n\n"
+							warn("Decompiled script does not compile:", script:GetFullName(), syntax_error)
 						end
 					end
+
 					if RenameVariables then
 						local renamed_ok, renamed = pcall(RenameDecompiledVariables, result)
 						if renamed_ok and type(renamed) == "string" and renamed ~= "" then
-							result = renamed
+							-- * Never let renaming be the thing that breaks a script
+							if syntax_error or not GetSyntaxError(renamed) then
+								result = renamed
+							elseif __DEBUG_MODE then
+								__DEBUG_MODE("RenameVariables broke the syntax, keeping the unrenamed output for", script:GetFullName())
+							end
 						elseif __DEBUG_MODE then
 							__DEBUG_MODE("RenameVariables failed, keeping the original output for", script:GetFullName(), renamed)
 						end
 					end
-					output = result
+					output = note and note .. result or result
 				else
 					output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
 				end
