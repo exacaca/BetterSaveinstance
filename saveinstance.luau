@@ -1902,7 +1902,8 @@ do
 		"FASTCALL3", "FORGPREP_NEXT", "NATIVECALL", "GETVARARGS", "DUPCLOSURE", "PREPVARARGS",
 		"LOADKX", "JUMPX", "FASTCALL", "COVERAGE", "CAPTURE", "SUBRK", "DIVRK", "FASTCALL1",
 		"FASTCALL2", "FASTCALL2K", "FORGPREP", "JUMPXEQKNIL", "JUMPXEQKB", "JUMPXEQKN", "JUMPXEQKS",
-		"IDIV", "IDIVK",
+		"IDIV", "IDIVK", "GETUDATAKS", "SETUDATAKS", "NAMECALLUDATA", "NEWCLASSMEMBER", "CALLFB",
+		"CMPPROTO", "FASTPCALL", "NEWCLASS",
 	}
 	local OP = {}
 	for code = 0, #OP_NAMES do
@@ -1916,7 +1917,8 @@ do
 			"GETGLOBAL", "SETGLOBAL", "GETIMPORT", "GETTABLEKS", "SETTABLEKS", "NAMECALL", "JUMPIFEQ",
 			"JUMPIFLE", "JUMPIFLT", "JUMPIFNOTEQ", "JUMPIFNOTLE", "JUMPIFNOTLT", "NEWTABLE", "SETLIST",
 			"FORGLOOP", "LOADKX", "FASTCALL2", "FASTCALL2K", "FASTCALL3", "JUMPXEQKNIL", "JUMPXEQKB",
-			"JUMPXEQKN", "JUMPXEQKS",
+			"JUMPXEQKN", "JUMPXEQKS", "GETUDATAKS", "SETUDATAKS", "NAMECALLUDATA", "NEWCLASSMEMBER", "CALLFB",
+			"CMPPROTO", "NEWCLASS",
 		}
 	do
 		HAS_AUX[OP[name]] = true
@@ -1960,6 +1962,18 @@ do
 			pos += 4
 			return v
 		end
+		local function varint64()
+			local result, scale = 0, 1
+			for _ = 1, 10 do
+				local b = u8()
+				result += band(b, 127) * scale
+				if b < 128 then
+					return result
+				end
+				scale *= 128
+			end
+			error("bad varint", 0)
+		end
 		local function varint()
 			local result, scale = 0, 1
 			for _ = 1, 5 do
@@ -1976,7 +1990,7 @@ do
 		local version = u8()
 		if version == 0 then
 			error("the script failed to compile: " .. string.sub(bytecode, 2), 0)
-		elseif version < 3 or version > 6 then
+		elseif version < 3 or version > 14 then
 			error("unsupported bytecode version " .. version, 0)
 		end
 		local typesVersion = 0
@@ -2005,6 +2019,12 @@ do
 		local protos = {}
 		local protoCount = varint()
 		for id = 0, protoCount - 1 do
+			-- * v12+: every function is prefixed with its size, so trailing data can be skipped
+			local protoSize, protoStart
+			if version >= 12 then
+				protoSize = varint()
+				protoStart = pos
+			end
 			local p = { id = id }
 			p.maxstack = u8()
 			p.numparams = u8()
@@ -2045,6 +2065,34 @@ do
 						keys[j] = varint()
 					end
 					k[i] = { t = "table", v = keys }
+				elseif t == 8 then
+					-- * v7: DUPTABLE template whose keys may come with constant values
+					local keys, vals = {}, {}
+					for j = 1, varint() do
+						keys[j] = varint()
+						need(4)
+						vals[j] = buffer.readi32(buf, pos)
+						pos += 4
+					end
+					k[i] = { t = "table", v = keys, vals = vals }
+				elseif t == 9 then
+					-- * v8: 64-bit integer
+					local negative = u8() ~= 0
+					local magnitude = varint64()
+					k[i] = { t = "number", v = negative and -magnitude or magnitude }
+				elseif t == 11 then
+					-- * v13: double precision vector
+					need(32)
+					k[i] = {
+						t = "vector",
+						v = {
+							buffer.readf64(buf, pos),
+							buffer.readf64(buf, pos + 8),
+							buffer.readf64(buf, pos + 16),
+							buffer.readf64(buf, pos + 24),
+						},
+					}
+					pos += 32
 				elseif t == 6 then
 					k[i] = { t = "closure", v = varint() }
 				elseif t == 7 then
@@ -2105,6 +2153,15 @@ do
 				for _ = 1, varint() do
 					varint()
 				end
+			end
+			if version >= 11 and not protoSize then
+				for _ = 1, varint() do -- * feedback vector
+					u8()
+					varint()
+				end
+			end
+			if protoSize then
+				pos = protoStart + protoSize
 			end
 			protos[id] = p
 		end
@@ -2258,6 +2315,21 @@ do
 				ins.size = 2
 			else
 				ins.size = 1
+			end
+			if op == OP.GETUDATAKS or op == OP.SETUDATAKS or op == OP.NAMECALLUDATA then
+				-- * userdata field access: same as GETTABLEKS / SETTABLEKS / NAMECALL (16 bit constant)
+				ins.op = op == OP.GETUDATAKS and OP.GETTABLEKS or op == OP.SETUDATAKS and OP.SETTABLEKS or OP.NAMECALL
+				ins.aux = band(ins.aux, 0xFFFF)
+			elseif op == OP.CALLFB then
+				ins.op = OP.CALL -- * a call that also records profiling feedback
+			elseif op == OP.CMPPROTO then
+				-- * speculative "is this the known function?" check: the jump goes to the general
+				-- * path, which does the same thing, so always taking it is exact
+				ins.op = OP.JUMP
+			elseif op == OP.FASTPCALL then
+				ins.op = OP.NOP -- * a hint; the CALL that follows does the work
+			elseif op == OP.NEWCLASS or op == OP.NEWCLASSMEMBER then
+				error("Luau classes are not supported", 0)
 			end
 			ins.next = pc + ins.size
 			insns[#insns + 1] = ins
@@ -2694,6 +2766,17 @@ do
 				emit(depth, R(a) .. " = -" .. R(b))
 			elseif op == OP.LENGTH then
 				emit(depth, R(a) .. " = #" .. R(b))
+			elseif op == OP.DUPTABLE and K[ins.d] and K[ins.d].vals then
+				local tk = K[ins.d]
+				local parts = {}
+				for j, keyIdx in tk.v do
+					local valIdx = tk.vals[j]
+					local valK = valIdx >= 0 and K[valIdx]
+					if valK and valK.t ~= "nil" then
+						parts[#parts + 1] = "[" .. Kt(keyIdx) .. "] = " .. Kt(valIdx)
+					end
+				end
+				emit(depth, R(a) .. " = {" .. concat(parts, ", ") .. "}")
 			elseif op == OP.NEWTABLE or op == OP.DUPTABLE then
 				emit(depth, R(a) .. " = {}")
 			elseif op == OP.SETLIST then
@@ -4956,7 +5039,21 @@ do
 					pushStmt(block, { k = "assign", targets = { E("index", { obj = ex[1], key = keyExpr }) }, values = { valueExpr } })
 				end
 			elseif op == OP.NEWTABLE or op == OP.DUPTABLE then
-				local st = pushDef(block, ins, a, E("table", { entries = {}, nextIndex = 1 }), true)
+				-- * v7+ templates may already hold constant values
+				local entries = {}
+				local tk = op == OP.DUPTABLE and K[ins.d]
+				if tk and tk.vals then
+					for j, keyIdx in tk.v do
+						local valIdx = tk.vals[j]
+						local valK = valIdx >= 0 and K[valIdx]
+						if valK and valK.t ~= "nil" then
+							local keyK = K[keyIdx]
+							local key = keyK.t == "string" and E("const", { text = strLit(keyK.v), str = keyK.v }) or K_(keyIdx)
+							entries[#entries + 1] = { key = key, value = K_(valIdx) }
+						end
+					end
+				end
+				local st = pushDef(block, ins, a, E("table", { entries = entries, nextIndex = 1 }), #entries == 0)
 				st.tableCtor = true
 				-- * fills right after creation go into the constructor, even for a variable
 				st.ctorWeb = webOf(ins.defIds[a])
