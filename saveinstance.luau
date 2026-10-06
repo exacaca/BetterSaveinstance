@@ -1723,7 +1723,8 @@ All options are case insensitive.
     - `local v14 = load("ClientStore")` becomes `local ClientStore = load("ClientStore")`
     - `local v28 = child:GetChildren()[1]` becomes `local firstChild = ...`
     - `function set_house_edit_mode(p2)` becomes `function set_house_edit_mode(house_edit_mode)`
-  - Works with every decompiler, because it runs on the decompiled text.
+    - Not used on the built-in decompiler's output, which already names variables itself (Roblox style).
+  - Works with any other decompiler, because it runs on the decompiled text.
   - Only names change. Strings, comments, table keys, type annotations and formatting come out byte for byte as the decompiler produced them.
   - Each new name is unique within its function and every function enclosing it, so nothing can be shadowed.
   - Default: true
@@ -3242,8 +3243,10 @@ do
 					producer = nil
 				elseif not NOOPS[op] and op ~= OP.CLOSEUPVALS then
 					-- * `f(g())` with a builtin f loads f between g's call and f's call
+					-- * `obj:m(g())` with obj not in a local: NAMECALL comes after g's call too
 					local loadsBelow = producer and ins.a < producer.a
-						and (op == OP.GETIMPORT or op == OP.GETGLOBAL or op == OP.MOVE or op == OP.GETUPVAL)
+						and (op == OP.GETIMPORT or op == OP.GETGLOBAL or op == OP.MOVE or op == OP.GETUPVAL
+							or (op == OP.NAMECALL and ins.a + 1 < producer.a))
 					if not loadsBelow then
 						producer = nil
 					end
@@ -5845,6 +5848,1239 @@ do
 	end
 
 	--------------------------------------------------------------------------
+	-- naming: Roblox style names from what a variable holds and how it is used
+	--------------------------------------------------------------------------
+	local NAME_KEYWORDS = {}
+	for word in string.gmatch(
+		"and break do else elseif end false for function if in local nil not or repeat return then true until while continue export type typeof",
+		"%S+"
+	) do
+		NAME_KEYWORDS[word] = true
+	end
+
+	local BUILTIN_NAMES = {}
+	for word in string.gmatch([[
+		assert error getfenv getmetatable ipairs load loadstring newproxy next pairs pcall print rawequal rawget rawlen
+		rawset require select setfenv setmetatable tonumber tostring type typeof unpack xpcall ypcall gcinfo
+		collectgarbage _G _VERSION string table math os coroutine bit32 utf8 buffer debug task vector game workspace
+		script shared plugin settings UserSettings wait delay spawn tick time elapsedTime warn version stats Enum
+		Instance Vector3 Vector2 CFrame Color3 BrickColor UDim UDim2 Ray Region3 TweenInfo NumberRange NumberSequence
+		ColorSequence Random Rect DateTime Font Faces Axes PhysicalProperties RaycastParams OverlapParams SharedTable
+		Content Vector3int16 Vector2int16 NumberSequenceKeypoint ColorSequenceKeypoint PathWaypoint Region3int16 self]], "%S+") do
+		BUILTIN_NAMES[word] = true
+	end
+
+	local CAMEL_SPECIAL = {
+		CFrame = "cframe", UDim2 = "udim2", UDim = "udim", GUI = "gui", UI = "ui", ID = "id", NPC = "npc",
+		HRP = "hrp", FOV = "fov", URL = "url", JSON = "json", HTTP = "http", FFlag = "fflag",
+	}
+
+	-- * "Hello World" / "hello-world" / "__index" -> "HelloWorld" / "helloWorld" / "index"
+	local function cleanWord(s)
+		if type(s) ~= "string" then
+			return nil
+		end
+		s = string.gsub(s, "[^%w_]+(%w)", string.upper)
+		s = string.gsub(s, "[^%w_]", "")
+		s = string.gsub(s, "^_+", "")
+		s = string.gsub(s, "_+$", "")
+		if s == "" or #s > 40 or string.find(s, "^%d") then
+			return nil
+		end
+		return s
+	end
+
+	-- * "LocalPlayer" -> "localPlayer", "CFrame" -> "cframe", "HTTPService" -> "httpService"
+	local function camel(s)
+		s = cleanWord(s)
+		if not s then
+			return nil
+		end
+		if CAMEL_SPECIAL[s] then
+			return CAMEL_SPECIAL[s]
+		end
+		for prefix, low in CAMEL_SPECIAL do
+			if #s > #prefix and string.sub(s, 1, #prefix) == prefix and string.find(s, "^%u", #prefix + 1) then
+				return low .. string.sub(s, #prefix + 1)
+			end
+		end
+		if not string.find(s, "%l") then
+			return string.lower(s)
+		end
+		local run = string.match(s, "^%u+")
+		if not run then
+			return s
+		end
+		if #run == 1 then
+			return string.lower(run) .. string.sub(s, 2)
+		end
+		return string.lower(string.sub(run, 1, -2)) .. string.sub(s, #run)
+	end
+
+	local function constStr(e)
+		if e and e.k == "const" then
+			if e.str then
+				return e.str
+			end
+			if e.value and e.value.t == "string" then
+				return e.value.v
+			end
+		end
+		return nil
+	end
+
+	local function upperFirst(s)
+		return (string.gsub(s, "^%l", string.upper))
+	end
+
+	local IRREGULAR_PLURALS = {
+		children = "child", people = "person", data = "entry", indices = "index", vertices = "vertex",
+		matrices = "matrix", mice = "mouse", leaves = "leaf", knives = "knife", lives = "life",
+	}
+	local function singular(s)
+		if not s then
+			return nil
+		end
+		if IRREGULAR_PLURALS[s] then
+			return IRREGULAR_PLURALS[s]
+		end
+		if #s < 4 then
+			return nil
+		end
+		if string.find(s, "ies$") then
+			return string.sub(s, 1, -4) .. "y"
+		elseif string.find(s, "sses$") or string.find(s, "[xz]es$") or string.find(s, "[cs]hes$") then
+			return string.sub(s, 1, -3)
+		elseif string.find(s, "[^su]s$") then
+			return string.sub(s, 1, -2)
+		end
+		return nil
+	end
+
+	-- * the name of one element of a collection: "players" -> "player", "fooToModuleMap" -> "module"
+	local function elementName(s)
+		if not s then
+			return nil
+		end
+		local single = singular(s)
+		if single then
+			return single
+		end
+		local target = string.match(s, "^%l[%w]-To(%u%w-)Map$")
+		if target then
+			return camel(target)
+		end
+		for _, suffix in { "Map", "Lookup", "Table", "Dict", "Dictionary", "Cache", "List", "Array", "Registry" } do
+			local base = string.match(s, "^(.-)" .. suffix .. "$")
+			if base and #base >= 2 then
+				return singular(base) or base
+			end
+		end
+		return nil
+	end
+
+	-- * parameters of the functions Roblox events pass to a connected function
+	local EVENT_PARAMS = {
+		CharacterAdded = { "character" }, CharacterRemoving = { "character" }, CharacterAppearanceLoaded = { "character" },
+		ChildAdded = { "child" }, ChildRemoved = { "child" }, DescendantAdded = { "descendant" },
+		DescendantRemoving = { "descendant" }, AncestryChanged = { "child", "parent" },
+		PlayerAdded = { "player" }, PlayerRemoving = { "player" }, Touched = { "hit" },
+		Changed = { "property" }, AttributeChanged = { "attribute" },
+		InputBegan = { "input", "gameProcessedEvent" }, InputChanged = { "input", "gameProcessedEvent" },
+		InputEnded = { "input", "gameProcessedEvent" }, TouchStarted = { "touch", "gameProcessedEvent" },
+		TouchMoved = { "touch", "gameProcessedEvent" }, TouchTap = { "touchPositions", "gameProcessedEvent" },
+		LastInputTypeChanged = { "lastInputType" }, GamepadConnected = { "gamepadNum" }, GamepadDisconnected = { "gamepadNum" },
+		Heartbeat = { "deltaTime" }, RenderStepped = { "deltaTime" }, PreRender = { "deltaTime" },
+		PreSimulation = { "deltaTime" }, PostSimulation = { "deltaTime" }, PreAnimation = { "deltaTime" },
+		Stepped = { "time", "deltaTime" }, HealthChanged = { "health" }, Running = { "speed" },
+		Jumping = { "active" }, FreeFalling = { "active" }, Climbing = { "speed" }, Swimming = { "speed" },
+		Seated = { "active", "currentSeatPart" }, StateChanged = { "oldState", "newState" },
+		MoveToFinished = { "reached" }, Chatted = { "message" }, Idled = { "time" },
+		Activated = { "inputObject", "clickCount" }, MouseEnter = { "x", "y" }, MouseLeave = { "x", "y" },
+		MouseMoved = { "x", "y" }, MouseButton1Down = { "x", "y" }, MouseButton1Up = { "x", "y" },
+		MouseButton2Down = { "x", "y" }, MouseButton2Up = { "x", "y" }, MouseWheelForward = { "x", "y" },
+		MouseWheelBackward = { "x", "y" }, FocusLost = { "enterPressed", "inputThatCausedFocusLoss" },
+		OnServerEvent = { "player" }, Completed = { "playbackState" }, Equipped = { "mouse" },
+		Triggered = { "player" }, TriggerEnded = { "player" }, MouseClick = { "player" },
+		PromptTriggered = { "prompt", "player" }, KeyframeReached = { "keyframeName" },
+		AnimationPlayed = { "animationTrack" }, PromptProductPurchaseFinished = { "userId", "productId", "isPurchased" },
+		PromptGamePassPurchaseFinished = { "player", "gamePassId", "wasPurchased" },
+		PromptPurchaseFinished = { "player", "assetId", "isPurchased" }, TextChanged = {},
+	}
+
+	-- * results of methods with fixed meanings
+	local METHOD_RESULTS = {
+		GetChildren = "children", GetDescendants = "descendants", GetPlayers = "players", GetTags = "tags",
+		GetMouse = "mouse", GetPlayerFromCharacter = "player", GetPlayerByUserId = "player", GetState = "state",
+		Clone = "clone", Raycast = "raycastResult", GetTouchingParts = "touchingParts", GetPartsInPart = "parts",
+		GetPartBoundsInBox = "parts", GetPartBoundsInRadius = "parts", JSONDecode = "data", JSONEncode = "json",
+		GenerateGUID = "guid", GetAsync = "data", HttpGet = "response", HttpGetAsync = "response",
+		PostAsync = "response", RequestAsync = "response", InvokeServer = "result", InvokeClient = "result",
+		Invoke = "result", GetFocusedTextBox = "textBox", GetServerTimeNow = "now", LoadAnimation = "track",
+		PointToWorldSpace = "worldPoint", VectorToWorldSpace = "worldVector", PointToObjectSpace = "localPoint",
+		VectorToObjectSpace = "localVector", ToWorldSpace = "worldCFrame", ToObjectSpace = "relativeCFrame",
+		GetPivot = "pivot", GetExtentsSize = "size", GetMass = "mass", GetDataStore = "dataStore",
+		GetOrderedDataStore = "dataStore", GetGlobalDataStore = "dataStore", UserOwnsGamePassAsync = "ownsGamePass",
+		PlayerOwnsAsset = "ownsAsset", Connect = "connection", Once = "connection", ConnectParallel = "connection",
+		ScreenPointToRay = "ray", ViewportPointToRay = "ray", Cross = "cross", Dot = "dot", Lerp = "lerped",
+		Create = "tween", GetUserId = "userId", GetFullName = "fullName",
+		FindPartOnRay = { "hit", "position", "normal", "material" },
+		FindPartOnRayWithIgnoreList = { "hit", "position", "normal", "material" },
+		FindPartOnRayWithWhitelist = { "hit", "position", "normal", "material" },
+		WorldToScreenPoint = { "screenPoint", "onScreen" }, WorldToViewportPoint = { "viewportPoint", "onScreen" },
+		ToEulerAnglesYXZ = { "rx", "ry", "rz" }, ToEulerAnglesXYZ = { "rx", "ry", "rz" },
+		ToOrientation = { "rx", "ry", "rz" }, ToAxisAngle = { "axis", "angle" },
+		GetBoundingBox = { "boundingCFrame", "boundingSize" },
+		GetComponents = { "x", "y", "z", "r00", "r01", "r02", "r10", "r11", "r12", "r20", "r21", "r22" },
+		components = { "x", "y", "z", "r00", "r01", "r02", "r10", "r11", "r12", "r20", "r21", "r22" },
+	}
+	-- * `obj:Method("Name")`: the string names the result
+	local CHILD_BY_NAME = { WaitForChild = true, FindFirstChild = true, FindFirstAncestor = true, FindFirstDescendant = true }
+	local CHILD_BY_CLASS = {
+		FindFirstChildOfClass = true, FindFirstChildWhichIsA = true, FindFirstAncestorOfClass = true,
+		FindFirstAncestorWhichIsA = true,
+	}
+	local FLAG_METHODS = {
+		IsUserFeatureEnabled = "FFlag", GetFFlag = "FFlag", GetFastFlag = "FFlag", DefineFastFlag = "FFlag",
+		GetEngineFeature = "FFlag", GetFastInt = "FInt", DefineFastInt = "FInt", GetFastString = "FString",
+		DefineFastString = "FString",
+	}
+	-- * results of global functions
+	local CALL_RESULTS = {
+		tostring = "text", tonumber = "number", typeof = "valueType", type = "valueType", getmetatable = "metatable",
+		next = { "key", "value" }, ["os.clock"] = "now", ["os.time"] = "now", tick = "now", time = "now",
+		elapsedTime = "now", ["os.date"] = "date", ["math.random"] = "randomNumber", ["math.atan2"] = "angle",
+		["math.atan"] = "angle", ["math.rad"] = "radians", ["math.deg"] = "degrees", ["math.sqrt"] = "root",
+		["math.sign"] = "sign", ["math.noise"] = "noise", ["math.min"] = "minimum", ["math.max"] = "maximum",
+		["math.clamp"] = "clamped", ["math.floor"] = "rounded", ["math.ceil"] = "rounded", ["math.round"] = "rounded",
+		["math.abs"] = "absolute", ["math.lerp"] = "lerped", ["string.format"] = "text", ["string.split"] = "parts",
+		["string.sub"] = "substring", ["string.len"] = "length", ["string.rep"] = "repeated", ["string.lower"] = "lower",
+		["string.upper"] = "upper", ["string.find"] = { "startIndex", "endIndex" }, ["string.match"] = "match",
+		["string.gsub"] = { "result", "count" }, ["string.byte"] = "byte", ["string.char"] = "character",
+		["table.concat"] = "text", ["table.find"] = "index", ["table.remove"] = "removed", ["table.create"] = "list",
+		["table.pack"] = "packed", ["table.clone"] = "copy", ["coroutine.create"] = "thread",
+		["coroutine.wrap"] = "thread", ["coroutine.running"] = "thread", ["coroutine.resume"] = { "success", "result" },
+		["coroutine.status"] = "status", ["task.spawn"] = "thread", ["task.defer"] = "thread", ["task.delay"] = "thread",
+		spawn = "thread", delay = "thread", ["task.wait"] = "elapsed", wait = "elapsed",
+		pcall = { "success", "result" }, xpcall = { "success", "result" }, ypcall = { "success", "result" },
+		["Vector3.new"] = "vector", ["Vector2.new"] = "vector", ["Vector3int16.new"] = "vector",
+		["Vector2int16.new"] = "vector", ["vector.create"] = "vector", ["CFrame.new"] = "cframe",
+		["CFrame.lookAt"] = "cframe", ["CFrame.fromMatrix"] = "cframe", ["CFrame.Angles"] = "rotation",
+		["CFrame.fromEulerAnglesXYZ"] = "rotation", ["CFrame.fromEulerAnglesYXZ"] = "rotation",
+		["CFrame.fromOrientation"] = "rotation", ["CFrame.fromAxisAngle"] = "rotation", ["Color3.new"] = "color",
+		["Color3.fromRGB"] = "color", ["Color3.fromHSV"] = "color", ["Color3.fromHex"] = "color",
+		["BrickColor.new"] = "brickColor", ["BrickColor.random"] = "brickColor", ["UDim2.new"] = "udim2",
+		["UDim2.fromScale"] = "udim2", ["UDim2.fromOffset"] = "udim2", ["UDim.new"] = "udim",
+		["TweenInfo.new"] = "tweenInfo", ["RaycastParams.new"] = "raycastParams", ["OverlapParams.new"] = "overlapParams",
+		["Random.new"] = "random", ["Ray.new"] = "ray", ["Region3.new"] = "region", ["NumberRange.new"] = "range",
+		["NumberSequence.new"] = "sequence", ["ColorSequence.new"] = "sequence",
+		["NumberSequenceKeypoint.new"] = "keypoint", ["ColorSequenceKeypoint.new"] = "keypoint",
+		["PhysicalProperties.new"] = "physicalProperties", ["DateTime.now"] = "now", ["Font.new"] = "font",
+		["Rect.new"] = "rect", ["buffer.create"] = "buf", ["buffer.fromstring"] = "buf", ["utf8.char"] = "character",
+		["utf8.len"] = "length",
+	}
+	-- * `obj.Field`: fields whose own name is too vague without the object's name
+	local PREFIXED_FIELDS = {
+		CFrame = true, Position = true, Size = true, Value = true, Magnitude = true, Unit = true, LookVector = true,
+		RightVector = true, UpVector = true, Name = true, Text = true, Velocity = true, Orientation = true, Rotation = true,
+	}
+	local FIELD_RESULTS = {
+		LocalPlayer = "player", CurrentCamera = "camera", Character = "character", Humanoid = "humanoid",
+		HumanoidRootPart = "rootPart", Parent = "parent",
+	}
+	-- * what reading a field says about the object
+	local FIELD_KINDS = {
+		Character = "player", UserId = "player", DisplayName = "player", Team = "player", TeamColor = "player",
+		Backpack = "player", PlayerGui = "player", leaderstats = "player", AccountAge = "player", CharacterAdded = "player",
+		Humanoid = "character", HumanoidRootPart = "character", Head = "character", Torso = "character",
+		UpperTorso = "character", KeyCode = "input", UserInputType = "input", UserInputState = "input",
+		Health = "humanoid", MaxHealth = "humanoid", WalkSpeed = "humanoid", JumpPower = "humanoid",
+		JumpHeight = "humanoid", MoveDirection = "humanoid", RootPart = "humanoid", FloorMaterial = "humanoid",
+		HipHeight = "humanoid", Anchored = "part", CanCollide = "part", CanTouch = "part", Material = "part",
+		BrickColor = "part", AssemblyLinearVelocity = "part", Touched = "part", Text = "label", TextColor3 = "label",
+		TextSize = "label", MouseButton1Click = "button", Activated = "button", Volume = "sound", SoundId = "sound",
+		IsPlaying = "track", AnimationId = "animation", LookVector = "cframe", RightVector = "cframe",
+		UpVector = "cframe",
+	}
+	local FIELD_KIND_SCORE = {
+		player = 1, character = 1, input = 1, humanoid = 1, part = 0.8, label = 0.6, button = 0.8, sound = 0.8,
+		track = 0.8, animation = 0.8, cframe = 0.6,
+	}
+
+	-- * `pcall(function() return settings:IsUserFeatureEnabled("Name") end)`: the flag it reads
+	local function flagNameOfProto(chunk, protoId, ctx)
+		ctx.flagNames = ctx.flagNames or {}
+		local cached = ctx.flagNames[protoId]
+		if cached ~= nil then
+			return cached or nil
+		end
+		local result = false
+		local p = chunk.protos[protoId]
+		local ok, insns = pcall(Lifter.decodeProto, chunk, p)
+		if ok then
+			local lastString
+			for _, ins in insns do
+				if ins.op == OP.LOADK then
+					local k = p.k[ins.d]
+					lastString = k and k.t == "string" and k.v or lastString
+				elseif ins.op == OP.NAMECALL then
+					local k = p.k[ins.aux]
+					local prefix = k and k.t == "string" and FLAG_METHODS[k.v]
+					local word = prefix and cleanWord(lastString)
+					if word then
+						result = prefix .. upperFirst(word)
+						break
+					end
+				end
+			end
+		end
+		ctx.flagNames[protoId] = result
+		return result or nil
+	end
+
+	local RETURN_VERBS = { "Get", "Select", "Find", "Choose", "Pick", "Calculate", "Compute", "Create", "Make", "Build", "Load", "Fetch" }
+
+	-- * Chooses every variable name of one function. Returns names (web -> name), the
+	-- * parameter names in order, and whether the function is printed as `function T:m()`.
+	local function chooseNames(A, p, root, materialized, upnames, hints, ctx, chunk, protoId)
+		hints = hints or {}
+		local isMethod = false
+		local recs, order = {}, {}
+		local function rec(w)
+			local r = recs[w]
+			if not r then
+				r = { w = w, defs = {}, fields = {}, methods = {}, stores = {}, reads = 0 }
+				recs[w] = r
+				order[#order + 1] = r
+			end
+			return r
+		end
+
+		local function pathOf(e)
+			if e.k == "global" then
+				return e.name
+			elseif e.k == "index" and e.key.str then
+				local base = pathOf(e.obj)
+				return base and base .. "." .. e.key.str
+			end
+			return nil
+		end
+
+		-- * facts about how each variable is used
+		local function scan(e)
+			forEachExpr(e, function(x)
+				local k = x.k
+				if k == "var" then
+					rec(x.w).reads += 1
+				elseif k == "index" then
+					if x.obj.k == "var" then
+						local r = rec(x.obj.w)
+						if x.key.str then
+							r.fields[x.key.str] = true
+						else
+							r.indexed = true
+						end
+					end
+				elseif k == "method" then
+					if x.obj.k == "var" then
+						local r = rec(x.obj.w)
+						r.methods[x.name] = true
+						local a1 = x.args[1]
+						if x.name == "IsA" and constStr(a1) then
+							r.isA = r.isA or constStr(a1)
+						elseif (CHILD_BY_NAME[x.name] or CHILD_BY_CLASS[x.name])
+							and (constStr(a1) == "Humanoid" or constStr(a1) == "HumanoidRootPart")
+						then
+							r.hasHumanoid = true
+						end
+					end
+					-- * functions handed to Roblox get the parameter names Roblox uses
+					local fnArg
+					if (x.name == "Connect" or x.name == "Once" or x.name == "ConnectParallel") and x.args[1] then
+						fnArg = x.args[1]
+						if fnArg.k == "closure" then
+							local event = x.obj.k == "index" and x.obj.key.str
+							fnArg.hints = { params = event and EVENT_PARAMS[event], eventName = event or nil }
+						end
+					elseif x.name == "BindToRenderStep" and x.args[3] and x.args[3].k == "closure" then
+						x.args[3].hints = { params = { "deltaTime" } }
+					elseif (x.name == "BindAction" or x.name == "BindActionAtPriority") and x.args[2] and x.args[2].k == "closure" then
+						x.args[2].hints = { params = { "actionName", "inputState", "inputObject" } }
+					end
+				elseif k == "call" then
+					if x.fn.k == "var" then
+						rec(x.fn.w).called = true
+					end
+					local path = pathOf(x.fn)
+					local a1 = x.args[1]
+					if a1 and a1.k == "var" then
+						local r = rec(a1.w)
+						if path == "ipairs" or path == "table.insert" or path == "table.remove" or path == "table.sort"
+							or path == "table.concat" or path == "table.find" or path == "table.clear" or path == "unpack"
+							or path == "table.unpack"
+						then
+							r.list = true
+						elseif path == "pairs" or path == "next" then
+							r.map = true
+						elseif path == "require" then
+							r.module = true
+						end
+					end
+					if path == "table.sort" and x.args[2] and x.args[2].k == "closure" then
+						x.args[2].hints = { params = { "a", "b" } }
+					end
+				elseif k == "binop" then
+					for _, side in { x.l, x.r } do
+						if side.k == "var" then
+							if x.op == "+" or x.op == "-" or x.op == "*" or x.op == "/" or x.op == "%" or x.op == "^" or x.op == "//" then
+								rec(side.w).numeric = true
+							end
+						end
+					end
+				elseif k == "unop" and x.op == "#" and x.e.k == "var" then
+					rec(x.e.w).list = true
+				elseif k == "concat" then
+					for _, part in x.list do
+						if part.k == "var" then
+							rec(part.w).text = true
+						end
+					end
+				elseif k == "closure" then
+					for _, cap in x.caps do
+						if type(cap) == "table" then
+							rec(cap.w).reads += 1
+						end
+					end
+				end
+			end)
+		end
+
+		-- * parameters first, in order
+		local paramRecs = {}
+		for r = 0, p.numparams - 1 do
+			local w = A.webOf(A.paramDefs[r])
+			paramRecs[r + 1] = rec(w)
+			paramRecs[r + 1].param = r + 1
+			paramRecs[r + 1].block = root
+		end
+
+		local returnedFromMain = {}
+		local function walk(block)
+			for _, st in block.stmts do
+				local k = st.k
+				if k == "local" then
+					local r = rec(st.w)
+					r.block = r.block or block
+				elseif k == "assign" then
+					local n = #st.targets
+					local nv = #st.values
+					for t, target in st.targets do
+						if target.k == "var" then
+							local r = rec(target.w)
+							if not r.block then
+								r.block = block
+							end
+							local def
+							if nv >= n then
+								def = { e = st.values[t], pos = 1, count = 1 }
+							elseif t >= nv then
+								def = { e = st.values[nv], pos = t - nv + 1, count = n - nv + 1 }
+							else
+								def = { e = st.values[t], pos = 1, count = 1 }
+							end
+							def.multi = n > 1
+							r.defs[#r.defs + 1] = def
+							local e = def.e
+							if def.pos == 2 and e.k == "call" and pathOf(e.fn) == "pcall" and e.args[1] and e.args[1].k == "closure" then
+								r.flag = flagNameOfProto(chunk, e.args[1].child, ctx)
+							end
+						else
+							scan(target)
+							if target.k == "index" and target.obj.k == "var" then
+								local owner = rec(target.obj.w)
+								local value = st.values[t]
+								if value and target.key.str then
+									if target.key.str == "__index" and value.k == "var" and value.w == target.obj.w then
+										owner.isClass = true
+									elseif value.k == "closure" then
+										owner.hasFunctions = true
+									end
+								end
+							end
+							local value = st.values[t]
+							if value and value.k == "var" and target.k == "index" and target.key.str then
+								local r = rec(value.w)
+								r.stores[#r.stores + 1] = target.key.str
+							end
+							if value and value.k == "closure" and target.k == "index" and target.key.str then
+								local key = target.key.str
+								if key == "OnServerInvoke" then
+									value.hints = { params = { "player" } }
+								elseif key == "ProcessReceipt" then
+									value.hints = { params = { "receiptInfo" } }
+								end
+							end
+						end
+					end
+					for _, v in st.values do
+						scan(v)
+					end
+				elseif k == "call" then
+					scan(st.expr)
+				elseif k == "return" then
+					for _, v in st.values do
+						scan(v)
+						if v.k == "var" then
+							rec(v.w).returned = true
+							if block == root then
+								returnedFromMain[v.w] = true
+							end
+						end
+					end
+				elseif k == "if" then
+					scan(st.cond)
+					walk(st.thenB)
+					if st.elseB then
+						walk(st.elseB)
+					end
+				elseif k == "while" then
+					if st.cond then
+						scan(st.cond)
+					end
+					walk(st.body)
+				elseif k == "repeat" then
+					walk(st.body)
+					if st.untilCond then
+						scan(st.untilCond)
+					end
+				elseif k == "numfor" then
+					scan(st.init)
+					scan(st.limit)
+					scan(st.step)
+					local r = rec(st.var)
+					r.block = st.body
+					r.numfor = true
+					walk(st.body)
+				elseif k == "genfor" then
+					for _, v in st.exprs do
+						scan(v)
+					end
+					for n, w in st.vars do
+						local r = rec(w)
+						r.block = st.body
+						r.genfor = st
+						r.genforIndex = n
+					end
+					walk(st.body)
+				end
+			end
+		end
+		walk(root)
+
+		local names = {}
+		local baseOfName = {} -- * "angle3" -> "angle" for names that got a number to be unique
+		local function nameOf(w)
+			local n = names[w]
+			return n and (baseOfName[n] or n)
+		end
+		local reserved = {}
+		for name in NAME_KEYWORDS do
+			reserved[name] = true
+		end
+		for name in ctx.allGlobals do
+			reserved[name] = true
+		end
+		for name in BUILTIN_NAMES do
+			if name ~= "self" then
+				reserved[name] = true
+			end
+		end
+		for _, name in upnames do
+			if type(name) == "string" then
+				reserved[name] = true
+			end
+		end
+
+		-- * a noun for an expression, for building names from it
+		local valueName
+		local function nounOf(e)
+			if not e then
+				return nil
+			end
+			local k = e.k
+			if k == "var" then
+				return nameOf(e.w)
+			elseif k == "upval" or k == "global" then
+				return isIdent(e.name) and e.name or nil
+			elseif k == "index" then
+				return e.key.str and cleanWord(e.key.str)
+			elseif k == "call" or k == "method" then
+				return (valueName(e, 1, 1))
+			end
+			return nil
+		end
+
+		local function nameFromFunctionName(fname, fallbackScore)
+			if not fname then
+				return nil
+			end
+			local rest = string.match(fname, "^[Gg]et(%u%w*)$")
+			if rest then
+				return camel(rest), 2
+			end
+			if string.find(fname, "^[IiHhCcSs][a-z]+%u") and (string.find(fname, "^[Ii]s%u") or string.find(fname, "^[Hh]as%u")
+				or string.find(fname, "^[Cc]an%u") or string.find(fname, "^[Ss]hould%u"))
+			then
+				return camel(fname), 2
+			end
+			for _, verb in { "Find", "Load", "Create", "Make", "Build", "Calculate", "Compute", "Fetch", "Read", "Generate", "New", "Wait", "Select", "Choose", "Pick" } do
+				rest = string.match(fname, "^" .. verb .. "(%u%w*)$") or string.match(fname, "^" .. string.lower(verb) .. "(%u%w*)$")
+				if rest then
+					return camel(rest), 1.5
+				end
+			end
+			local base = camel(fname)
+			return base and base .. "Result", fallbackScore or 0.3
+		end
+
+		local function fromList(v, pos)
+			if type(v) == "table" then
+				return v[pos]
+			end
+			return pos == 1 and v or nil
+		end
+
+		function valueName(e, pos, count)
+			local k = e.k
+			if k == "closure" then
+				local child = chunk.protos[e.child]
+				if child.debugname and isIdent(child.debugname) then
+					return child.debugname, 5
+				end
+				if e.hints and e.hints.eventName then
+					return "on" .. upperFirst(e.hints.eventName), 2
+				end
+				return "callback", 0.5
+			elseif k == "method" then
+				local m = e.name
+				local a1 = e.args[1]
+				local str = constStr(a1)
+				if (m == "GetService" or m == "FindService") and str then
+					return cleanWord(str), 4
+				elseif CHILD_BY_NAME[m] and str then
+					return camel(str), 3
+				elseif CHILD_BY_CLASS[m] and str then
+					return camel(str), 3
+				elseif FLAG_METHODS[m] and str and cleanWord(str) then
+					return FLAG_METHODS[m] .. upperFirst(cleanWord(str)), 4
+				elseif m == "GetAttribute" and str then
+					return camel(str), 3
+				elseif (m == "GetPropertyChangedSignal" or m == "GetAttributeChangedSignal") and str and camel(str) then
+					return camel(str) .. "Changed", 2
+				elseif m == "GetUserCFrame" and a1 and a1.k == "index" and a1.key.str then
+					return camel(a1.key.str) .. "CFrame", 2.5
+				elseif (m == "Wait" or m == "wait") and e.obj.k == "index" and e.obj.key.str then
+					local params = EVENT_PARAMS[e.obj.key.str]
+					local name = params and params[pos]
+					if name then
+						return name, 3
+					end
+					return nil
+				elseif (m == "Connect" or m == "Once") and e.obj.k == "index" and e.obj.key.str and camel(e.obj.key.str) then
+					return camel(e.obj.key.str) .. "Connection", 2
+				elseif m == "Clone" then
+					local noun = nounOf(e.obj)
+					return noun and camel(noun) or "clone", 1.5
+				elseif m == "IsA" and str and cleanWord(str) then
+					return "is" .. upperFirst(cleanWord(str)), 2
+				elseif METHOD_RESULTS[m] then
+					local name = fromList(METHOD_RESULTS[m], pos)
+					if name then
+						return name, 2
+					end
+					return nil
+				end
+				local name, score = nameFromFunctionName(m)
+				if pos > 1 and name then
+					return name .. pos, score * 0.5
+				end
+				return name, score
+			elseif k == "call" then
+				local path = pathOf(e.fn)
+				local a1 = e.args[1]
+				if path == "require" and a1 then
+					local name
+					if a1.k == "method" and CHILD_BY_NAME[a1.name] and constStr(a1.args[1]) then
+						name = cleanWord(constStr(a1.args[1]))
+					elseif a1.k == "index" and a1.key.str then
+						name = cleanWord(a1.key.str)
+					elseif a1.k == "var" then
+						name = names[a1.w]
+					elseif a1.k == "upval" then
+						name = isIdent(a1.name) and a1.name or nil
+					elseif constStr(a1) then
+						local last = string.match(constStr(a1), "([^/\\]+)$")
+						last = last and string.match(last, "^[^%.]+")
+						name = last and cleanWord(last)
+						name = name and upperFirst(name)
+					end
+					return name or "module", name and 4 or 1
+				elseif path == "setmetatable" then
+					return "object", 1
+				elseif path == "Instance.new" and constStr(a1) then
+					return camel(constStr(a1)), 3
+				elseif path and CALL_RESULTS[path] then
+					local name = fromList(CALL_RESULTS[path], pos)
+					if name then
+						return name, path == "pcall" and 3 or 1
+					end
+					return nil
+				end
+				if e.fn.k == "var" or e.fn.k == "upval" then
+					local fname = e.fn.k == "var" and names[e.fn.w] or e.fn.name
+					if fname and isIdent(fname) then
+						local name, score = nameFromFunctionName(fname)
+						if pos > 1 and name then
+							return name .. pos, score * 0.5
+						end
+						return name, score
+					end
+				elseif e.fn.k == "index" and e.fn.key.str then
+					local key = e.fn.key.str
+					if key == "new" or key == "New" or key == "create" or key == "Create" then
+						local noun = nounOf(e.fn.obj)
+						if noun and camel(noun) then
+							return camel(noun), 2
+						end
+					end
+					return nameFromFunctionName(key)
+				end
+				return nil
+			elseif k == "index" then
+				local key = e.key.str
+				if key then
+					local path = pathOf(e.obj)
+					if path and string.sub(path, 1, 5) == "Enum." then
+						return camel(string.match(path, "^Enum%.([%w_]+)")), 1
+					end
+					if FIELD_RESULTS[key] then
+						return FIELD_RESULTS[key], 2.5
+					end
+					if PREFIXED_FIELDS[key] then
+						local noun = e.obj.k == "var" and names[e.obj.w]
+						if noun and #noun + #key <= 28 then
+							return noun .. key, 2
+						end
+					end
+					local obj = e.obj
+					local fromModule = obj.k == "call" and pathOf(obj.fn) == "require"
+					if not fromModule then
+						local objName = (obj.k == "var" and names[obj.w]) or ((obj.k == "upval" or obj.k == "global") and obj.name)
+						fromModule = type(objName) == "string" and string.find(objName, "^%u%l") ~= nil
+					end
+					if fromModule and string.find(key, "^%u") and cleanWord(key) then
+						return cleanWord(key), 2
+					end
+					local name = camel(key)
+					if name and (BUILTIN_NAMES[name] or NAME_KEYWORDS[name]) then
+						local noun = camel(nounOf(obj))
+						name = noun and #noun + #name <= 28 and noun .. upperFirst(name) or nil
+					end
+					return name, 2
+				end
+				local noun = nounOf(e.obj)
+				local element = elementName(noun)
+				if element then
+					return element, 2
+				end
+				return nil
+			elseif k == "table" then
+				if #e.entries == 0 then
+					return "tbl", 0.1
+				end
+				local keyed, stringKeyed = false, true
+				for _, entry in e.entries do
+					if entry.key then
+						keyed = true
+						if not entry.key.str then
+							stringKeyed = false
+						end
+					end
+				end
+				if not keyed then
+					return "list", 0.5
+				end
+				return stringKeyed and "data" or "lookup", 0.5
+			elseif k == "const" then
+				if e.text == "true" or e.text == "false" then
+					return "flag", 0.1
+				elseif constStr(e) then
+					return "text", 0.1
+				elseif e.text ~= "nil" then
+					return "value", 0.1
+				end
+				return nil
+			elseif k == "binop" then
+				if e.op == "==" or e.op == "~=" or e.op == "<" or e.op == "<=" then
+					return "condition", 0.2
+				end
+				local function isPosition(x)
+					return x.k == "index" and (x.key.str == "Position" or x.key.str == "p")
+				end
+				if e.op == "-" and isPosition(e.l) and isPosition(e.r) then
+					return "offset", 0.6
+				end
+				-- * named after its leftmost operand that has a name
+				for _, side in { e.l, e.r } do
+					if side.k ~= "const" then
+						local noun = valueName(side, 1, 1)
+						if noun then
+							return noun, 0.3
+						end
+					end
+				end
+				return nil
+			elseif k == "and" or k == "or" then
+				if e.r.k == "var" and recs[e.r.w] and recs[e.r.w].flag then
+					return recs[e.r.w].flag, 3.5
+				end
+				local noun = (e.r.k == "var" and nameOf(e.r.w)) or nounOf(e.r) or nounOf(e.l)
+				return camel(noun), 0.3
+			elseif k == "not" then
+				return "condition", 0.2
+			elseif k == "unop" then
+				if e.op == "#" then
+					return "count", 1
+				end
+				return (valueName(e.e, 1, 1)), 0.3
+			elseif k == "concat" then
+				return "text", 0.5
+			elseif k == "var" then
+				return nameOf(e.w), 0.2
+			elseif k == "upval" or k == "global" then
+				return camel(e.name), 0.2
+			elseif k == "vararg" then
+				return count > 1 and ("arg" .. pos) or "args", 0.5
+			elseif k == "ifexpr" then
+				local a, sa = valueName(e.a, pos, count)
+				local b, sb = valueName(e.b, pos, count)
+				if a and (not b or sa >= sb) then
+					return a, sa
+				end
+				return b, sb
+			end
+			return nil
+		end
+
+		local function usageName(r)
+			local best, bestScore
+			local function offer(name, score)
+				if name and (not bestScore or score > bestScore) then
+					best, bestScore = name, score
+				end
+			end
+			for _, key in r.stores do
+				if not string.find(key, "^__") then
+					offer(camel(key), 1.5)
+					break
+				end
+			end
+			if r.isA then
+				offer(camel(r.isA), 1.2)
+			end
+			if r.hasHumanoid then
+				offer("character", 1.2)
+			end
+			for field in r.fields do
+				local kind = FIELD_KINDS[field]
+				if kind then
+					offer(kind, FIELD_KIND_SCORE[kind])
+				end
+			end
+			if r.methods.Disconnect then
+				offer("connection", 1)
+			end
+			if r.methods.Connect or r.methods.Wait then
+				offer("signal", 1)
+			end
+			if r.methods.FireServer or r.methods.FireAllClients or r.methods.FireClient then
+				offer("remote", 1)
+			end
+			if r.methods.InvokeServer or r.methods.InvokeClient then
+				offer("remote", 1)
+			end
+			if r.methods.LoadAnimation then
+				offer("humanoid", 0.8)
+			end
+			if r.called then
+				offer("callback", 0.6)
+			end
+			if r.list then
+				offer("list", 0.8)
+			end
+			if r.map then
+				offer("tbl", 0.4)
+			end
+			if r.module then
+				offer("module", 0.8)
+			end
+			if r.text then
+				offer("text", 0.5)
+			end
+			if r.methods.Destroy or r.methods.FindFirstChild or r.methods.WaitForChild or r.methods.GetChildren
+				or r.fields.Parent or r.fields.Name or r.fields.ClassName
+			then
+				offer("instance", 0.4)
+			end
+			if r.fields.Magnitude or r.fields.Unit or r.fields.magnitude or r.fields.unit then
+				offer("vector", 0.5)
+			end
+			if r.fields.X or r.fields.Y or r.fields.Z then
+				offer("vector", 0.3)
+			end
+			if r.numeric then
+				offer("value", 0.2)
+			end
+			return best, bestScore
+		end
+
+		-- * the function's own name says what its parameters are: `OnCharacterAdded(character)`,
+		-- * `SetEnabled(enabled)`
+		local fname = p.debugname
+		local fnameParams
+		if fname then
+			local event = string.match(fname, "^On(%u%w*)$")
+			if event then
+				fnameParams = EVENT_PARAMS[event] or EVENT_PARAMS[string.match(event, "^%u%l+(%u%w*)$") or ""]
+			end
+			local set = string.match(fname, "^Set(%u%w*)$")
+			if set and camel(set) then
+				fnameParams = { camel(set) }
+			end
+		end
+
+		-- * `NormalizeAngle` -> its parameter is an angle
+		local fnameNoun = fname and string.match(fname, "^%a%l+(%u%l+)$")
+		fnameNoun = fnameNoun and camel(fnameNoun)
+
+		-- * the module's class / table, named after the script
+		local className
+		if protoId == chunk.main and ctx.options.scriptName then
+			className = cleanWord(ctx.options.scriptName)
+			if className then
+				className = upperFirst(className)
+			end
+		end
+		local classTaken = false
+
+		local function candidate(r)
+			local best, bestScore
+			local function offer(name, score)
+				if name and score and (not bestScore or score > bestScore) then
+					best, bestScore = name, score
+				end
+			end
+			if r.param then
+				local index = r.param - (hints.methodSelf and 1 or 0)
+				local hinted = hints.params and hints.params[index]
+				if hinted then
+					offer(hinted, 4)
+				end
+				local fromName = fnameParams and fnameParams[index]
+				if fromName then
+					offer(fromName, 3)
+				end
+				local count = p.numparams - (hints.methodSelf and 1 or 0)
+				if fnameNoun and count == 1 then
+					offer(fnameNoun, 1)
+				elseif fnameNoun and count == 2 and index >= 1 then
+					offer(fnameNoun .. (index == 1 and "A" or "B"), 1)
+				end
+			end
+			if r.numfor then
+				offer("i", 1)
+			end
+			if r.genfor then
+				local st, n = r.genfor, r.genforIndex
+				local iter = st.exprs[1]
+				local container, kind = iter, nil
+				if iter and iter.k == "call" then
+					local path = pathOf(iter.fn)
+					if path == "pairs" or path == "ipairs" or path == "next" then
+						container, kind = iter.args[1], path
+					end
+				elseif iter and iter.k == "global" and iter.name == "next" then
+					container, kind = st.exprs[2], "pairs"
+				end
+				if n == 1 then
+					if kind == "ipairs" then
+						offer("i", 1)
+					else
+						local noun = container and nounOf(container)
+						if container and container.k == "method" and (container.name == "GetChildren" or container.name == "GetDescendants" or container.name == "GetPlayers") then
+							offer("i", 1)
+						elseif noun and elementName(noun) and string.find(noun, "s$") then
+							offer("i", 0.8)
+						else
+							offer("key", 1)
+						end
+					end
+				elseif n == 2 then
+					local element = container and elementName(nounOf(container))
+					offer(element, 2)
+					offer("value", 0.5)
+				else
+					offer("value" .. n, 0.5)
+				end
+			end
+			for _, def in r.defs do
+				local name, score = valueName(def.e, def.pos, def.count)
+				local isCopy = def.e.k == "var" or def.e.k == "upval" or def.e.k == "global"
+				if not (isCopy and #r.defs > 1) then
+					offer(name, score)
+				end
+				-- * `local self = setmetatable({}, Class) ... return self` in a constructor
+				if def.e.k == "call" and pathOf(def.e.fn) == "setmetatable" and r.returned and not isMethod then
+					offer("self", 3)
+				end
+			end
+			offer(usageName(r))
+			if r.isClass then
+				offer("Class", 1)
+			end
+			if className and not classTaken and (r.isClass or r.hasFunctions or returnedFromMain[r.w]) then
+				for _, def in r.defs do
+					if def.e.k == "table" then
+						offer(className, 6)
+						break
+					end
+				end
+			end
+			if r.returned and fname then
+				for _, verb in RETURN_VERBS do
+					local rest = string.match(fname, "^" .. verb .. "(%u%w*)$") or string.match(fname, "^" .. string.lower(verb) .. "(%u%w*)$")
+					if rest then
+						offer(camel(rest), 1.2)
+						break
+					end
+				end
+			end
+			if not best then
+				if r.param then
+					best = next(r.methods) and "object" or "value"
+				else
+					local fromCall = false
+					for _, def in r.defs do
+						if def.e.k == "call" or def.e.k == "method" then
+							fromCall = true
+						end
+					end
+					best = fromCall and "result" or "value"
+				end
+			end
+			if best == className then
+				classTaken = true
+			end
+			return best, bestScore or 0
+		end
+
+		-- * unique within every scope that can see it
+		local taken = {}
+		local function contains(a, b)
+			while b do
+				if a == b then
+					return true
+				end
+				b = b.parent
+			end
+			return false
+		end
+		local function isFree(name, block)
+			if reserved[name] or not isIdent(name) then
+				return false
+			end
+			local list = taken[name]
+			if list then
+				for _, other in list do
+					if contains(other, block) or contains(block, other) then
+						return false
+					end
+				end
+			end
+			return true
+		end
+		local LETTERS = { i = { "j", "k", "l", "m", "n" } }
+		local function claim(base, block)
+			local name = base
+			if not isFree(name, block) then
+				name = nil
+				for _, alt in LETTERS[base] or {} do
+					if isFree(alt, block) then
+						name = alt
+						break
+					end
+				end
+				if not name then
+					local n = 2
+					while not isFree((string.find(base, "%d$") and base .. "_" or base) .. n, block) do
+						n += 1
+					end
+					name = (string.find(base, "%d$") and base .. "_" or base) .. n
+					baseOfName[name] = base
+				end
+			end
+			local list = taken[name]
+			if not list then
+				list = {}
+				taken[name] = list
+			end
+			list[#list + 1] = block
+			return name
+		end
+
+		-- * `self`: the first parameter of a method
+		if hints.method and paramRecs[1] and not reserved.self then
+			local first = paramRecs[1]
+			local usedAsObject = next(first.fields) ~= nil or next(first.methods) ~= nil or first.indexed
+			if hints.method == "namecall" or usedAsObject or first.reads == 0 then
+				isMethod = true
+				names[first.w] = "self"
+				taken.self = { root }
+				hints.methodSelf = true
+			end
+		end
+
+		for _, r in order do
+			local w = r.w
+			if not names[w] and (materialized[w] or r.param) then
+				local multiTarget = false
+				for _, def in r.defs do
+					if def.multi then
+						multiTarget = true
+					end
+				end
+				if r.reads == 0 and not w.captured and not r.param and (r.genfor or multiTarget) and not reserved._ then
+					names[w] = "_"
+				else
+					local block = r.block or root
+					local base, score = candidate(r)
+					-- * a weak guess borrowed from a numbered name (`r01`, `result2`) that is already
+					-- * taken would only read as a typo (`r01_2`)
+					if score < 1 and string.find(base, "%d$") and not isFree(base, block) then
+						base = "value"
+					end
+					names[w] = claim(base, block)
+				end
+			end
+		end
+
+		local classWebs = {}
+		for _, r in order do
+			if r.isClass or r.hasFunctions then
+				classWebs[r.w] = true
+			end
+		end
+
+		local params = {}
+		for n, r in paramRecs do
+			if not (isMethod and n == 1) then
+				params[#params + 1] = names[r.w]
+			end
+		end
+		if p.isvararg then
+			params[#params + 1] = "..."
+		end
+		return names, params, isMethod, classWebs
+	end
+
+	local function onlyReadsLocals(e)
+		local k = e.k
+		if k == "const" or k == "var" or k == "upval" then
+			return true
+		elseif k == "and" or k == "or" then
+			return onlyReadsLocals(e.l) and onlyReadsLocals(e.r)
+		elseif k == "not" then
+			return onlyReadsLocals(e.e)
+		end
+		return false
+	end
+	local function dropEmptyIfs(block)
+		local stmts = block.stmts
+		for i = #stmts, 1, -1 do
+			local st = stmts[i]
+			local a, b = childBlocks(st)
+			if a then
+				dropEmptyIfs(a)
+			end
+			if b then
+				dropEmptyIfs(b)
+			end
+			if st.k == "if" and #st.thenB.stmts == 0 and (not st.elseB or #st.elseB.stmts == 0) and onlyReadsLocals(st.cond) then
+				remove(stmts, i)
+			end
+		end
+	end
+
+	-- * `local x = nil` for a variable nothing ever reads (the declaration of a local that is
+	-- * assigned on every path before use) says nothing; leaving it out changes nothing
+	local function dropDeadNils(block)
+		local stmts = block.stmts
+		for i = #stmts, 1, -1 do
+			local st = stmts[i]
+			if st.k == "assign" and #st.targets == 1 and #st.values == 1 and st.targets[1].k == "var"
+				and st.values[1].k == "const" and st.values[1].text == "nil" and #st.targets[1].w.uses == 0
+				and not st.targets[1].w.captured and not st.targets[1].w.kinds.param
+			then
+				remove(stmts, i)
+			end
+			local a, b = childBlocks(st)
+			if a then
+				dropDeadNils(a)
+			end
+			if b then
+				dropDeadNils(b)
+			end
+		end
+	end
+
+	-- * names the whole script uses as globals, and method names it calls with `:`
+	local function scanChunk(chunk)
+		local globals, namecalls, dotReads = {}, {}, {}
+		for _, p in chunk.protos do
+			local ok, insns = pcall(Lifter.decodeProto, chunk, p)
+			if ok then
+				local K = p.k
+				for _, ins in insns do
+					local op = ins.op
+					local k
+					if op == OP.GETGLOBAL or op == OP.SETGLOBAL then
+						k = K[ins.aux]
+						if k and k.t == "string" then
+							globals[k.v] = true
+						end
+					elseif op == OP.GETIMPORT then
+						k = K[band(rshift(ins.aux, 20), 1023)]
+						if k and k.t == "string" then
+							globals[k.v] = true
+						end
+					elseif op == OP.NAMECALL then
+						k = K[ins.aux]
+						if k and k.t == "string" then
+							namecalls[k.v] = true
+						end
+					elseif op == OP.GETTABLEKS then
+						k = K[ins.aux]
+						if k and k.t == "string" then
+							dotReads[k.v] = true
+						end
+					end
+				end
+			end
+		end
+		return globals, namecalls, dotReads
+	end
+
+	--------------------------------------------------------------------------
 	-- printing
 	--------------------------------------------------------------------------
 	local PREC = {
@@ -5880,6 +7116,15 @@ do
 	end
 
 	local decompileFunction -- forward
+
+	local function reasonText(err)
+		local text = string.gsub(tostring(err), "^" .. FAIL, "")
+		text = string.gsub(text, "[%c]+", " ")
+		if #text > 140 then
+			text = string.sub(text, 1, 140) .. "..."
+		end
+		return text
+	end
 
 	function Printer:name(w)
 		local n = self.names[w]
@@ -5970,7 +7215,7 @@ do
 			for n, cap in e.caps do
 				upnames[n] = type(cap) == "string" and cap or self:name(cap.w)
 			end
-			return "function" .. decompileFunction(self.chunk, e.child, upnames, indent, self.ctx)
+			return "function" .. (decompileFunction(self.chunk, e.child, upnames, indent, self.ctx, nil, e.hints))
 		end
 		fail("cannot print " .. tostring(k))
 	end
@@ -6016,19 +7261,19 @@ do
 				local v1 = st.values[1]
 				local t1 = st.targets[1]
 				local sugarName
+				local function path(x)
+					if x.k == "global" or x.k == "upval" then
+						return isIdent(x.name) and x.name or nil
+					elseif x.k == "var" then
+						return self:name(x.w)
+					elseif x.k == "index" and x.key.str and isIdent(x.key.str) then
+						local base = path(x.obj)
+						return base and base .. "." .. x.key.str
+					end
+					return nil
+				end
 				if #st.targets == 1 and #st.values == 1 and v1.k == "closure" and not st.isLocal and not st.isLocalFunction then
 					local debugname = self.chunk.protos[v1.child].debugname
-					local function path(x)
-						if x.k == "global" or x.k == "upval" then
-							return x.name
-						elseif x.k == "var" then
-							return self:name(x.w)
-						elseif x.k == "index" and x.key.str and isIdent(x.key.str) then
-							local base = path(x.obj)
-							return base and base .. "." .. x.key.str
-						end
-						return nil
-					end
 					local last = (t1.k == "index" and t1.key.str) or ((t1.k == "global" or t1.k == "upval") and t1.name)
 					if debugname and last == debugname then
 						sugarName = path(t1)
@@ -6039,20 +7284,37 @@ do
 					for m, cap in v1.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
-					out[#out + 1] = tab .. "function " .. sugarName .. decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true)
+					-- * a method: called with `:` somewhere in the script, or stored in a class table
+					local methodHint
+					local key = t1.k == "index" and t1.key.str
+					if key and key ~= "new" and key ~= "New" and key ~= "create" and key ~= "Create" then
+						if self.ctx.namecalls[key] then
+							methodHint = "namecall"
+						elseif t1.obj.k == "var" and self.classWebs[t1.obj.w] and not self.ctx.dotReads[key] then
+							methodHint = "class"
+						end
+					end
+					local childHints = { method = methodHint, params = v1.hints and v1.hints.params }
+					local body, isMethod = decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true, childHints)
+					if isMethod then
+						sugarName = path(t1.obj) .. ":" .. key
+					end
+					out[#out + 1] = tab .. "function " .. sugarName .. body
 				elseif st.isLocalFunction then
 					local v = st.values[1]
 					local upnames = {}
 					for m, cap in v.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
-					out[#out + 1] = tab .. "local function " .. targets[1] .. decompileFunction(self.chunk, v.child, upnames, indent, self.ctx, true)
+					out[#out + 1] = tab .. "local function " .. targets[1] .. (decompileFunction(self.chunk, v.child, upnames, indent, self.ctx, true, v.hints))
 				elseif st.isLocal and #st.targets == 1 and v1.k == "closure" and self.chunk.protos[v1.child].debugname then
 					local upnames = {}
 					for m, cap in v1.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
-					out[#out + 1] = tab .. "local function " .. targets[1] .. decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true)
+					out[#out + 1] = tab .. "local function " .. targets[1] .. (decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true, v1.hints))
+				elseif st.isLocal and #st.targets == 1 and #st.values == 1 and v1.k == "const" and v1.text == "nil" then
+					out[#out + 1] = tab .. "local " .. targets[1]
 				elseif st.isLocal then
 					out[#out + 1] = tab .. "local " .. concat(targets, ", ") .. " = " .. values()
 				else
@@ -6140,7 +7402,7 @@ do
 	--------------------------------------------------------------------------
 	-- one function
 	--------------------------------------------------------------------------
-	local function structured(chunk, protoId, upnames, indent, ctx)
+	local function structured(chunk, protoId, upnames, indent, ctx, hints)
 		local p = chunk.protos[protoId]
 		local A = analyze(chunk, p)
 		local ast = structure(A)
@@ -6148,42 +7410,26 @@ do
 		local root, materialized = buildIR(A, ast, irCtx)
 		makeRepeats(root)
 		makeIfExpressions(root)
+		dropDeadNils(root)
+		dropEmptyIfs(root)
 		placeDeclarations(A, root, materialized, ctx)
-
-		local names = {}
-		local params = {}
-		for r = 0, p.numparams - 1 do
-			local w = A.webOf(A.paramDefs[r])
-			ctx.counter += 1
-			local name = "p" .. ctx.counter
-			names[w] = name
-			params[#params + 1] = name
-		end
-		if p.isvararg then
-			params[#params + 1] = "..."
-		end
-		for w in materialized do
-			if not names[w] then
-				ctx.counter += 1
-				names[w] = "v" .. ctx.counter
-			end
-		end
-		local printer = setmetatable({ names = names, chunk = chunk, ctx = ctx }, Printer)
+		local names, params, isMethod, classWebs = chooseNames(A, p, root, materialized, upnames, hints, ctx, chunk, protoId)
+		local printer = setmetatable({ names = names, chunk = chunk, ctx = ctx, classWebs = classWebs }, Printer)
 		local out = {}
 		printer:block(root, indent + 1, out)
-		return params, out
+		return params, out, isMethod
 	end
 
-	function decompileFunction(chunk, protoId, upnames, indent, ctx, named)
+	function decompileFunction(chunk, protoId, upnames, indent, ctx, named, hints)
 		if BetterDecompiler.onFunction then
 			BetterDecompiler.onFunction() -- * lets the caller yield on very large scripts
 		end
 		local p = chunk.protos[protoId]
-		local ok, params, out = pcall(structured, chunk, protoId, upnames, indent, ctx)
+		local ok, params, out, isMethod = pcall(structured, chunk, protoId, upnames, indent, ctx, hints)
 		local header = (p.debugname and not named) and (" -- " .. p.debugname) or ""
 		if ok then
 			ctx.structured += 1
-			return "(" .. concat(params, ", ") .. ")" .. header .. "\n" .. concat(out, "\n") .. (#out > 0 and "\n" or "") .. rep("\t", indent) .. "end"
+			return "(" .. concat(params, ", ") .. ")" .. header .. "\n" .. concat(out, "\n") .. (#out > 0 and "\n" or "") .. rep("\t", indent) .. "end", isMethod
 		end
 		if not string.find(tostring(params), FAIL, 1, true) then
 			ctx.internalErrors[#ctx.internalErrors + 1] = tostring(params)
@@ -6191,22 +7437,27 @@ do
 		ctx.lifted += 1
 		ctx.reasons[#ctx.reasons + 1] = ("%s (function %s, line %d, proto %d)"):format(tostring(params), tostring(p.debugname or "anonymous"), p.linedefined, protoId)
 		local text, globals = Lifter.liftFunction(chunk, protoId, upnames, indent, function(childId, childUpnames, childIndent)
-			return decompileFunction(chunk, childId, childUpnames, childIndent, ctx)
+			return (decompileFunction(chunk, childId, childUpnames, childIndent, ctx))
 		end)
+		local reason = reasonText(params)
 		text = string.gsub(text, "^(%b())\n", function(params)
 			return params .. header .. "\n" .. rep("\t", indent + 1)
-				.. "-- [low-level] the structure of this function could not be rebuilt; this is its exact behaviour (registers are __R[n], jumps set __pc)\n"
+				.. "-- [low-level] the structure of this function could not be rebuilt (" .. reason .. "); this is its exact behaviour (registers are __R[n], jumps set __pc)\n"
 		end, 1)
 		for g in globals do
 			ctx.globals[g] = true
 		end
-		return text
+		return text, false
 	end
 
-	-- * decompiles a whole script; returns source text and stats
-	function BetterDecompiler.decompile(chunk)
-		local ctx = { counter = 0, globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {} }
-		local main = chunk.protos[chunk.main]
+	-- * decompiles a whole script; returns source text and stats.
+	-- * options.scriptName (optional) names the module's main table after the script.
+	function BetterDecompiler.decompile(chunk, options)
+		local allGlobals, namecalls, dotReads = scanChunk(chunk)
+		local ctx = {
+			globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {},
+			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {},
+		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
 		if ok then
@@ -6215,15 +7466,13 @@ do
 		else
 			ctx.lifted += 1
 			ctx.reasons[#ctx.reasons + 1] = "main: " .. tostring(params)
-			body = Lifter.liftScript(chunk, function(childId, childUpnames, childIndent)
-				return decompileFunction(chunk, childId, childUpnames, childIndent, ctx)
-			end)
-		end
-		-- * our generated names must not hide a global the script uses
-		for g in ctx.globals do
-			if string.match(g, "^[pv]%d+$") then
-				error("the script uses a global named " .. g .. ", which clashes with generated names", 0)
+			if not string.find(tostring(params), FAIL, 1, true) then
+				ctx.internalErrors[#ctx.internalErrors + 1] = tostring(params)
 			end
+			body = "-- [low-level] the structure of the main body could not be rebuilt (" .. reasonText(params) .. "); it is exact but low level\n"
+				.. Lifter.liftScript(chunk, function(childId, childUpnames, childIndent)
+					return (decompileFunction(chunk, childId, childUpnames, childIndent, ctx))
+				end)
 		end
 		return body, ctx
 	end
@@ -6233,7 +7482,7 @@ end
 -- * inferred from what they get assigned from / how they are used.
 -- * Pure text in, text out. Comments, whitespace and everything else is preserved.
 
-local RenameDecompiledVariables, FixGotoStatements, FixFunctionTypeAnnotations, RebuildBrokenFunctions, FindSuspiciousLines
+local RenameDecompiledVariables, FixGotoStatements, FixFunctionTypeAnnotations, RebuildBrokenFunctions, FindSuspiciousLines, FreeNames
 do
 	local sub, find, gsub, rep, upper, lower, match =
 		string.sub, string.find, string.gsub, string.rep, string.upper, string.lower, string.match
@@ -7496,6 +8745,27 @@ do
 			return ntoks
 		end
 
+		-- * Inside a function body, `do` / `repeat` / an `if` statement open blocks of their own
+		-- * that end with `end` / `until`; they must not be mistaken for the function's `end`.
+		local function opensInnerBlock(j, blocks)
+			if blocks == 0 then
+				return false
+			end
+			local t = toks[j]
+			if t.v == "do" or t.v == "repeat" then
+				return true
+			end
+			if t.v ~= "if" then
+				return false
+			end
+			if t.nl then
+				return true
+			end
+			local prev = toks[j - 1]
+			return prev ~= nil and ((prev.k == "op" and prev.v == ";")
+				or (prev.k == "kw" and (prev.v == "then" or prev.v == "else" or prev.v == "do" or prev.v == "repeat" or prev.v == "end")))
+		end
+
 		local function stmtEnd(i)
 			local depth, blocks = 0, 0
 			local j = i
@@ -7516,7 +8786,7 @@ do
 						return j - 1
 					end
 				elseif t.k == "kw" then
-					if t.v == "function" then
+					if t.v == "function" or opensInnerBlock(j, blocks) then
 						blocks = blocks + 1
 					elseif t.v == "end" or t.v == "until" then
 						if blocks > 0 then
@@ -7568,9 +8838,9 @@ do
 						return j
 					end
 				elseif t.k == "kw" then
-					if t.v == "function" then
+					if t.v == "function" or opensInnerBlock(j, blocks) then
 						blocks = blocks + 1
-					elseif t.v == "end" then
+					elseif t.v == "end" or (t.v == "until" and blocks > 0) then
 						blocks = blocks - 1
 					elseif depth == 0 and blocks == 0 and set[t.v] and j > a then
 						return j
@@ -8752,7 +10022,109 @@ do
 		if renamed == 0 then
 			return src, bindings
 		end
-		return concat(pieces), bindings
+		local result = concat(pieces)
+		-- * Safety net: renaming must never leave a reference to a variable that no longer
+		-- * exists (it would read nil at runtime). Any name that is free afterwards but was not
+		-- * free before means a reference was missed, so the script is kept as it was.
+		local before, after = FreeNames(src), FreeNames(result)
+		for name in after do
+			if not before[name] then
+				return src, bindings
+			end
+		end
+		return result, bindings
+	end
+
+	-- * Names a script reads without declaring them (globals, as far as text can tell)
+	function FreeNames(src)
+		local _, toks, ntoks = lex(src)
+		local declared, used = {}, {}
+		local function isOp(i, v)
+			local t = toks[i]
+			return t ~= nil and t.k == "op" and t.v == v
+		end
+		local function skipType(i)
+			-- * `name: Type` up to the next `,` `=` `)` or line, at bracket depth 0
+			local depth = 0
+			while i <= ntoks do
+				local t = toks[i]
+				if t.k == "op" then
+					if OPEN[t.v] then
+						depth += 1
+					elseif CLOSE[t.v] then
+						if depth == 0 then
+							return i
+						end
+						depth -= 1
+					elseif depth == 0 and (t.v == "," or t.v == "=") then
+						return i
+					end
+				elseif depth == 0 and t.nl then
+					return i
+				elseif depth == 0 and t.k == "kw" and (t.v == "in" or t.v == "do") then
+					return i
+				end
+				i += 1
+			end
+			return i
+		end
+		local function nameList(i)
+			while toks[i] and toks[i].k == "name" do
+				declared[toks[i].v] = true
+				i += 1
+				if isOp(i, ":") then
+					i = skipType(i + 1)
+				end
+				if isOp(i, ",") then
+					i += 1
+				else
+					break
+				end
+			end
+			return i
+		end
+		for i = 1, ntoks do
+			local t = toks[i]
+			if t.k == "kw" then
+				if t.v == "local" then
+					if toks[i + 1] and toks[i + 1].k == "kw" and toks[i + 1].v == "function" then
+						if toks[i + 2] and toks[i + 2].k == "name" then
+							declared[toks[i + 2].v] = true
+						end
+					else
+						nameList(i + 1)
+					end
+				elseif t.v == "for" then
+					nameList(i + 1)
+				elseif t.v == "function" then
+					local j = i + 1
+					while toks[j] and toks[j].k == "name" and (isOp(j + 1, ".") or isOp(j + 1, ":")) do
+						j += 2
+					end
+					if toks[j] and toks[j].k == "name" then
+						j += 1
+					end
+					if isOp(j, "(") then
+						nameList(j + 1)
+					end
+				end
+			elseif t.k == "name" then
+				local prev = toks[i - 1]
+				local isField = prev and prev.k == "op" and (prev.v == "." or prev.v == ":" or prev.v == "::")
+				-- * `{ key = value }` keys are not variables
+				local isKey = isOp(i + 1, "=") and prev and prev.k == "op" and (prev.v == "{" or prev.v == "," or prev.v == ";")
+				if not isField and not isKey then
+					used[t.v] = true
+				end
+			end
+		end
+		local free = {}
+		for name in used do
+			if not declared[name] and name ~= "self" then
+				free[name] = true
+			end
+		end
+		return free
 	end
 end
 
@@ -9464,21 +10836,17 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local BuiltinDecompile
 	if DecompType == "builtin" and getscriptbytecode then
-		local lastYield = os.clock()
-		BetterDecompiler.onFunction = function()
-			-- * pure Luau: give the game a frame now and then on very large scripts
-			if task and os.clock() - lastYield > 1 / 30 then
-				task.wait()
-				lastYield = os.clock()
-			end
-		end
+		-- * No yielding in the middle of a script: pausing mid-decompile made random functions
+		-- * fall back to low level on some executors.
+		BetterDecompiler.onFunction = nil
 		BuiltinDecompile = function(script)
 			local bytecode = getscriptbytecode(script)
 			if type(bytecode) ~= "string" or bytecode == "" then
 				error("could not read the script's bytecode", 0)
 			end
 			local chunk = BytecodeLifter.parse(bytecode)
-			local text, stats = BetterDecompiler.decompile(chunk)
+			local scriptName = typeof(script) == "Instance" and script.Name or nil
+			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName })
 			local header = "-- Decompiled with BetterSaveinstance's built-in decompiler (" .. stats.structured + stats.lifted .. " functions"
 			if stats.lifted > 0 then
 				header ..= ", " .. stats.lifted .. " rebuilt low-level: search for \"[low-level]\""
@@ -9735,7 +11103,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						end
 					end
 
-					if RenameVariables then
+					-- * The built-in decompiler already names variables from what they hold and how
+					-- * they are used; the text renamer is for other decompilers' v1 / p2 names.
+					local named_by_builtin = string.find(result, "^%-%- Decompiled with BetterSaveinstance's built%-in decompiler") ~= nil
+					if RenameVariables and not named_by_builtin then
 						local renamed_ok, renamed = pcall(RenameDecompiledVariables, result)
 						if renamed_ok and type(renamed) == "string" and renamed ~= "" then
 							-- * Never let renaming be the thing that breaks a script
