@@ -1,5 +1,7 @@
 --!native
---!optimize 2
+--!optimize 1
+-- * optimize 1, not 2: Luau's -O2 inliner miscompiles code like `x = f({ obj = x })` (the new table is
+-- * written into x before x is read), which broke the built-in decompiler on executors.
 --!divine-intellect
 -- https://discord.gg/wx4ThpAsmw
 
@@ -3006,7 +3008,9 @@ do
 	--------------------------------------------------------------------------
 	-- * k: const | var | upval | global | index | call | method | binop | unop | and | or | not
 	-- *    | concat | vararg | closure | table | paren
-	local function E(k, t)
+	-- * The `...` keeps Luau's -O2 inliner away: it miscompiles `x = E("index", { obj = x })`
+	-- * by building the new table straight into `x` before `x` is read (a node that contains itself).
+	local function E(k, t, ...)
 		t = t or {}
 		t.k = k
 		return t
@@ -5000,7 +5004,8 @@ do
 				ctx.globals[root] = true
 				local ex = E("global", { name = root })
 				for n = 2, count do
-					ex = E("index", { obj = ex, key = E("const", { text = strLit(Ks(ids[n])), str = Ks(ids[n]) }) })
+					local base = ex
+					ex = E("index", { obj = base, key = E("const", { text = strLit(Ks(ids[n])), str = Ks(ids[n]) }) })
 				end
 				pushDef(block, ins, a, ex, false)
 			elseif op == OP.GETTABLE then
@@ -5227,7 +5232,8 @@ do
 				elseif kind == "if" or kind == "condjump" then
 					local cond = buildCondition(block, item.chain, false)
 					if kind == "condjump" then
-						cond = E("not", { e = cond })
+						local inner = cond
+						cond = E("not", { e = inner })
 					end
 					cond = simplifyCond(cond)
 					local st = { k = "if", cond = cond, refBlock = block }
@@ -6024,6 +6030,8 @@ do
 		PlayerOwnsAsset = "ownsAsset", Connect = "connection", Once = "connection", ConnectParallel = "connection",
 		ScreenPointToRay = "ray", ViewportPointToRay = "ray", Cross = "cross", Dot = "dot", Lerp = "lerped",
 		Create = "tween", GetUserId = "userId", GetFullName = "fullName",
+		format = "text", sub = "substring", rep = "repeated", len = "length", split = "parts", byte = "byte",
+		find = { "startIndex", "endIndex" }, match = "match",
 		FindPartOnRay = { "hit", "position", "normal", "material" },
 		FindPartOnRayWithIgnoreList = { "hit", "position", "normal", "material" },
 		FindPartOnRayWithWhitelist = { "hit", "position", "normal", "material" },
@@ -6136,6 +6144,24 @@ do
 		end
 		ctx.flagNames[protoId] = result
 		return result or nil
+	end
+
+	local LOOKUP_FUNCTIONS = {
+		get = true, load = true, require = true, import = true, fetch = true, find = true, wait = true,
+		getmodule = true, loadmodule = true, legacyload = true, getservice = true, use = true, module = true,
+	}
+	local STRING_TRANSFORMS = { lower = true, upper = true, gsub = true, reverse = true, trim = true }
+
+	-- * the last part of a path-like string, if it can be a name: "StreamingAPI/StreamingIdRemoved" -> "StreamingIdRemoved"
+	local function lookupName(str)
+		if type(str) ~= "string" or #str > 60 then
+			return nil
+		end
+		local last = string.match(str, "([^/\\%.:]+)$")
+		if not last or not string.find(last, "^[%a_][%w_]*$") then
+			return nil
+		end
+		return last
 	end
 
 	local RETURN_VERBS = { "Get", "Select", "Find", "Choose", "Pick", "Calculate", "Compute", "Create", "Make", "Build", "Load", "Fetch" }
@@ -6424,6 +6450,19 @@ do
 			if not fname then
 				return nil
 			end
+			local snakeRest = string.match(fname, "^[Gg]et_([%a][%w_]*)$")
+			if snakeRest then
+				return snakeRest, 2
+			end
+			if string.find(fname, "^is_%a") or string.find(fname, "^has_%a") or string.find(fname, "^can_%a") or string.find(fname, "^should_%a") then
+				return fname, 2
+			end
+			for _, verb in { "find", "load", "create", "make", "build", "calculate", "compute", "fetch", "read", "generate", "new", "wait", "select", "await", "promise" } do
+				snakeRest = string.match(fname, "^" .. verb .. "_([%a][%w_]*)$")
+				if snakeRest then
+					return snakeRest, 1.5
+				end
+			end
 			local rest = string.match(fname, "^[Gg]et(%u%w*)$")
 			if rest then
 				return camel(rest), 2
@@ -6493,6 +6532,10 @@ do
 					return noun and camel(noun) or "clone", 1.5
 				elseif m == "IsA" and str and cleanWord(str) then
 					return "is" .. upperFirst(cleanWord(str)), 2
+				elseif STRING_TRANSFORMS[m] and pos == 1 and nounOf(e.obj) and camel(nounOf(e.obj)) then
+					return camel(nounOf(e.obj)), 1.5
+				elseif LOOKUP_FUNCTIONS[string.lower(m)] and pos == 1 and lookupName(str) then
+					return lookupName(str), 2.5
 				elseif METHOD_RESULTS[m] then
 					local name = fromList(METHOD_RESULTS[m], pos)
 					if name then
@@ -6535,6 +6578,18 @@ do
 						return name, path == "pcall" and 3 or 1
 					end
 					return nil
+				end
+				local calleeName = (e.fn.k == "var" and nameOf(e.fn.w)) or ((e.fn.k == "upval" or e.fn.k == "global") and e.fn.name)
+					or (e.fn.k == "index" and e.fn.key.str)
+				local looked = pos == 1 and lookupName(constStr(a1))
+				if looked and type(calleeName) == "string" then
+					local lowered = string.lower(calleeName)
+					if LOOKUP_FUNCTIONS[lowered] or string.find(lowered, "load") or string.find(lowered, "require") then
+						return looked, 2.5
+					end
+					if (e.fn.k == "var" or e.fn.k == "upval") and string.find(looked, "^%u") then
+						return looked, 2.2
+					end
 				end
 				if e.fn.k == "var" or e.fn.k == "upval" then
 					local fname = e.fn.k == "var" and names[e.fn.w] or e.fn.name
@@ -6762,6 +6817,9 @@ do
 		-- * `NormalizeAngle` -> its parameter is an angle
 		local fnameNoun = fname and string.match(fname, "^%a%l+(%u%l+)$")
 		fnameNoun = fnameNoun and camel(fnameNoun)
+		if not fnameNoun and fname then
+			fnameNoun = string.match(fname, "_by_(%a[%w]*)$") or string.match(fname, "^[%l]+_for_(%a[%w]*)$")
+		end
 
 		-- * the module's class / table, named after the script
 		local className
@@ -6976,7 +7034,7 @@ do
 
 		local classWebs = {}
 		for _, r in order do
-			if r.isClass or r.hasFunctions then
+			if r.isClass then
 				classWebs[r.w] = true
 			end
 		end
@@ -7191,23 +7249,47 @@ do
 			if #e.entries == 0 then
 				return "{}"
 			end
-			local parts = {}
-			for n, entry in e.entries do
-				local v = self:expr(entry.value, indent)
-				if entry.key then
-					if entry.key.str and isIdent(entry.key.str) then
-						parts[n] = entry.key.str .. " = " .. v
+			local function render(entryIndent)
+				local parts = {}
+				for n, entry in e.entries do
+					local value = entry.value
+					-- * `name = function()` needs no `-- name` comment
+					if value.k == "closure" and entry.key and entry.key.str and self.chunk.protos[value.child].debugname == entry.key.str then
+						value.namedByKey = true
+					end
+					local v = self:expr(value, entryIndent)
+					if entry.key then
+						if entry.key.str and isIdent(entry.key.str) then
+							parts[n] = entry.key.str .. " = " .. v
+						else
+							parts[n] = "[" .. self:expr(entry.key, entryIndent) .. "] = " .. v
+						end
 					else
-						parts[n] = "[" .. self:expr(entry.key, indent) .. "] = " .. v
+						if n == #e.entries and (value.k == "call" or value.k == "method" or value.k == "vararg") and not value.multret then
+							v = "(" .. v .. ")"
+						end
+						parts[n] = v
 					end
-				else
-					if n == #e.entries and (entry.value.k == "call" or entry.value.k == "method" or entry.value.k == "vararg") and not entry.value.multret then
-						v = "(" .. v .. ")"
-					end
-					parts[n] = v
+				end
+				return parts
+			end
+			-- * functions and long tables go one entry per line, like hand written code. Functions
+			-- * are only printed once (printing one decompiles it).
+			local hasFunction = false
+			forEachExpr(e, function(x)
+				if x.k == "closure" then
+					hasFunction = true
+				end
+			end)
+			if not hasFunction then
+				local line = "{ " .. concat(render(indent), ", ") .. " }"
+				if #line <= 100 and not string.find(line, "\n", 1, true) then
+					return line
 				end
 			end
-			return "{ " .. concat(parts, ", ") .. " }"
+			local inner = rep("\t", indent + 1)
+			local parts = render(indent + 1)
+			return "{\n" .. inner .. concat(parts, ",\n" .. inner) .. ",\n" .. rep("\t", indent) .. "}"
 		elseif k == "ifexpr" then
 			return "if " .. self:expr(e.c, indent) .. " then " .. self:expr(e.a, indent) .. " else " .. self:expr(e.b, indent)
 		elseif k == "closure" then
@@ -7215,7 +7297,7 @@ do
 			for n, cap in e.caps do
 				upnames[n] = type(cap) == "string" and cap or self:name(cap.w)
 			end
-			return "function" .. (decompileFunction(self.chunk, e.child, upnames, indent, self.ctx, nil, e.hints))
+			return "function" .. (decompileFunction(self.chunk, e.child, upnames, indent, self.ctx, e.namedByKey, e.hints))
 		end
 		fail("cannot print " .. tostring(k))
 	end
