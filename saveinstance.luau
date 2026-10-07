@@ -226,8 +226,14 @@ do -- * Load Region of Déjà Vu
 		local hash = global_container.hash
 
 		if hash then
-			sha384 = function(data)
-				return hash(data, "sha384")
+			-- * only if it hashes the whole input (a C-string implementation stops at the first zero byte)
+			local ok, same = pcall(function()
+				return hash("a\0b", "sha384") == hash("a\0c", "sha384")
+			end)
+			if ok and same == false then
+				sha384 = function(data)
+					return hash(data, "sha384")
+				end
 			end
 		end
 
@@ -5181,6 +5187,20 @@ do
 				local ex = takeOperands(block, ins, { c })
 				pushDef(block, ins, a, E("binop", { op = op == OP.SUBRK and "-" or "/", l = K_(b), r = ex[1] }), false)
 			elseif op == OP.AND or op == OP.OR then
+				-- * the instruction evaluates both sides; `a or f()` would only call f sometimes, so a
+				-- * right side with side effects stays in its own local (`local x = f()` ... `a or x`)
+				local right = webOf(ins.useDef[c])
+				if right.tempish then
+					for k = #block.stmts, 1, -1 do
+						local st = block.stmts[k]
+						if st.tempWeb == right then
+							if not isSideEffectFree(st.value) then
+								right.noFold = true
+							end
+							break
+						end
+					end
+				end
 				local ex = takeOperands(block, ins, { b, c })
 				if not isSideEffectFree(ex[2]) then
 					-- * the instruction evaluates both sides; `a and f()` would not
@@ -6153,6 +6173,15 @@ do
 	}
 	local STRING_TRANSFORMS = { lower = true, upper = true, gsub = true, reverse = true, trim = true }
 
+	local function isLookupName(fname)
+		if type(fname) ~= "string" then
+			return false
+		end
+		local lowered = string.lower((string.gsub(fname, "^_+", "")))
+		return LOOKUP_FUNCTIONS[lowered] or string.find(lowered, "^get") ~= nil or string.find(lowered, "^find") ~= nil
+			or string.find(lowered, "^load") ~= nil or string.find(lowered, "^fetch") ~= nil or string.find(lowered, "require") ~= nil
+	end
+
 	-- * the last part of a path-like string, if it can be a name: "StreamingAPI/StreamingIdRemoved" -> "StreamingIdRemoved"
 	local function lookupName(str)
 		if type(str) ~= "string" or #str > 60 then
@@ -6163,6 +6192,21 @@ do
 			return nil
 		end
 		return last
+	end
+
+	-- * the last constant string argument that can be a name
+	local function lookupNameInArgs(args)
+		for n = #args, 1, -1 do
+			local x = args[n]
+			if x.k == "const" then
+				local str = x.str or (x.value and x.value.t == "string" and x.value.v)
+				local name = str and lookupName(str)
+				if name then
+					return name
+				end
+			end
+		end
+		return nil
 	end
 
 	local RETURN_VERBS = { "Get", "Select", "Find", "Choose", "Pick", "Calculate", "Compute", "Create", "Make", "Build", "Load", "Fetch" }
@@ -6293,15 +6337,25 @@ do
 			paramRecs[r + 1] = rec(w)
 			paramRecs[r + 1].param = r + 1
 			paramRecs[r + 1].block = root
+			paramRecs[r + 1].index = 0
 		end
 
 		local returnedFromMain = {}
 		local function walk(block)
-			for _, st in block.stmts do
+			for i, st in block.stmts do
 				local k = st.k
+				-- * blocks inside this statement: where they sit, for scope checks
+				local a, b = childBlocks(st)
+				for _, child in { a or false, b or false } do
+					if child then
+						child.nameParent, child.nameIndex = block, i
+					end
+				end
 				if k == "local" then
 					local r = rec(st.w)
-					r.block = r.block or block
+					if not r.block then
+						r.block, r.index = block, i
+					end
 				elseif k == "assign" then
 					local n = #st.targets
 					local nv = #st.values
@@ -6309,7 +6363,7 @@ do
 						if target.k == "var" then
 							local r = rec(target.w)
 							if not r.block then
-								r.block = block
+								r.block, r.index = block, i
 							end
 							local def
 							if nv >= n then
@@ -6389,7 +6443,7 @@ do
 					scan(st.limit)
 					scan(st.step)
 					local r = rec(st.var)
-					r.block = st.body
+					r.block, r.index = st.body, 0
 					r.numfor = true
 					walk(st.body)
 				elseif k == "genfor" then
@@ -6398,7 +6452,7 @@ do
 					end
 					for n, w in st.vars do
 						local r = rec(w)
-						r.block = st.body
+						r.block, r.index = st.body, 0
 						r.genfor = st
 						r.genforIndex = n
 					end
@@ -6460,9 +6514,27 @@ do
 			if not fname then
 				return nil
 			end
+			fname = string.gsub(fname, "^_+", "")
+			if fname == "" then
+				return nil
+			end
+			-- * what it is, not where it comes from: drop `_from_config`, `ForPlayer`, `_by_id`
+			local function trimmed(name)
+				local short = string.match(name, "^(.-)_from_[%w_]+$")
+					or string.match(name, "^(.-)_by_[%w_]+$")
+					or string.match(name, "^(.-)_for_[%w_]+$")
+				if short and #short >= 2 then
+					return short
+				end
+				short = string.match(name, "^(.-)From%u%w*$") or string.match(name, "^(.-)For%u%w*$") or string.match(name, "^(.-)By%u%w*$")
+				if short and #short >= 2 then
+					return short
+				end
+				return name
+			end
 			local snakeRest = string.match(fname, "^[Gg]et_([%a][%w_]*)$")
 			if snakeRest then
-				return snakeRest, 2
+				return trimmed(snakeRest), 2
 			end
 			if string.find(fname, "^is_%a") or string.find(fname, "^has_%a") or string.find(fname, "^can_%a") or string.find(fname, "^should_%a") then
 				return fname, 2
@@ -6470,12 +6542,12 @@ do
 			for _, verb in { "find", "load", "create", "make", "build", "calculate", "compute", "fetch", "read", "generate", "new", "wait", "select", "await", "promise" } do
 				snakeRest = string.match(fname, "^" .. verb .. "_([%a][%w_]*)$")
 				if snakeRest then
-					return snakeRest, 1.5
+					return trimmed(snakeRest), 1.5
 				end
 			end
 			local rest = string.match(fname, "^[Gg]et(%u%w*)$")
 			if rest then
-				return camel(rest), 2
+				return camel(trimmed(rest)), 2
 			end
 			if string.find(fname, "^[IiHhCcSs][a-z]+%u") and (string.find(fname, "^[Ii]s%u") or string.find(fname, "^[Hh]as%u")
 				or string.find(fname, "^[Cc]an%u") or string.find(fname, "^[Ss]hould%u"))
@@ -6544,8 +6616,8 @@ do
 					return "is" .. upperFirst(cleanWord(str)), 2
 				elseif STRING_TRANSFORMS[m] and pos == 1 and nounOf(e.obj) and camel(nounOf(e.obj)) then
 					return camel(nounOf(e.obj)), 1.5
-				elseif LOOKUP_FUNCTIONS[string.lower(m)] and pos == 1 and lookupName(str) then
-					return lookupName(str), 2.5
+				elseif pos == 1 and isLookupName(m) and not METHOD_RESULTS[m] and lookupNameInArgs(e.args) then
+					return lookupNameInArgs(e.args), 2.5
 				elseif METHOD_RESULTS[m] then
 					local name = fromList(METHOD_RESULTS[m], pos)
 					if name then
@@ -6592,6 +6664,9 @@ do
 				local calleeName = (e.fn.k == "var" and nameOf(e.fn.w)) or ((e.fn.k == "upval" or e.fn.k == "global") and e.fn.name)
 					or (e.fn.k == "index" and e.fn.key.str)
 				local looked = pos == 1 and lookupName(constStr(a1))
+				if pos == 1 and isLookupName(calleeName) and lookupNameInArgs(e.args) and not CALL_RESULTS[pathOf(e.fn) or ""] then
+					return lookupNameInArgs(e.args), 2.5
+				end
 				if looked and type(calleeName) == "string" then
 					local lowered = string.lower(calleeName)
 					if LOOKUP_FUNCTIONS[lowered] or string.find(lowered, "load") or string.find(lowered, "require") then
@@ -6957,23 +7032,41 @@ do
 
 		-- * unique within every scope that can see it
 		local taken = {}
-		local function contains(a, b)
-			while b do
-				if a == b then
-					return true
-				end
-				b = b.parent
+		-- * index, in `outer`, of the statement that contains `block` (nil if it is not inside)
+		local function positionIn(outer, block)
+			local index
+			while block and block ~= outer do
+				index = block.nameIndex
+				block = block.nameParent
+			end
+			if block == outer then
+				return index or 0
+			end
+			return nil
+		end
+		-- * does a variable declared at (block1, index1) see one declared at (block2, index2), or the reverse?
+		local function overlaps(block1, index1, block2, index2)
+			if block1 == block2 then
+				return true
+			end
+			local at = positionIn(block1, block2)
+			if at then
+				return at >= index1
+			end
+			at = positionIn(block2, block1)
+			if at then
+				return at >= index2
 			end
 			return false
 		end
-		local function isFree(name, block)
+		local function isFree(name, block, index)
 			if reserved[name] or not isIdent(name) then
 				return false
 			end
 			local list = taken[name]
 			if list then
 				for _, other in list do
-					if contains(other, block) or contains(block, other) then
+					if overlaps(other.block, other.index, block, index or 0) then
 						return false
 					end
 				end
@@ -6981,19 +7074,19 @@ do
 			return true
 		end
 		local LETTERS = { i = { "j", "k", "l", "m", "n" } }
-		local function claim(base, block)
+		local function claim(base, block, index)
 			local name = base
-			if not isFree(name, block) then
+			if not isFree(name, block, index) then
 				name = nil
 				for _, alt in LETTERS[base] or {} do
-					if isFree(alt, block) then
+					if isFree(alt, block, index) then
 						name = alt
 						break
 					end
 				end
 				if not name then
 					local n = 2
-					while not isFree((string.find(base, "%d$") and base .. "_" or base) .. n, block) do
+					while not isFree((string.find(base, "%d$") and base .. "_" or base) .. n, block, index) do
 						n += 1
 					end
 					name = (string.find(base, "%d$") and base .. "_" or base) .. n
@@ -7005,7 +7098,7 @@ do
 				list = {}
 				taken[name] = list
 			end
-			list[#list + 1] = block
+			list[#list + 1] = { block = block, index = index or 0 }
 			return name
 		end
 
@@ -7016,7 +7109,7 @@ do
 			if hints.method == "namecall" or usedAsObject or first.reads == 0 then
 				isMethod = true
 				names[first.w] = "self"
-				taken.self = { root }
+				taken.self = { { block = root, index = 0 } }
 				hints.methodSelf = true
 			end
 		end
@@ -7034,20 +7127,21 @@ do
 					names[w] = "_"
 				else
 					local block = r.block or root
+					local index = r.block and r.index or 0
 					local base, score = candidate(r)
 					-- * a weak guess borrowed from a numbered name (`r01`, `result2`) that is already
 					-- * taken would only read as a typo (`r01_2`)
 					local argIndex = r.param and tonumber(string.match(base, "^arg(%d+)$"))
 					if argIndex then
 						-- * `arg2` taken by an enclosing function: the next free number, never `arg2_2`
-						while not isFree("arg" .. argIndex, block) do
+						while not isFree("arg" .. argIndex, block, index) do
 							argIndex += 1
 						end
 						base = "arg" .. argIndex
-					elseif score < 1 and string.find(base, "%d$") and not isFree(base, block) then
+					elseif score < 1 and string.find(base, "%d$") and not isFree(base, block, index) then
 						base = "value"
 					end
-					names[w] = claim(base, block)
+					names[w] = claim(base, block, index)
 				end
 			end
 		end
@@ -10654,7 +10748,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07 " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	local CACHE_VERSION = "2026-10-07b " .. string.lower(tostring(OPTIONS.decomptype or ""))
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
@@ -11226,7 +11320,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 							if Crashlog then Crashlog("  Script "..script:GetFullName().." is empty") end
 							return "-- The Script is Empty"
 						end
-						hashed_bytecode = sha384(bytecode)
+						-- * Keyed by the bytecode itself, not a hash of it: some executors' `hash` stops at the
+						-- * first zero byte, so scripts that start alike (same constant strings) collided and
+						-- * got each other's decompiled source.
+						hashed_bytecode = bytecode
 						cached = ldeccache[hashed_bytecode]
 					end
 
