@@ -1708,6 +1708,7 @@ All options are case insensitive.
   - Default: false
 - scriptcache: `boolean`
   - Caches decompiled scripts, so if a script with the same bytecode appears in a game multiple times, it only needs to be decompiled once.
+  - The cache is kept between runs in the same game session, and is thrown away automatically when saveinstance is updated (output from an older version is never reused).
   - Default: true
 - decomptype: `string`
   - "builtin" - BetterDecompiler, included in this script: rebuilds if / elseif / while / repeat / for / break / continue, and/or expressions, `x = a and b or c`, table constructors, method calls and named functions straight from the bytecode, and never emits goto. A function whose structure cannot be rebuilt is emitted in an exact low-level form instead (marked "[low-level]"). If it cannot read a script at all (e.g. a newer bytecode version), the executor's decompiler is used for that script. Default.
@@ -10650,8 +10651,15 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		RecoveredScripts = {}
 	end
 
+	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
+	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
+	-- * decompiled output changes.
+	local CACHE_VERSION = "2026-10-07 " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
+		ldeccache = nil
+	end
 	if ScriptCache and not ldeccache then
-		ldeccache = {}
+		ldeccache = { __version = CACHE_VERSION }
 		GLOBAL_ENV.scriptcache = ldeccache
 	end
 
