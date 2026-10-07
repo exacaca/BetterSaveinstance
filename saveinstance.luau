@@ -1,7 +1,7 @@
---!native
 --!optimize 1
 -- * optimize 1, not 2: Luau's -O2 inliner miscompiles code like `x = f({ obj = x })` (the new table is
--- * written into x before x is read), which broke the built-in decompiler on executors.
+-- * written into x before x is read), which broke the built-in decompiler on executors. No --!native
+-- * either: it switches the compiler to -O2 by itself.
 --!divine-intellect
 -- https://discord.gg/wx4ThpAsmw
 
@@ -6228,6 +6228,8 @@ do
 							local event = x.obj.k == "index" and x.obj.key.str
 							fnArg.hints = { params = event and EVENT_PARAMS[event], eventName = event or nil }
 						end
+					elseif (x.name == "catch" or x.name == "Catch") and x.args[1] and x.args[1].k == "closure" then
+						x.args[1].hints = { params = { "err" } }
 					elseif x.name == "BindToRenderStep" and x.args[3] and x.args[3].k == "closure" then
 						x.args[3].hints = { params = { "deltaTime" } }
 					elseif (x.name == "BindAction" or x.name == "BindActionAtPriority") and x.args[2] and x.args[2].k == "closure" then
@@ -6254,6 +6256,8 @@ do
 					end
 					if path == "table.sort" and x.args[2] and x.args[2].k == "closure" then
 						x.args[2].hints = { params = { "a", "b" } }
+					elseif path == "xpcall" and x.args[2] and x.args[2].k == "closure" then
+						x.args[2].hints = { params = { "err" } }
 					end
 				elseif k == "binop" then
 					for _, side in { x.l, x.r } do
@@ -6423,6 +6427,11 @@ do
 		end
 		for _, name in upnames do
 			if type(name) == "string" then
+				reserved[name] = true
+			end
+		end
+		for _, outer in ctx.outerNames do
+			for name in outer do
 				reserved[name] = true
 			end
 		end
@@ -6924,8 +6933,11 @@ do
 				end
 			end
 			if not best then
-				if r.param then
-					best = next(r.methods) and "object" or "value"
+				if r.param and next(r.methods) then
+					best = "object"
+				elseif r.param then
+					-- * nothing says what it is: named by position (`arg1`)
+					best = "arg" .. (r.param - (hints.methodSelf and 1 or 0))
 				else
 					local fromCall = false
 					for _, def in r.defs do
@@ -7024,7 +7036,14 @@ do
 					local base, score = candidate(r)
 					-- * a weak guess borrowed from a numbered name (`r01`, `result2`) that is already
 					-- * taken would only read as a typo (`r01_2`)
-					if score < 1 and string.find(base, "%d$") and not isFree(base, block) then
+					local argIndex = r.param and tonumber(string.match(base, "^arg(%d+)$"))
+					if argIndex then
+						-- * `arg2` taken by an enclosing function: the next free number, never `arg2_2`
+						while not isFree("arg" .. argIndex, block) do
+							argIndex += 1
+						end
+						base = "arg" .. argIndex
+					elseif score < 1 and string.find(base, "%d$") and not isFree(base, block) then
 						base = "value"
 					end
 					names[w] = claim(base, block)
@@ -7076,6 +7095,79 @@ do
 			if st.k == "if" and #st.thenB.stmts == 0 and (not st.elseB or #st.elseB.stmts == 0) and onlyReadsLocals(st.cond) then
 				remove(stmts, i)
 			end
+		end
+	end
+
+	local LOOP_KINDS = { ["while"] = true, ["repeat"] = true, numfor = true, genfor = true }
+
+	-- * a `break` / `continue` that belongs to this block (not to a loop nested inside it)
+	local function exitsBlock(block)
+		for _, st in block.stmts do
+			if st.k == "break" or st.k == "continue" then
+				return true
+			end
+			if not LOOP_KINDS[st.k] then
+				local a, b = childBlocks(st)
+				if (a and exitsBlock(a)) or (b and exitsBlock(b)) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	-- * `A or B or true` -> `A or B` when the value is not used (an empty `if`): the same things are
+	-- * evaluated in the same order. nil means the whole condition is a constant.
+	local function withoutConstantTail(e)
+		if e.k == "const" and (e.text == "true" or e.text == "false") then
+			return nil
+		end
+		if e.k == "or" or e.k == "and" then
+			local r = withoutConstantTail(e.r)
+			if r == nil then
+				return withoutConstantTail(e.l)
+			end
+			return E(e.k, { l = e.l, r = r })
+		end
+		return e
+	end
+
+	-- * readable control flow, same behaviour:
+	-- * `repeat ... until true` with nothing that leaves it early is just its body,
+	-- * `if c then else x end` is `if not c then x end`,
+	-- * `if c or true then end` is `if c then end`
+	local function tidyBlocks(block)
+		local stmts = block.stmts
+		local i = 1
+		while i <= #stmts do
+			local st = stmts[i]
+			local a, b = childBlocks(st)
+			if a then
+				tidyBlocks(a)
+			end
+			if b then
+				tidyBlocks(b)
+			end
+			if st.k == "repeat" and st.isBlock and not exitsBlock(st.body) then
+				remove(stmts, i)
+				for n, inner in st.body.stmts do
+					insert(stmts, i + n - 1, inner)
+				end
+				continue
+			end
+			if st.k == "if" and #st.thenB.stmts == 0 and st.elseB and #st.elseB.stmts > 0 then
+				st.cond = boolNot(st.cond)
+				st.thenB, st.elseB = st.elseB, nil
+			end
+			if st.k == "if" and #st.thenB.stmts == 0 and (not st.elseB or #st.elseB.stmts == 0) then
+				local cond = withoutConstantTail(st.cond)
+				if cond == nil then
+					remove(stmts, i)
+					continue
+				end
+				st.cond = cond
+			end
+			i += 1
 		end
 	end
 
@@ -7492,13 +7584,24 @@ do
 		local root, materialized = buildIR(A, ast, irCtx)
 		makeRepeats(root)
 		makeIfExpressions(root)
+		tidyBlocks(root)
 		dropDeadNils(root)
 		dropEmptyIfs(root)
 		placeDeclarations(A, root, materialized, ctx)
 		local names, params, isMethod, classWebs = chooseNames(A, p, root, materialized, upnames, hints, ctx, chunk, protoId)
 		local printer = setmetatable({ names = names, chunk = chunk, ctx = ctx, classWebs = classWebs }, Printer)
 		local out = {}
-		printer:block(root, indent + 1, out)
+		-- * functions written inside this one see these names
+		local visible = {}
+		for _, name in names do
+			visible[name] = true
+		end
+		insert(ctx.outerNames, visible)
+		local ok, err = pcall(printer.block, printer, root, indent + 1, out)
+		remove(ctx.outerNames)
+		if not ok then
+			error(err, 0)
+		end
 		return params, out, isMethod
 	end
 
@@ -7538,7 +7641,7 @@ do
 		local allGlobals, namecalls, dotReads = scanChunk(chunk)
 		local ctx = {
 			globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {},
-			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {},
+			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {}, outerNames = {},
 		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
@@ -10921,6 +11024,20 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- * No yielding in the middle of a script: pausing mid-decompile made random functions
 		-- * fall back to low level on some executors.
 		BetterDecompiler.onFunction = nil
+		do
+			-- * The file asks for `--!optimize 1`. If an executor compiled it with -O2 anyway, Luau's
+			-- * inliner bug is live (this builds a node that contains itself) and output can be wrong.
+			local function probe(k, t)
+				t = t or {}
+				t.k = k
+				return t
+			end
+			local node = probe("a", {})
+			node = probe("b", { obj = node })
+			if node.obj == node then
+				warn("[BetterSaveinstance] This executor compiled saveinstance with -O2 (ignoring --!optimize 1). Luau's -O2 inliner has a bug that can corrupt decompiled scripts; report your executor's name.")
+			end
+		end
 		BuiltinDecompile = function(script)
 			local bytecode = getscriptbytecode(script)
 			if type(bytecode) ~= "string" or bytecode == "" then
