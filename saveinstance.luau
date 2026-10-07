@@ -4742,6 +4742,15 @@ do
 		-- * instruction that computed them. That keeps every side effect in its original order,
 		-- * whatever order the compiler chose for this construct (built-in calls load the function
 		-- * last, method calls compute the arguments before NAMECALL, ...).
+		local mentions -- forward
+
+		-- * `local flag = false` (a constant into a new local) can be evaluated earlier without changing
+		-- * anything, so a value computed before it may still fold past it, unless it reads that local
+		local function isConstLocalStore(st)
+			return st.k == "assign" and st.pure and not st.tempWeb and #st.targets == 1 and st.targets[1].k == "var"
+				and #st.values == 1 and st.values[1].k == "const"
+		end
+
 		local function takeOperands(block, ins, regs, multret, allowNamed)
 			local stmts = block.stmts
 			local exprs = {}
@@ -4773,16 +4782,31 @@ do
 				local found
 				if not blocked then
 					local k = j
+					local skippedStores = nil
 					while k >= 1 do
 						local st = stmts[k]
 						if (cand.multret and st.multretOf == cand.multret) or (cand.w and st.tempWeb == cand.w) then
 							if cand.w and st.namedClosure and not allowNamed then
 								break
 							end
-							found = k
+							local readsSkipped = false
+							if skippedStores then
+								for _, w2 in skippedStores do
+									if mentions(st.value, w2) then
+										readsSkipped = true
+									end
+								end
+							end
+							if not readsSkipped then
+								found = k
+							end
 							break
 						end
 						if st.pure and st.tempWeb then
+							k -= 1
+						elseif isConstLocalStore(st) then
+							skippedStores = skippedStores or {}
+							skippedStores[#skippedStores + 1] = st.targets[1].w
 							k -= 1
 						else
 							break
@@ -4823,7 +4847,7 @@ do
 		end
 
 		-- * does the expression read the variable `w` (e.g. `t.self = t`)?
-		local function mentions(e, w)
+		function mentions(e, w)
 			local found = false
 			local function visit(x)
 				if found or not x then
@@ -7642,7 +7666,7 @@ do
 					out[#out + 1] = tab .. (first and "if " or "elseif ") .. self:expr(cur.cond, indent) .. " then"
 					if first and #cur.thenB.stmts == 0 and (not cur.elseB or #cur.elseB.stmts == 0) then
 						-- * nothing was lost: every outcome of the condition continues after the `if`
-						out[#out + 1] = tab .. "	-- (empty in the bytecode: both outcomes continue below; usually an early `return` of a function the compiler inlined here)"
+						out[#out + 1] = tab .. "	-- (empty in the bytecode itself: the original body compiled to nothing, e.g. an inlined early `return`; nothing was left out)"
 					end
 					self:block(cur.thenB, indent + 1, out)
 					first = false
@@ -10768,7 +10792,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07c " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	local CACHE_VERSION = "2026-10-07d " .. string.lower(tostring(OPTIONS.decomptype or ""))
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
