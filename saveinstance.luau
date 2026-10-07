@@ -4158,7 +4158,8 @@ do
 				-- * `if c then continue end` as the last statement of a loop body: the compiler jumps
 				-- * straight to the next iteration, which is also the next instruction (an empty `if`
 				-- * would test the opposite condition)
-				if n == 1 and loopTargets(ctx, telse) == "continue" then
+				if not A.conservative and n == 1 and loopTargets(ctx, telse) == "continue" then
+					A.info.usedNew = true
 					local taken = E("cond", { seg = segs[1] })
 					return { kind = "condjump", chain = { segs = { segs[1] }, cond = E("not", { e = taken }) }, action = "continue" }, tthen
 				end
@@ -4172,11 +4173,12 @@ do
 					-- * own, on a later line than the code before it
 					local lineOf = A.p.lineOf
 					local before = lastBefore(lastThen.pc)
-					if lineOf and before and before.pc >= tthen and loopTargets(ctx, lastThen.target) == "continue"
+					if not A.conservative and lineOf and before and before.pc >= tthen and loopTargets(ctx, lastThen.target) == "continue"
 						and (lineOf(lastThen.pc) or 0) > (lineOf(before.pc) or math.huge)
 					then
 						local ok1, thenB = pcall(structRange, tthen, lastThen.pc, ctx)
 						if ok1 then
+							A.info.usedNew = true
 							local thenItems = table.move(thenB.items, 1, #thenB.items, 1, {})
 							thenItems[#thenItems + 1] = { kind = "continue" }
 							return { kind = "if", chain = chain, thenB = { items = thenItems } }, telse
@@ -4397,7 +4399,7 @@ do
 			local prevItem = items[falseIndex]
 			local startsFalse = prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 0
 				and prevItem.ins.c == 0 and prevItem.ins.a == R
-			local startsTrue = prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 1
+			local startsTrue = not A.conservative and prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 1
 				and prevItem.ins.c == 0 and prevItem.ins.a == R
 			local usedFalse = false
 			-- * a comparison is `true` when its jump is taken; a truthiness test is not
@@ -4433,6 +4435,7 @@ do
 						F[k] = { k = "and", l = { k = "fall", el = el }, r = Fn }
 						usedFalse = true
 					elseif Ft == CUR and startsTrue and countCur(Fn) == 0 and isCompareTest(el) then
+						A.info.usedNew = true
 						F[k] = { k = "or", l = { k = "taken", el = el }, r = Fn }
 						usedFalse = true
 					elseif Ft ~= CUR and splitTail(Fn, "or", Ft) then
@@ -4477,8 +4480,11 @@ do
 				return t.k == "leaf" and #t.el.run == 1 and t.el.run[1].op == OP.LOADB and t.el.run[1].b == 1 and t.el.run[1].c == 0
 			end
 			local function scanCond(t)
+				if not A.conservative and t.k == "cond" and isTrueLeaf(t.a) and t.c.k == "taken" and isCompareTest(t.c.el) then
+					A.info.usedNew = true
+				end
 				if t.k == "cond" and not isFalseLeaf(t.a) and not (t.a == CUR and startsFalse)
-					and not (isTrueLeaf(t.a) and t.c.k == "taken" and isCompareTest(t.c.el))
+					and not (not A.conservative and isTrueLeaf(t.a) and t.c.k == "taken" and isCompareTest(t.c.el))
 				then
 					realCond = true
 				end
@@ -5318,7 +5324,17 @@ do
 				if tail and tail.tableCtor and tail.ctorWeb == tw and not tail.closedCtor
 					and not mentions(keyExpr, tw) and not mentions(valueExpr, tw)
 				then
-					insert(tail.value.entries, { key = keyExpr, value = valueExpr })
+					local entries = tail.value.entries
+					local rank = keyExpr.str and tail.value.keyRank and tail.value.keyRank[keyExpr.str]
+					local at = #entries + 1
+					if rank then
+						-- * before constant fields that come later in the source (constants have no
+						-- * side effects, so nothing is evaluated in another order)
+						while at > 1 and entries[at - 1].isConst and entries[at - 1].rank and entries[at - 1].rank > rank do
+							at -= 1
+						end
+					end
+					insert(entries, at, { key = keyExpr, value = valueExpr, rank = rank, line = ctx.ownLine and ctx.ownLine(ins.pc) or nil })
 					tail.pure = false
 					tw.useLeft -= 1
 				else
@@ -5328,7 +5344,17 @@ do
 			elseif op == OP.NEWTABLE or op == OP.DUPTABLE then
 				-- * v7+ templates may already hold constant values
 				local entries = {}
+				local keyRank
 				local tk = op == OP.DUPTABLE and K[ins.d]
+				if tk and tk.v then
+					keyRank = {}
+					for j, keyIdx in tk.v do
+						local keyK = K[keyIdx]
+						if keyK and keyK.t == "string" and keyRank[keyK.v] == nil then
+							keyRank[keyK.v] = j
+						end
+					end
+				end
 				if tk and tk.vals then
 					for j, keyIdx in tk.v do
 						local valIdx = tk.vals[j]
@@ -5336,11 +5362,11 @@ do
 						if valK and valK.t ~= "nil" then
 							local keyK = K[keyIdx]
 							local key = keyK.t == "string" and E("const", { text = strLit(keyK.v), str = keyK.v }) or K_(keyIdx)
-							entries[#entries + 1] = { key = key, value = K_(valIdx) }
+							entries[#entries + 1] = { key = key, value = K_(valIdx), rank = j, isConst = true }
 						end
 					end
 				end
-				local st = pushDef(block, ins, a, E("table", { entries = entries, nextIndex = 1 }), #entries == 0)
+				local st = pushDef(block, ins, a, E("table", { entries = entries, nextIndex = 1, keyRank = keyRank }), #entries == 0)
 				st.tableCtor = true
 				-- * fills right after creation go into the constructor, even for a variable
 				st.ctorWeb = webOf(ins.defIds[a])
@@ -8084,15 +8110,38 @@ do
 					hasFunction = true
 				end
 			end)
-			if not hasFunction then
+			local fieldLines = {}
+			for _, entry in e.entries do
+				if entry.line then
+					fieldLines[entry.line] = true
+				end
+			end
+			local multiLine = next(fieldLines) ~= nil and next(fieldLines, next(fieldLines)) ~= nil
+			if not hasFunction and not multiLine then
 				local line = "{ " .. concat(render(indent), ", ") .. " }"
 				if #line <= 100 and not string.find(line, "\n", 1, true) then
 					return line
 				end
 			end
 			local inner = rep("\t", indent + 1)
+			-- * each field on its source line (when it is not earlier than the code around it)
+			local marks = {}
+			local floor = self.ctx.lineFloor
+			for n, entry in e.entries do
+				if entry.line and (not floor or entry.line >= floor) then
+					marks[n] = "\1" .. entry.line .. "\2"
+					floor = entry.line
+				end
+			end
 			local parts = render(indent + 1)
-			return "{\n" .. inner .. concat(parts, ",\n" .. inner) .. ",\n" .. rep("\t", indent) .. "}"
+			local lines = {}
+			for n, part in parts do
+				lines[n] = (marks[n] or "") .. inner .. part .. ","
+			end
+			if floor then
+				self.ctx.lineFloor = floor
+			end
+			return "{\n" .. concat(lines, "\n") .. "\n" .. rep("\t", indent) .. "}"
 		elseif k == "ifexpr" then
 			return "if " .. self:expr(e.c, indent) .. " then " .. self:expr(e.a, indent) .. " else " .. self:expr(e.b, indent)
 		elseif k == "closure" then
@@ -8302,6 +8351,15 @@ do
 			else
 				fail("cannot print statement " .. tostring(k))
 			end
+			if i > 1 and out[startIdx] and startIdx > 1 and string.find(out[startIdx], "^%s*%(") then
+				local prev = out[startIdx - 1]
+				local lastLine = string.match(prev, "([^\n]*)$")
+				if string.find(lastLine, "--", 1, true) then
+					out[startIdx - 1] = prev .. "\n" .. tab .. ";"
+				else
+					out[startIdx - 1] = prev .. ";"
+				end
+			end
 			if markLine and out[startIdx] then
 				out[startIdx] = "\1" .. markLine .. "\2" .. out[startIdx]
 			end
@@ -8319,7 +8377,7 @@ do
 		local result = table.pack(pcall(structuredOnce, chunk, protoId, upnames, indent, ctx, hints, false, info))
 		if result[1] then
 			return table.unpack(result, 2, result.n)
-		elseif not info.didSplit then
+		elseif not info.usedNew then
 			error(result[2], 0)
 		end
 		ctx.structured, ctx.lifted = saved[1], saved[2]
@@ -8334,6 +8392,8 @@ do
 	function structuredOnce(chunk, protoId, upnames, indent, ctx, hints, noSplit, info)
 		local p = chunk.protos[protoId]
 		local A = analyze(chunk, p)
+		A.conservative = noSplit
+		A.info = info or {}
 		local ast = structure(A)
 		local irCtx = { upnames = upnames, globals = ctx.globals, chunk = chunk }
 		-- * this function and the ones it is written in
@@ -8358,12 +8418,25 @@ do
 		-- * written on an earlier line than its use, and still holding its register while the
 		-- * statement that uses it works above it (a temporary of the same expression is consumed
 		-- * into its own register or below: `p:andThen(f)` <newline> `:catch(g)` reuses it).
+		-- * the highest line of the code before each instruction (loop ends jump back to the
+		-- * loop's own line, they do not count): a statement of its own never starts above it
+		local maxBefore = {}
+		do
+			local high = 0
+			for _, ins in A.seq do
+				maxBefore[ins] = high
+				local l = irCtx.ownLine(ins.pc)
+				if l and l > high and ins.op ~= OP.FORNLOOP and ins.op ~= OP.FORGLOOP and ins.op ~= OP.JUMPBACK then
+					high = l
+				end
+			end
+		end
 		for _, w in (noSplit and {} or A.webs) do
 			if w.tempish and #w.defs == 1 and #w.uses == 1 then
 				local def = A.defInfo[w.defs[1]].ins
 				local use = w.uses[1].ins
 				local dl, ul = def and irCtx.ownLine(def.pc), irCtx.ownLine(use.pc)
-				if dl and ul and dl < ul and #def.defs == 1 and not def.boolmat and not def.target
+				if dl and ul and dl < ul and dl >= (maxBefore[def] or 0) and #def.defs == 1 and not def.boolmat and not def.target
 					and not (def.op == OP.CALL and def.c == 0) and not use.boolmat
 					and def.op ~= OP.NEWTABLE and def.op ~= OP.DUPTABLE
 				then
@@ -8374,7 +8447,7 @@ do
 					end
 					local above = lowest > r
 					if above then
-						info.didSplit = true
+						A.info.usedNew = true
 						w.tempish, w.temp = false, false
 					end
 				end
@@ -11654,7 +11727,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07g " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
+	local CACHE_VERSION = "2026-10-07h " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
