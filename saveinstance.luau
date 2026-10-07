@@ -3961,6 +3961,10 @@ do
 
 		-- * jumping to an unconditional jump is the same as jumping to where it goes (the compiler
 		-- * threads jumps: a loop followed by `JUMP x` may exit straight to x)
+		-- * a loop instruction jumps back to the first instruction of the body, or, when the body
+		-- * is nothing but a jump to the loop instruction (`continue`), the compiler threads that
+		-- * jump and the loop instruction jumps to itself
+		local loopBacksTo
 		local function canonical(pc)
 			for _ = 1, 16 do
 				local ins = insAt(pc)
@@ -3971,6 +3975,12 @@ do
 				end
 			end
 			return pc
+		end
+		function loopBacksTo(loopIns, bodyStart)
+			if loopIns.target == bodyStart then
+				return true
+			end
+			return loopIns.target == loopIns.pc and canonical(bodyStart) == loopIns.pc
 		end
 
 		-- * a chain of conditional jumps forming one and/or condition
@@ -4612,7 +4622,7 @@ do
 				elseif ins.op == OP.FORNPREP then
 					local exit = ins.target
 					local loopIns = lastBefore(exit)
-					if not loopIns or loopIns.op ~= OP.FORNLOOP or loopIns.target ~= ins.next or loopIns.a ~= ins.a or exit > e then
+					if not loopIns or loopIns.op ~= OP.FORNLOOP or not loopBacksTo(loopIns, ins.next) or loopIns.a ~= ins.a or exit > e then
 						fail("malformed numeric for")
 					end
 					local loop = { header = ins.next, exit = exit, conts = { [loopIns.pc] = true } }
@@ -4621,7 +4631,7 @@ do
 					pc = exit
 				elseif FORGPREPS[ins.op] then
 					local loopIns = insAt(ins.target)
-					if not loopIns or loopIns.op ~= OP.FORGLOOP or loopIns.target ~= ins.next or loopIns.a ~= ins.a or loopIns.next > e then
+					if not loopIns or loopIns.op ~= OP.FORGLOOP or not loopBacksTo(loopIns, ins.next) or loopIns.a ~= ins.a or loopIns.next > e then
 						fail("malformed generic for")
 					end
 					local loop = { header = ins.next, exit = loopIns.next, conts = { [loopIns.pc] = true } }
@@ -6487,7 +6497,10 @@ do
 		end
 		for _, outer in ctx.outerNames do
 			for name in outer do
-				reserved[name] = true
+				-- * `_` only ever names variables nothing reads, so reusing it hides nothing
+				if name ~= "_" then
+					reserved[name] = true
+				end
 			end
 		end
 
@@ -6904,6 +6917,9 @@ do
 		fnameNoun = fnameNoun and camel(fnameNoun)
 		if not fnameNoun and fname then
 			fnameNoun = string.match(fname, "_by_(%a[%w]*)$") or string.match(fname, "^[%l]+_for_(%a[%w]*)$")
+		end
+		if fnameNoun and (NAME_KEYWORDS[fnameNoun] or BUILTIN_NAMES[fnameNoun]) then
+			fnameNoun = nil -- * `guardReturn` says nothing about its parameter
 		end
 
 		-- * the module's class / table, named after the script
@@ -7624,6 +7640,10 @@ do
 				local first = true
 				while true do
 					out[#out + 1] = tab .. (first and "if " or "elseif ") .. self:expr(cur.cond, indent) .. " then"
+					if first and #cur.thenB.stmts == 0 and (not cur.elseB or #cur.elseB.stmts == 0) then
+						-- * nothing was lost: every outcome of the condition continues after the `if`
+						out[#out + 1] = tab .. "	-- (empty in the bytecode: both outcomes continue below; usually an early `return` of a function the compiler inlined here)"
+					end
 					self:block(cur.thenB, indent + 1, out)
 					first = false
 					local elseB = cur.elseB
@@ -10748,7 +10768,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07b " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	local CACHE_VERSION = "2026-10-07c " .. string.lower(tostring(OPTIONS.decomptype or ""))
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
