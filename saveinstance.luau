@@ -3060,6 +3060,18 @@ do
 	end
 
 	-- * `not` in a boolean context (if / while / until)
+	-- * `c ? a : b` as Luau: `c and a or b` when `a` is a constant that is never false or nil
+	-- * (the usual way to write it, and what it compiles from), else `if c then a else b`
+	local function ifValue(c, a, b)
+		if c.k == "not" then
+			c, a, b = c.e, b, a
+		end
+		if a.k == "const" and a.text ~= "nil" and a.text ~= "false" then
+			return E("or", { l = E("and", { l = c, r = a }), r = b })
+		end
+		return E("ifexpr", { c = c, a = a, b = b })
+	end
+
 	local function boolNot(e)
 		if e.k == "not" then
 			return e.e
@@ -3829,6 +3841,75 @@ do
 			w.temp = tempish and #w.uses == 1
 			w.useLeft = #w.uses
 		end
+		local crossSpans = {}
+		-- * A value computed before an `a and b or c` and used after it (`f(x, c and y or z)`): the
+		-- * and/or splits the code into blocks, but the value is still a temporary when nothing in
+		-- * between writes its register or a lower one (expression temporaries live above it) and
+		-- * no jump enters or leaves that stretch of code.
+		for _, w in webs do
+			local onlyDef = #w.defs == 1 and #w.uses >= 1 and defInfo[w.defs[1]]
+			local def = onlyDef and onlyDef.ins
+			local u = def and w.uses[1].ins
+			local usesAfter = def ~= nil
+			if def then
+				for _, use in w.uses do
+					if use.ins.pc <= def.pc then
+						usesAfter = false
+					elseif use.ins.pc > u.pc then
+						u = use.ins
+					end
+				end
+				-- * more than one use: only a table and its fills
+				if #w.uses > 1 and def.op ~= OP.NEWTABLE and def.op ~= OP.DUPTABLE then
+					usesAfter = false
+				end
+			end
+			if not w.tempish and def and usesAfter and onlyDef.kind == "normal" and not w.captured
+				and u.block ~= def.block and not def.target and #def.defs == 1
+			then
+				local r = onlyDef.reg
+				local ok = true
+				local pc = def.next
+				while ok and pc and pc < u.pc do
+					local i2 = byPc[pc]
+					if not i2 or i2.op == OP.RETURN or FORGPREPS[i2.op] or i2.op == OP.FORNPREP or i2.op == OP.FORNLOOP
+						or i2.op == OP.FORGLOOP or i2.op == OP.NEWCLOSURE or i2.op == OP.DUPCLOSURE
+					then
+						ok = false
+						break
+					end
+					for _, d in i2.defs do
+						if d <= r then
+							ok = false
+						end
+					end
+					if i2.target and (i2.target <= def.pc or i2.target > u.pc) then
+						ok = false
+					end
+					local list = incoming[pc]
+					if list and pc ~= def.next then
+						for _, src in list do
+							if src.pc < def.pc or src.pc > u.pc then
+								ok = false
+							end
+						end
+					end
+					pc = i2.next
+				end
+				local list = incoming[u.pc]
+				if list then
+					for _, src in list do
+						if src.pc < def.pc or src.pc > u.pc then
+							ok = false
+						end
+					end
+				end
+				if ok and pc == u.pc then
+					w.tempish, w.temp, w.crossTemp = true, #w.uses == 1, true
+					crossSpans[#crossSpans + 1] = { from = def.pc, to = u.pc }
+				end
+			end
+		end
 
 		-- * liveness of variables at block entries (for hoisting declarations out of loops)
 		local liveIn = {}
@@ -3915,7 +3996,7 @@ do
 		end
 
 		return {
-			p = p, K = K, seq = seq, byPc = byPc, prevOf = prevOf, incoming = incoming, blocks = blocks,
+			p = p, K = K, seq = seq, byPc = byPc, prevOf = prevOf, incoming = incoming, blocks = blocks, crossSpans = crossSpans,
 			blockAt = blockAt, webOf = webOf, webs = webs, defInfo = defInfo, liveIn = liveIn,
 			openWebsAt = openWebsAt, backSources = backSources, paramDefs = paramDefs,
 		}
@@ -4249,10 +4330,20 @@ do
 						Jn = ins.target
 					end
 					pc = ins.next
+				elseif ins.op == OP.JUMP and ins.target > ins.pc and ins.target <= e and elements[#elements] and elements[#elements].kind == "leaf" then
+					positions[pc] = #elements + 1
+					elements[#elements + 1] = { kind = "goto", jump = ins, startPc = pc }
+					regionJumps[ins] = true
+					if ins.target > Jn then
+						Jn = ins.target
+					end
+					pc = ins.next
 				else
 					local startPc = pc
 					local run = {}
-					while ins and pc < e and pc < Jn and not (CONDITIONAL[ins.op] and not ins.boolmat) and (pc == startPc or not A.incoming[pc]) do
+					while ins and pc < e and pc < Jn and not (CONDITIONAL[ins.op] and not ins.boolmat)
+						and not (ins.op == OP.JUMP and ins.target > ins.pc) and (pc == startPc or not A.incoming[pc])
+					do
 						local multretOk = ((ins.op == OP.CALL and ins.c == 0) or (ins.op == OP.GETVARARGS and ins.b == 0))
 						if (ins.target and not ins.boolmat) or (#ins.defs == 0 and not NOOPS[ins.op] and not multretOk) then
 							return nil
@@ -4346,6 +4437,15 @@ do
 							return nil
 						end
 						el.rtest = j.op == OP.JUMPIF and "truthy" or "falsy"
+					elseif j.a == R or (TWO_REG_COMPARE[j.op] and j.aux == R) then
+						return nil -- * `x == "none"` tests the value being built: not part of its expression
+					end
+					for _, i2 in el.seg.pre do
+						for _, r in i2.uses do
+							if r == R then
+								return nil
+							end
+						end
 					end
 					if j.target ~= Jn and not positions[j.target] then
 						return nil
@@ -4414,6 +4514,13 @@ do
 						return nil
 					end
 					F[k] = subst(F[k + 1], { k = "leaf", el = el })
+				elseif el.kind == "goto" then
+					local t = el.jump.target
+					local Ft = t == Jn and CUR or (positions[t] and F[positions[t]])
+					if not Ft then
+						return nil
+					end
+					F[k] = Ft
 				else
 					local t = el.seg.jump.target
 					local Ft = t == Jn and CUR or F[positions[t]]
@@ -4467,7 +4574,7 @@ do
 				return nil
 			end
 			for _, el in elements do
-				if not seen[el] then
+				if not seen[el] and el.kind ~= "goto" then
 					return nil
 				end
 			end
@@ -4520,7 +4627,10 @@ do
 			-- * everything the expression is built from, for "is the result only used once, right after?"
 			local regionIns = {}
 			for _, el in elements do
-				for _, i2 in (el.run or el.seg.pre) do
+				if el.jump then
+					regionIns[el.jump] = true
+				end
+				for _, i2 in (el.run or (el.seg and el.seg.pre) or {}) do
 					regionIns[i2] = true
 				end
 				if el.seg then
@@ -4829,7 +4939,12 @@ do
 								break
 							end
 							if i2.op == OP.FORNLOOP and i2.a == ins.a and loopBacksTo(i2, ins.next) then
-								if canonical(i2.next) == canonical(exit) then
+								local a2, b2 = insAt(canonical(i2.next)), insAt(canonical(exit))
+								-- * the same place, or two copies of a bare `return` (the compiler copies
+								-- * a `return` over a jump to it)
+								if canonical(i2.next) == canonical(exit)
+									or (a2 and b2 and a2.op == OP.RETURN and b2.op == OP.RETURN and a2.b == 1 and b2.b == 1)
+								then
 									loopIns, exit = i2, i2.next
 								end
 								break
@@ -4876,6 +4991,16 @@ do
 				elseif CONDITIONAL[ins.op] and not ins.boolmat then
 					-- * prefer `x = a and b or c`, then if statements, then `if c then a else b` values
 					local node, nextPc = tryValueExpr(ins, e, items, false)
+					-- * values computed before this condition wait to be used after it (`f(a, c and 1 or 2)`):
+					-- * an `if` statement here would come between them and their use
+					if not node then
+						for _, span in A.crossSpans do
+							if span.from < ins.pc and span.to > ins.pc then
+								node, nextPc = tryValueExpr(ins, e, items, true)
+								break
+							end
+						end
+					end
 					if not node then
 						local ok, n2, p2 = pcall(handleIf, ins, e, ctx)
 						if ok then
@@ -5576,6 +5701,7 @@ do
 			local block = newBlock(parent, loopStmt)
 			for _, item in astBlock.items do
 				local line = itemLine(item)
+				local copied = item.kind == "ins" and A.copiedReturn and A.copiedReturn[item.ins]
 				buildItem(block, item)
 				if block.absorbedLine and (not line or block.absorbedLine < line) then
 					line = block.absorbedLine
@@ -5588,6 +5714,7 @@ do
 						break
 					end
 					st.lineDone = true
+					st.copiedReturn = copied or nil
 					if st.line == nil then
 						st.line = line
 					end
@@ -5762,7 +5889,7 @@ do
 							elseif a.k == "const" and a.text == "true" and isBoolean(c) then
 								return E("or", { l = c, r = b })
 							end
-							return E("ifexpr", { c = c, a = a, b = b })
+							return ifValue(c, a, b)
 						end
 						fail("bad value tree")
 					end
@@ -5983,7 +6110,7 @@ do
 					and x.targets[1].k == "var" and y.targets[1].k == "var" and x.targets[1].w == y.targets[1].w
 					and x.values[1].k ~= "closure" and y.values[1].k ~= "closure"
 				then
-					block.stmts[i] = { k = "assign", targets = { x.targets[1] }, values = { E("ifexpr", { c = st.cond, a = x.values[1], b = y.values[1] }) }, line = st.line }
+					block.stmts[i] = { k = "assign", targets = { x.targets[1] }, values = { ifValue(st.cond, x.values[1], y.values[1]) }, line = st.line }
 				end
 			end
 		end
@@ -8438,7 +8565,7 @@ do
 				local dl, ul = def and irCtx.ownLine(def.pc), irCtx.ownLine(use.pc)
 				if dl and ul and dl < ul and dl >= (maxBefore[def] or 0) and #def.defs == 1 and not def.boolmat and not def.target
 					and not (def.op == OP.CALL and def.c == 0) and not use.boolmat
-					and def.op ~= OP.NEWTABLE and def.op ~= OP.DUPTABLE
+					and def.op ~= OP.NEWTABLE and def.op ~= OP.DUPTABLE and use.op ~= OP.SETLIST
 				then
 					local r = def.defs[1]
 					local lowest = math.huge
@@ -8453,10 +8580,45 @@ do
 				end
 			end
 		end
+		A.copiedReturn = {}
+		for n = 2, #A.seq do
+			local ins, prev = A.seq[n], A.seq[n - 1]
+			local l, pl = irCtx.ownLine(ins.pc), irCtx.ownLine(prev.pc)
+			if ins.op == OP.RETURN and ins.b == 1 and n < #A.seq and l and pl and l <= pl then
+				A.copiedReturn[ins] = true
+			end
+		end
 		local root, materialized = buildIR(A, ast, irCtx)
 		makeRepeats(root)
 		makeIfExpressions(root)
 		tidyBlocks(root)
+		-- * `if c then A else B end` at the end of a function: the compiler copies the final
+		-- * `return` over the jump past B, which reads as `if c then A return end B`. The copy has
+		-- * the line of the code just before it; a `return` written in the source starts a new line.
+		do
+			local stmts = root.stmts
+			for i = #stmts - 1, 1, -1 do
+				local st = stmts[i]
+				local tb = st.k == "if" and not st.elseB and st.thenB.stmts
+				local ret = tb and tb[#tb]
+				if not noSplit and ret and ret.k == "return" and #ret.values == 0 and ret.copiedReturn then
+					A.info.usedNew = true
+					remove(tb)
+					local rest = {}
+					for n = i + 1, #stmts do
+						rest[#rest + 1] = stmts[n]
+					end
+					for n = #stmts, i + 1, -1 do
+						stmts[n] = nil
+					end
+					st.elseB = { stmts = rest, parent = root, depth = 1 }
+					if #tb == 0 then
+						st.cond = boolNot(st.cond)
+						st.thenB, st.elseB = st.elseB, nil
+					end
+				end
+			end
+		end
 		dropDeadNils(root)
 		dropEmptyIfs(root)
 		placeDeclarations(A, root, materialized, ctx)
@@ -11727,7 +11889,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07h " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
+	local CACHE_VERSION = "2026-10-08a " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
