@@ -1731,6 +1731,11 @@ All options are case insensitive.
   - Adds the "-- Saved by ..." and "-- Decompiled with ..." comments at the top of every saved script.
   - Off by default: they shift every line number by 4. The saved file itself still says what saved it.
   - Default: false
+- MatchLineNumbers: `boolean`
+  - Built-in decompiler: puts every statement on the line it has in the original script (Roblox keeps
+    line numbers in the bytecode), so errors, tracebacks and `debug.info` report the original lines.
+    Code is kept on its own lines where the original had room, joined onto one line where it was denser.
+  - Default: true
 - RenameVariables: `boolean`
   - Renames the generic names decompilers emit (`v14`, `p1`, `s1`, `arg3`, `var_1`, ...) to names inferred from what each variable is assigned from, or how each parameter is used.
     - `local v14 = load("ClientStore")` becomes `local ClientStore = load("ClientStore")`
@@ -3626,6 +3631,10 @@ do
 				ins.useDef = {}
 				local function resolveUses()
 					for _, r in ins.uses do
+						if ins.useDef[r] ~= nil then
+							ins.readsTwice = ins.readsTwice or {}
+							ins.readsTwice[r] = true
+						end
 						if ins.useDef[r] == nil then
 							local set = cur[r]
 							local first
@@ -3809,6 +3818,9 @@ do
 			if tempish then
 				for _, u in w.uses do
 					if u.ins.block ~= onlyDef.ins.block or u.ins.index <= onlyDef.ins.index then
+						tempish = false
+					end
+					if u.ins.readsTwice and u.ins.readsTwice[u.reg] then
 						tempish = false
 					end
 				end
@@ -4118,6 +4130,9 @@ do
 			if target == loop.exit or t == canonical(loop.exit) then
 				return "break"
 			end
+			if loop.tailExit and (target == loop.tailExit or t == canonical(loop.tailExit)) then
+				return "break"
+			end
 			for c in loop.conts do
 				if target == c or t == canonical(c) then
 					return "continue"
@@ -4140,11 +4155,33 @@ do
 			end
 			local chain = { segs = { table.unpack(segs, 1, n) }, cond = cond }
 			if telse == tthen then
-				return { kind = "if", chain = chain, thenB = { items = {} } }, tthen
+				-- * `if c then continue end` as the last statement of a loop body: the compiler jumps
+				-- * straight to the next iteration, which is also the next instruction (an empty `if`
+				-- * would test the opposite condition)
+				if n == 1 and loopTargets(ctx, telse) == "continue" then
+					local taken = E("cond", { seg = segs[1] })
+					return { kind = "condjump", chain = { segs = { segs[1] }, cond = E("not", { e = taken }) }, action = "continue" }, tthen
+				end
+				return { kind = "if", chain = chain, thenB = { items = {} }, degenerate = true }, tthen
 			end
 			if telse > tthen and telse <= e then
 				local lastThen = lastBefore(telse)
 				if lastThen and lastThen.pc >= tthen and UNCONDITIONAL[lastThen.op] and lastThen.op ~= OP.JUMPBACK then
+					-- * `if c then ... continue end` compiles exactly like `if c then ... else <rest of the
+					-- * loop body> end`; the line info tells them apart: a `continue` is a statement of its
+					-- * own, on a later line than the code before it
+					local lineOf = A.p.lineOf
+					local before = lastBefore(lastThen.pc)
+					if lineOf and before and before.pc >= tthen and loopTargets(ctx, lastThen.target) == "continue"
+						and (lineOf(lastThen.pc) or 0) > (lineOf(before.pc) or math.huge)
+					then
+						local ok1, thenB = pcall(structRange, tthen, lastThen.pc, ctx)
+						if ok1 then
+							local thenItems = table.move(thenB.items, 1, #thenB.items, 1, {})
+							thenItems[#thenItems + 1] = { kind = "continue" }
+							return { kind = "if", chain = chain, thenB = { items = thenItems } }, telse
+						end
+					end
 					local E2 = lastThen.target
 					if E2 > e and canonical(e) == canonical(E2) then
 						E2 = e
@@ -4360,7 +4397,14 @@ do
 			local prevItem = items[falseIndex]
 			local startsFalse = prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 0
 				and prevItem.ins.c == 0 and prevItem.ins.a == R
+			local startsTrue = prevItem and prevItem.kind == "ins" and prevItem.ins.op == OP.LOADB and prevItem.ins.b == 1
+				and prevItem.ins.c == 0 and prevItem.ins.a == R
 			local usedFalse = false
+			-- * a comparison is `true` when its jump is taken; a truthiness test is not
+			local function isCompareTest(el)
+				local op = el.seg.jump.op
+				return op ~= OP.JUMPIF and op ~= OP.JUMPIFNOT
+			end
 			for k = m, 1, -1 do
 				local el = elements[k]
 				if el.kind == "leaf" then
@@ -4387,6 +4431,9 @@ do
 						end
 					elseif Ft == CUR and startsFalse and countCur(Fn) == 0 then
 						F[k] = { k = "and", l = { k = "fall", el = el }, r = Fn }
+						usedFalse = true
+					elseif Ft == CUR and startsTrue and countCur(Fn) == 0 and isCompareTest(el) then
+						F[k] = { k = "or", l = { k = "taken", el = el }, r = Fn }
 						usedFalse = true
 					elseif Ft ~= CUR and splitTail(Fn, "or", Ft) then
 						-- * c' ? (X or W) : W  ==  (c' and X) or W
@@ -4426,8 +4473,13 @@ do
 			local function isFalseLeaf(t)
 				return t.k == "leaf" and #t.el.run == 1 and t.el.run[1].op == OP.LOADB and t.el.run[1].b == 0 and t.el.run[1].c == 0
 			end
+			local function isTrueLeaf(t)
+				return t.k == "leaf" and #t.el.run == 1 and t.el.run[1].op == OP.LOADB and t.el.run[1].b == 1 and t.el.run[1].c == 0
+			end
 			local function scanCond(t)
-				if t.k == "cond" and not isFalseLeaf(t.a) and not (t.a == CUR and startsFalse) then
+				if t.k == "cond" and not isFalseLeaf(t.a) and not (t.a == CUR and startsFalse)
+					and not (isTrueLeaf(t.a) and t.c.k == "taken" and isCompareTest(t.c.el))
+				then
 					realCond = true
 				end
 				for _, f in FIELDS do
@@ -4523,6 +4575,136 @@ do
 
 		-- * memo + budget: the fallbacks (shorter chains, break blocks) retry sub-ranges, which
 		-- * must not blow up on large functions
+		-- * An inlined `for ... do if c then return false end end return true` (-O2): the inlined
+		-- * `return false` sets the result and jumps past the `true` that follows the loop. Written
+		-- * as `x = true` before the loop and `x = false; break` inside it, which is exact when:
+		-- * - the code after the loop up to the jump target only loads constants (no side effects),
+		-- * - every jump there writes all those registers first, in straight-line code,
+		-- * - nothing else in the loop (or its setup) reads or writes them, and no closure sees them.
+		-- * Returns the jump target, the constant loads and where to put them in `items`.
+		local CONST_LOADS = { [OP.LOADNIL] = true, [OP.LOADB] = true, [OP.LOADN] = true, [OP.LOADK] = true, [OP.LOADKX] = true }
+		local function hoistLoopTail(prep, loopIns, exit, e, items)
+			local loads, regs = {}, {}
+			local pc = exit
+			while pc < e do
+				local ins = insAt(pc)
+				if not ins or not CONST_LOADS[ins.op] or ins.target or #ins.defs ~= 1 or (pc ~= exit and A.incoming[pc]) then
+					break
+				end
+				loads[#loads + 1] = ins
+				regs[ins.defs[1]] = true
+				pc = ins.next
+			end
+			local J = pc
+			if #loads == 0 or J > e or not insAt(J) then
+				return nil
+			end
+			for r in regs do
+				if r >= prep.a then
+					return nil -- * a loop register: the loop itself overwrites it
+				end
+			end
+			for _, ins in loads do
+				for _, id in ins.defIds do
+					if A.webOf(id).captured then
+						return nil
+					end
+				end
+			end
+			-- * the jumps out of the loop to J, and what each writes just before jumping
+			local jumpBlock = {}
+			local found = false
+			local cJ = canonical(J)
+			local q = prep.next
+			while q < loopIns.pc do
+				local ins = insAt(q)
+				if not ins then
+					return nil
+				end
+				if ins.target and not ins.boolmat and (ins.target == J or (canonical(ins.target) == cJ and ins.target > loopIns.pc)) then
+					if not UNCONDITIONAL[ins.op] then
+						return nil
+					end
+					found = true
+					local written = {}
+					local cur = ins
+					while not A.incoming[cur.pc] do
+						local prev = lastBefore(cur.pc)
+						if not prev or prev.pc < prep.next or prev.target or CONDITIONAL[prev.op] or UNCONDITIONAL[prev.op] or prev.op == OP.RETURN then
+							break
+						end
+						jumpBlock[prev] = true
+						for _, r in prev.defs do
+							written[r] = true
+						end
+						cur = prev
+					end
+					for r in regs do
+						if not written[r] then
+							return nil
+						end
+					end
+				end
+				q = ins.next
+			end
+			if not found then
+				return nil
+			end
+			-- * nothing else in the loop touches them
+			q = prep.next
+			while q <= loopIns.pc do
+				local ins = insAt(q)
+				for _, r in ins.uses do
+					if regs[r] then
+						return nil
+					end
+				end
+				if not jumpBlock[ins] then
+					for _, r in ins.defs do
+						if regs[r] then
+							return nil
+						end
+					end
+				end
+				q = ins.next
+			end
+			for _, r in prep.uses do
+				if regs[r] then
+					return nil
+				end
+			end
+			-- * before the loop's setup (the instructions that only fill the loop registers)
+			local at = #items + 1
+			while at > 1 do
+				local item = items[at - 1]
+				local setupIns = item.kind == "ins" and item.ins
+				if not setupIns or #setupIns.defs == 0 then
+					break
+				end
+				local ok = true
+				for _, r in setupIns.defs do
+					if r < prep.a or regs[r] then
+						ok = false
+					end
+				end
+				for _, r in setupIns.uses do
+					if regs[r] then
+						ok = false
+					end
+				end
+				if not ok then
+					break
+				end
+				at -= 1
+			end
+			return J, loads, at
+		end
+		local function insertLoads(items, loads, at)
+			for n, ins in loads do
+				table.insert(items, at + n - 1, { kind = "ins", ins = ins })
+			end
+		end
+
 		local memo = {}
 		local budget = 4000
 		local rawStructRange
@@ -4535,7 +4717,7 @@ do
 					conts[#conts + 1] = c
 				end
 				table.sort(conts)
-				key ..= ":" .. tostring(loop.exit) .. ":" .. tostring(loop.header) .. ":" .. concat(conts, ",") .. (loop.isBlock and ":b" or "")
+				key ..= ":" .. tostring(loop.exit) .. ":" .. tostring(loop.header) .. ":" .. concat(conts, ",") .. (loop.isBlock and ":b" or "") .. ":" .. tostring(loop.tailExit)
 			end
 			local hit = memo[key]
 			if hit then
@@ -4630,22 +4812,61 @@ do
 				elseif ins.op == OP.FORNPREP then
 					local exit = ins.target
 					local loopIns = lastBefore(exit)
+					if not (loopIns and loopIns.op == OP.FORNLOOP and loopIns.a == ins.a and loopBacksTo(loopIns, ins.next)) then
+						-- * a loop followed by `JUMP x` (the end of an if branch): the compiler threads
+						-- * the "loop runs zero times" jump straight to x
+						loopIns = nil
+						local p2 = ins.next
+						while p2 < e do
+							local i2 = insAt(p2)
+							if not i2 then
+								break
+							end
+							if i2.op == OP.FORNLOOP and i2.a == ins.a and loopBacksTo(i2, ins.next) then
+								if canonical(i2.next) == canonical(exit) then
+									loopIns, exit = i2, i2.next
+								end
+								break
+							end
+							p2 = i2.next
+						end
+					end
 					if not loopIns or loopIns.op ~= OP.FORNLOOP or not loopBacksTo(loopIns, ins.next) or loopIns.a ~= ins.a or exit > e then
 						fail("malformed numeric for")
 					end
 					local loop = { header = ins.next, exit = exit, conts = { [loopIns.pc] = true } }
-					local body = structRange(ins.next, loopIns.pc, { loop = loop })
+					local ok, body = pcall(structRange, ins.next, loopIns.pc, { loop = loop })
+					local J, loads, at
+					if not ok then
+						J, loads, at = hoistLoopTail(ins, loopIns, exit, e, items)
+						if not J then
+							error(body, 0)
+						end
+						loop.tailExit = J
+						body = structRange(ins.next, loopIns.pc, { loop = loop })
+						insertLoads(items, loads, at)
+					end
 					items[#items + 1] = { kind = "numfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
-					pc = exit
+					pc = J or exit
 				elseif FORGPREPS[ins.op] then
 					local loopIns = insAt(ins.target)
 					if not loopIns or loopIns.op ~= OP.FORGLOOP or not loopBacksTo(loopIns, ins.next) or loopIns.a ~= ins.a or loopIns.next > e then
 						fail("malformed generic for")
 					end
 					local loop = { header = ins.next, exit = loopIns.next, conts = { [loopIns.pc] = true } }
-					local body = structRange(ins.next, loopIns.pc, { loop = loop })
+					local ok, body = pcall(structRange, ins.next, loopIns.pc, { loop = loop })
+					local J, loads, at
+					if not ok then
+						J, loads, at = hoistLoopTail(ins, loopIns, loopIns.next, e, items)
+						if not J then
+							error(body, 0)
+						end
+						loop.tailExit = J
+						body = structRange(ins.next, loopIns.pc, { loop = loop })
+						insertLoads(items, loads, at)
+					end
 					items[#items + 1] = { kind = "genfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
-					pc = loopIns.next
+					pc = J or loopIns.next
 				elseif CONDITIONAL[ins.op] and not ins.boolmat then
 					-- * prefer `x = a and b or c`, then if statements, then `if c then a else b` values
 					local node, nextPc = tryValueExpr(ins, e, items, false)
@@ -4759,6 +4980,13 @@ do
 				and #st.values == 1 and st.values[1].k == "const"
 		end
 
+		-- * a statement folded into the one being built: that one starts on the earliest line
+		local function absorbLine(block, st)
+			if st and st.line and (not block.absorbedLine or st.line < block.absorbedLine) then
+				block.absorbedLine = st.line
+			end
+		end
+
 		local function takeOperands(block, ins, regs, multret, allowNamed)
 			local stmts = block.stmts
 			local exprs = {}
@@ -4823,6 +5051,7 @@ do
 				end
 				if found then
 					exprs[cand.slot] = stmts[found].value
+					absorbLine(block, stmts[found])
 					remove(stmts, found)
 					j = found - 1
 				else
@@ -4834,6 +5063,7 @@ do
 							local st = stmts[k]
 							if st.tempWeb == cand.w and st.pure then
 								exprs[cand.slot] = st.value
+								absorbLine(block, st)
 								remove(stmts, k)
 								if k <= j then
 									j -= 1
@@ -5178,6 +5408,7 @@ do
 				local expr
 				if isMethod then
 					local nc = tail.ins
+					absorbLine(block, block.stmts[#block.stmts])
 					remove(block.stmts)
 					-- * emitted as: object, arguments, NAMECALL, CALL
 					local regs = { { ins = nc, reg = nc.b } }
@@ -5286,9 +5517,61 @@ do
 			end
 		end
 
+		-- * the source line a structured item starts on (bytecode line info), or nil
+		local lineOf = ctx.ownLine
+		local function itemLine(item)
+			if not lineOf then
+				return nil
+			end
+			local kind = item.kind
+			local ins
+			if kind == "ins" then
+				ins = item.ins
+			elseif kind == "if" or kind == "condjump" then
+				ins = item.chain.segs[1].jump
+			elseif kind == "numfor" or kind == "genfor" then
+				ins = item.prep
+			elseif kind == "while" then
+				ins = A.byPc[item.loop.header]
+			elseif kind == "valexpr" then
+				local best
+				for i2 in item.regionIns do
+					local l = lineOf(i2.pc)
+					if l and (not best or l < best) then
+						best = l
+					end
+				end
+				return best
+			end
+			return ins and lineOf(ins.pc) or nil
+		end
+
 		function buildBlock(astBlock, parent, loopStmt)
 			local block = newBlock(parent, loopStmt)
 			for _, item in astBlock.items do
+				local line = itemLine(item)
+				buildItem(block, item)
+				if block.absorbedLine and (not line or block.absorbedLine < line) then
+					line = block.absorbedLine
+				end
+				block.absorbedLine = nil
+				-- * the statements this item added (earlier ones are already done)
+				for n = #block.stmts, 1, -1 do
+					local st = block.stmts[n]
+					if st.lineDone then
+						break
+					end
+					st.lineDone = true
+					if st.line == nil then
+						st.line = line
+					end
+				end
+			end
+			return block
+		end
+
+		function buildItem(block, item)
+			do
 				local kind = item.kind
 				if kind == "ins" then
 					emitIns(block, item.ins)
@@ -5299,7 +5582,7 @@ do
 						cond = E("not", { e = inner })
 					end
 					cond = simplifyCond(cond)
-					local st = { k = "if", cond = cond, refBlock = block }
+					local st = { k = "if", cond = cond, refBlock = block, degenerate = item.degenerate }
 					if kind == "condjump" then
 						st.thenB = newBlock(block)
 						st.thenB.stmts = { item.action == "return" and { k = "return", values = {} } or { k = item.action } }
@@ -5350,6 +5633,7 @@ do
 							end
 						end
 						if ok then
+							absorbLine(block, tail)
 							remove(block.stmts)
 							for n = 1, 3 do
 								materialized[tail.targets[n].w] = nil
@@ -5495,7 +5779,6 @@ do
 					fail("unknown node " .. tostring(kind))
 				end
 			end
-			return block
 		end
 
 		local root = buildBlock(ast, nil, nil)
@@ -5674,9 +5957,158 @@ do
 					and x.targets[1].k == "var" and y.targets[1].k == "var" and x.targets[1].w == y.targets[1].w
 					and x.values[1].k ~= "closure" and y.values[1].k ~= "closure"
 				then
-					block.stmts[i] = { k = "assign", targets = { x.targets[1] }, values = { E("ifexpr", { c = st.cond, a = x.values[1], b = y.values[1] }) } }
+					block.stmts[i] = { k = "assign", targets = { x.targets[1] }, values = { E("ifexpr", { c = st.cond, a = x.values[1], b = y.values[1] }) }, line = st.line }
 				end
 			end
+		end
+	end
+
+	-- * Luau allows 200 locals in scope at once. Generated code (one `local name = "X"` per
+	-- * entry, hundreds of times, each scoped in the original) needs `do ... end` blocks.
+	local function exprRefs(e, fn)
+		forEachExpr(e, function(x)
+			if x.k == "var" then
+				fn(x.w)
+			elseif x.k == "closure" then
+				for _, cap in x.caps do
+					if type(cap) == "table" then
+						fn(cap.w)
+					end
+				end
+			end
+		end)
+	end
+	local function deepRefs(st, fn)
+		stmtRefs(st, fn)
+		if st.k == "local" then
+			fn(st.w)
+		elseif st.k == "numfor" and st.var then
+			fn(st.var)
+		elseif st.k == "genfor" and st.vars then
+			for _, w in st.vars do
+				fn(w)
+			end
+		elseif st.k == "while" and st.cond then
+			exprRefs(st.cond, fn)
+		elseif st.k == "repeat" and st.untilCond then
+			exprRefs(st.untilCond, fn)
+		end
+		local a, b = childBlocks(st)
+		for _, child in { a, b } do
+			for _, s2 in child.stmts do
+				deepRefs(s2, fn)
+			end
+		end
+	end
+	local function declaredIn(st)
+		if st.k == "local" then
+			return { st.w }
+		elseif st.k == "assign" and (st.isLocal or st.isLocalFunction) then
+			local list = {}
+			for _, t in st.targets do
+				if t.k == "var" then
+					list[#list + 1] = t.w
+				end
+			end
+			return list
+		end
+		return nil
+	end
+	local function maxActive(block)
+		local declared, deepest = 0, 0
+		for _, st in block.stmts do
+			local d = declaredIn(st)
+			if d then
+				declared += #d
+			end
+			local a, b = childBlocks(st)
+			local loopVars = (st.k == "numfor" and 4) or (st.k == "genfor" and #st.vars + 3) or 0
+			if a then
+				deepest = math.max(deepest, maxActive(a) + loopVars)
+			end
+			if b then
+				deepest = math.max(deepest, maxActive(b))
+			end
+		end
+		return declared + deepest
+	end
+	-- * a `break` / `continue` of an enclosing loop
+	local function hasLoopExit(block)
+		for _, st in block.stmts do
+			if st.k == "break" or st.k == "continue" then
+				return true
+			end
+			if st.k ~= "while" and st.k ~= "numfor" and st.k ~= "genfor" and not (st.k == "repeat" and not st.isDo) then
+				local a, b = childBlocks(st)
+				if (a and hasLoopExit(a)) or (b and hasLoopExit(b)) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	local function scopeShortLocals(block, parentStmt)
+		for _, st in block.stmts do
+			local a, b = childBlocks(st)
+			if a then
+				scopeShortLocals(a, st)
+			end
+			if b then
+				scopeShortLocals(b, st)
+			end
+		end
+		local stmts = block.stmts
+		local lastUse = {}
+		for n, st in stmts do
+			deepRefs(st, function(w)
+				lastUse[w] = n
+			end)
+		end
+		-- * `repeat local x ... until x`: the condition sees the body's locals
+		if parentStmt and parentStmt.k == "repeat" and parentStmt.untilCond and block == parentStmt.body then
+			exprRefs(parentStmt.untilCond, function(w)
+				lastUse[w] = math.huge
+			end)
+		end
+		local MAX_SPAN = 64
+		local i = 1
+		while i <= #stmts do
+			local decl = declaredIn(stmts[i])
+			if decl then
+				local j = i
+				for _, w in decl do
+					j = math.max(j, lastUse[w] or i)
+				end
+				-- * whatever is declared inside must also end inside
+				local n = i + 1
+				while n <= j and j - i < MAX_SPAN do
+					local d2 = declaredIn(stmts[n])
+					if d2 then
+						for _, w in d2 do
+							j = math.max(j, lastUse[w] or n)
+						end
+					end
+					n += 1
+				end
+				if j - i < MAX_SPAN and j <= #stmts and not (i == 1 and j == #stmts) then
+					local body = { stmts = table.move(stmts, i, j, 1, {}), parent = block, depth = (block.depth or 0) + 1 }
+					if not hasLoopExit(body) then
+						for _ = i, j do
+							remove(stmts, i)
+						end
+						insert(stmts, i, { k = "repeat", isBlock = true, isDo = true, untilCond = E("const", { text = "true" }), body = body })
+						local shift = j - i
+						for w, at in lastUse do
+							if at > j and at ~= math.huge then
+								lastUse[w] = at - shift
+							elseif at >= i and at <= j then
+								lastUse[w] = i
+							end
+						end
+					end
+				end
+			end
+			i += 1
 		end
 	end
 
@@ -5911,8 +6343,13 @@ do
 			end
 		end
 		fixPartial(root)
-		if count > 180 then
-			fail("too many locals")
+		-- * at most 200 locals in scope at once (with some room for the compiler)
+		local LIMIT = 190
+		if maxActive(root) + A.p.numparams > LIMIT then
+			scopeShortLocals(root)
+			if maxActive(root) + A.p.numparams > LIMIT then
+				fail("too many locals")
+			end
 		end
 	end
 
@@ -7042,6 +7479,19 @@ do
 			end
 		end
 		local classTaken = false
+		local classOwner
+		if className then
+			for w in returnedFromMain do
+				local r = recs[w]
+				if r then
+					for _, def in r.defs do
+						if def.e.k == "table" then
+							classOwner = w
+						end
+					end
+				end
+			end
+		end
 
 		local function candidate(r)
 			local best, bestScore
@@ -7138,7 +7588,7 @@ do
 			if r.isClass then
 				offer("Class", 1)
 			end
-			if className and not classTaken and (r.isClass or r.hasFunctions or returnedFromMain[r.w]) then
+			if className and not classTaken and (r.isClass or r.hasFunctions or returnedFromMain[r.w]) and (classOwner == nil or classOwner == r.w) then
 				for _, def in r.defs do
 					if def.e.k == "table" then
 						offer(className, 6)
@@ -7425,7 +7875,8 @@ do
 					remove(stmts, i)
 					continue
 				end
-				st.cond = cond
+				-- * the jumps of `if c then end` test `not c` (they skip the empty body): print `c`
+				st.cond = st.degenerate and boolNot(cond) or cond
 			end
 			i += 1
 		end
@@ -7679,7 +8130,18 @@ do
 	function Printer:block(block, indent, out)
 		local tab = rep("\t", indent)
 		local n = #block.stmts
+		local floor = self.ctx.lineFloor
+		local function lineMark(line)
+			if line and (not floor or line >= floor) then
+				floor = line
+				return line
+			end
+			return nil
+		end
 		for i, st in block.stmts do
+			local startIdx = #out + 1
+			local markLine = lineMark(st.line)
+			self.ctx.lineFloor = floor
 			local k = st.k
 			local isLast = i == n
 			if k == "local" then
@@ -7788,7 +8250,9 @@ do
 				local cur = st
 				local first = true
 				while true do
-					out[#out + 1] = tab .. (first and "if " or "elseif ") .. self:expr(cur.cond, indent) .. " then"
+					local elseifLine = not first and lineMark(cur.line)
+					local mark = elseifLine and ("\1" .. elseifLine .. "\2") or ""
+					out[#out + 1] = mark .. tab .. (first and "if " or "elseif ") .. self:expr(cur.cond, indent) .. " then"
 					if first and #cur.thenB.stmts == 0 and (not cur.elseB or #cur.elseB.stmts == 0) then
 						-- * nothing was lost: every outcome of the condition continues after the `if`
 						out[#out + 1] = tab .. "	-- (empty in the bytecode itself: the original body compiled to nothing, e.g. an inlined early `return`; nothing was left out)"
@@ -7809,6 +8273,10 @@ do
 				out[#out + 1] = tab .. "end"
 			elseif k == "while" then
 				out[#out + 1] = tab .. "while " .. (st.cond and self:expr(st.cond, indent) or "true") .. " do"
+				self:block(st.body, indent + 1, out)
+				out[#out + 1] = tab .. "end"
+			elseif k == "repeat" and st.isDo then
+				out[#out + 1] = tab .. "do"
 				self:block(st.body, indent + 1, out)
 				out[#out + 1] = tab .. "end"
 			elseif k == "repeat" then
@@ -7834,17 +8302,84 @@ do
 			else
 				fail("cannot print statement " .. tostring(k))
 			end
+			if markLine and out[startIdx] then
+				out[startIdx] = "\1" .. markLine .. "\2" .. out[startIdx]
+			end
 		end
+		self.ctx.lineFloor = floor
 	end
 
 	--------------------------------------------------------------------------
 	-- one function
 	--------------------------------------------------------------------------
+	local structuredOnce
 	local function structured(chunk, protoId, upnames, indent, ctx, hints)
+		local saved = { ctx.structured, ctx.lifted, #ctx.reasons, #ctx.internalErrors }
+		local info = {}
+		local result = table.pack(pcall(structuredOnce, chunk, protoId, upnames, indent, ctx, hints, false, info))
+		if result[1] then
+			return table.unpack(result, 2, result.n)
+		elseif not info.didSplit then
+			error(result[2], 0)
+		end
+		ctx.structured, ctx.lifted = saved[1], saved[2]
+		for n = #ctx.reasons, saved[3] + 1, -1 do
+			ctx.reasons[n] = nil
+		end
+		for n = #ctx.internalErrors, saved[4] + 1, -1 do
+			ctx.internalErrors[n] = nil
+		end
+		return structuredOnce(chunk, protoId, upnames, indent, ctx, hints, true)
+	end
+	function structuredOnce(chunk, protoId, upnames, indent, ctx, hints, noSplit, info)
 		local p = chunk.protos[protoId]
 		local A = analyze(chunk, p)
 		local ast = structure(A)
 		local irCtx = { upnames = upnames, globals = ctx.globals, chunk = chunk }
+		-- * this function and the ones it is written in
+		local enclosing = {}
+		local q = protoId
+		while q ~= nil and not enclosing[q] do
+			enclosing[q] = true
+			q = ctx.protoParent and ctx.protoParent[q]
+		end
+		irCtx.ownLine = function(pc)
+			local l = p.lineOf and p.lineOf(pc)
+			if not l then
+				return nil
+			end
+			local o = ctx.lineOwner and ctx.lineOwner[l]
+			if o ~= nil and not enclosing[o] then
+				return nil -- * inlined from another function
+			end
+			return l
+		end
+		-- * A value used once is folded into its use, unless it was a local of its own in the source:
+		-- * written on an earlier line than its use, and still holding its register while the
+		-- * statement that uses it works above it (a temporary of the same expression is consumed
+		-- * into its own register or below: `p:andThen(f)` <newline> `:catch(g)` reuses it).
+		for _, w in (noSplit and {} or A.webs) do
+			if w.tempish and #w.defs == 1 and #w.uses == 1 then
+				local def = A.defInfo[w.defs[1]].ins
+				local use = w.uses[1].ins
+				local dl, ul = def and irCtx.ownLine(def.pc), irCtx.ownLine(use.pc)
+				if dl and ul and dl < ul and #def.defs == 1 and not def.boolmat and not def.target
+					and not (def.op == OP.CALL and def.c == 0) and not use.boolmat
+					and def.op ~= OP.NEWTABLE and def.op ~= OP.DUPTABLE
+				then
+					local r = def.defs[1]
+					local lowest = math.huge
+					for _, d in use.defs do
+						lowest = math.min(lowest, d)
+					end
+					local above = lowest > r
+					if above then
+						info.didSplit = true
+						w.tempish, w.temp = false, false
+					end
+				end
+			end
+		end
 		local root, materialized = buildIR(A, ast, irCtx)
 		makeRepeats(root)
 		makeIfExpressions(root)
@@ -7866,7 +8401,9 @@ do
 		if not ok then
 			error(err, 0)
 		end
-		return params, out, isMethod
+		local last = A.seq[#A.seq]
+		local endLine = last and last.op == OP.RETURN and last.b == 1 and p.lineOf and p.lineOf(last.pc) or nil
+		return params, out, isMethod, endLine
 	end
 
 	function decompileFunction(chunk, protoId, upnames, indent, ctx, named, hints)
@@ -7874,11 +8411,12 @@ do
 			BetterDecompiler.onFunction() -- * lets the caller yield on very large scripts
 		end
 		local p = chunk.protos[protoId]
-		local ok, params, out, isMethod = pcall(structured, chunk, protoId, upnames, indent, ctx, hints)
+		local ok, params, out, isMethod, endLine = pcall(structured, chunk, protoId, upnames, indent, ctx, hints)
 		local header = (p.debugname and not named) and (" -- " .. p.debugname) or ""
 		if ok then
 			ctx.structured += 1
-			return "(" .. concat(params, ", ") .. ")" .. header .. "\n" .. concat(out, "\n") .. (#out > 0 and "\n" or "") .. rep("\t", indent) .. "end", isMethod
+			local endMark = endLine and ("\1" .. endLine .. "\2") or ""
+			return "(" .. concat(params, ", ") .. ")" .. header .. "\3\n" .. concat(out, "\n") .. (#out > 0 and "\n" or "") .. endMark .. rep("\t", indent) .. "end", isMethod
 		end
 		if not string.find(tostring(params), FAIL, 1, true) then
 			ctx.internalErrors[#ctx.internalErrors + 1] = tostring(params)
@@ -7896,22 +8434,217 @@ do
 		for g in globals do
 			ctx.globals[g] = true
 		end
+		text = string.gsub(text, "\n", "\n\4")
 		return text, false
+	end
+
+	-- * Puts every statement on the line it has in the original script (from the bytecode's line
+	-- * info), so error messages, tracebacks and debug.info give the original line numbers.
+	-- * Printer markers: "\1<line>\2" starts a statement's first line, "\3" ends a function header,
+	-- * "\4" starts a line that stays on a line of its own (low-level code). When the output is
+	-- * behind, blank lines are added; when it is ahead, lines are joined onto the previous one,
+	-- * which never changes what the code means: a `--` comment before the join becomes a
+	-- * `--[[ ]]` comment, and a line starting with `(` gets a `;` (no `f` `(x)` call ambiguity).
+	-- * Returns the text without markers.
+	local OPENER_WORDS = { ["then"] = true, ["do"] = true, ["else"] = true, ["repeat"] = true }
+	local function commentStart(line)
+		local i, n = 1, #line
+		while i <= n do
+			local c = string.sub(line, i, i)
+			if c == '"' or c == "'" then
+				i += 1
+				while i <= n do
+					local d = string.sub(line, i, i)
+					if d == "\\" then
+						i += 2
+					elseif d == c then
+						break
+					else
+						i += 1
+					end
+				end
+				i += 1
+			elseif c == "-" and string.sub(line, i + 1, i + 1) == "-" then
+				local level = string.match(line, "^%[(=*)%[", i + 2)
+				local close = level and string.find(line, "]" .. level .. "]", i + 4 + #level, true)
+				if not close then
+					return i
+				end
+				i = close + #level + 2
+			else
+				i += 1
+			end
+		end
+		return nil
+	end
+	local MAX_JOINED = 240
+	local function layoutLines(text, enabled)
+		if not enabled then
+			return (string.gsub(string.gsub(text, "\1%d+\2", ""), "[\3\4]", ""))
+		end
+		local lines = {}
+		for raw in string.gmatch(text .. "\n", "([^\n]*)\n") do
+			local entry = { free = false, opener = false }
+			while true do
+				local target, rest = string.match(raw, "^\1(%d+)\2(.*)$")
+				if target then
+					entry.target = entry.target or tonumber(target)
+					raw = rest
+				elseif string.sub(raw, 1, 1) == "\4" then
+					entry.free = true
+					raw = string.sub(raw, 2)
+				else
+					break
+				end
+			end
+			if string.sub(raw, -1) == "\3" then
+				entry.opener = true
+				raw = string.sub(raw, 1, -2)
+			end
+			entry.text = string.gsub(raw, "[\1\2\3\4]", "")
+			lines[#lines + 1] = entry
+		end
+		local nextTarget = {}
+		local nt
+		for n = #lines, 1, -1 do
+			nextTarget[n] = nt
+			nt = lines[n].target or nt
+		end
+		-- * each output line: its pieces, and what joining after it needs to know
+		local out = {}
+		local function describe(line, text)
+			local cut = commentStart(text)
+			local code = cut and string.sub(text, 1, cut - 1) or text
+			code = string.match(code, "^(.-)%s*$")
+			line.comment = cut and string.sub(text, cut + 2) or nil
+			if code ~= "" and string.find(code, "%S") then
+				line.lastChar = string.sub(code, -1)
+				line.lastWord = string.match(code, "([%w_]+)$")
+			end
+			line.len += #text
+		end
+		local function push(entry)
+			local line = { pieces = { entry.text }, len = 0, opener = entry.opener }
+			describe(line, entry.text)
+			out[#out + 1] = line
+		end
+		local function canJoin(entry)
+			local prev = out[#out]
+			return prev ~= nil and not entry.free and string.find(entry.text, "%S") ~= nil
+				and prev.len + #entry.text < MAX_JOINED
+		end
+		local function join(entry)
+			local line = out[#out]
+			local add = string.match(entry.text, "^%s*(.-)$")
+			local last = line.pieces[#line.pieces]
+			if line.comment then
+				-- * `-- c` -> `--[[ c ]]`, so the code after it is not commented out
+				local cut = commentStart(last)
+				local level = ""
+				while string.find(line.comment, "]" .. level .. "]", 1, true) do
+					level ..= "="
+				end
+				local code = string.match(string.sub(last, 1, cut - 1), "^(.-)%s*$")
+				line.pieces[#line.pieces] = code .. (code ~= "" and " " or "") .. "--[" .. level .. "[" .. line.comment .. " ]" .. level .. "]"
+				line.comment = nil
+			end
+			-- * `f()` then `(x)()` on one line would be one call: separate them with `;`
+			local sep = " "
+			if string.sub(add, 1, 1) == "(" and not line.opener and not (line.lastWord and OPENER_WORDS[line.lastWord])
+				and line.lastChar and string.find(line.lastChar, "[%w_%)%]}\"]")
+			then
+				sep = "; "
+			end
+			line.pieces[#line.pieces + 1] = sep .. add
+			line.opener = entry.opener
+			describe(line, add)
+		end
+		for n, entry in lines do
+			local t = entry.target
+			local blank = string.find(entry.text, "%S") == nil
+			if t and t > #out then
+				while #out < t - 1 do
+					push({ text = "", opener = false })
+				end
+				push(entry)
+			elseif t then
+				if canJoin(entry) then
+					join(entry)
+				else
+					push(entry)
+				end
+			else
+				local nextT = nextTarget[n]
+				local room = nextT == nil or #out + 1 < nextT
+				if room or entry.free then
+					push(entry)
+				elseif canJoin(entry) then
+					join(entry)
+				elseif not blank then
+					push(entry)
+				end
+			end
+		end
+		local result = table.create(#out)
+		for n, line in out do
+			result[n] = concat(line.pieces)
+		end
+		return concat(result, "\n")
+	end
+
+	-- * For every source line, the innermost function whose body strictly contains it. An
+	-- * instruction of function F on a line owned by another function (not F, not one F is
+	-- * written in) is inlined code: -O2 copies a local function's body, with its lines, into
+	-- * the caller.
+	local function lineOwners(chunk)
+		local parent, spans = {}, {}
+		for id, p in chunk.protos do
+			if p.p then
+				for _, child in p.p do
+					parent[child] = id
+				end
+			end
+		end
+		for id, p in chunk.protos do
+			if p.lineOf and p.sizecode then
+				local last = p.linedefined or 0
+				for pc = 0, p.sizecode - 1 do
+					local l = p.lineOf(pc)
+					if l and l > last then
+						last = l
+					end
+				end
+				spans[#spans + 1] = { id = id, first = p.linedefined or 0, last = last }
+			end
+		end
+		table.sort(spans, function(x, y)
+			return (x.last - x.first) > (y.last - y.first)
+		end)
+		local owner = {}
+		for _, span in spans do
+			for line = span.first + 1, span.last - 1 do
+				owner[line] = span.id
+			end
+		end
+		return owner, parent
 	end
 
 	-- * decompiles a whole script; returns source text and stats.
 	-- * options.scriptName (optional) names the module's main table after the script.
+	-- * options.matchLines (default true) puts statements on their original line numbers.
 	function BetterDecompiler.decompile(chunk, options)
 		local allGlobals, namecalls, dotReads = scanChunk(chunk)
+		local lineOwner, protoParent = lineOwners(chunk)
 		local ctx = {
 			globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {},
 			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {}, outerNames = {},
+			lineOwner = lineOwner, protoParent = protoParent,
 		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
 		if ok then
 			ctx.structured += 1
-			body = concat(out, "\n")
+			body = layoutLines(concat(out, "\n"), ctx.options.matchLines ~= false)
 		else
 			ctx.lifted += 1
 			ctx.reasons[#ctx.reasons + 1] = "main: " .. tostring(params)
@@ -7919,9 +8652,9 @@ do
 				ctx.internalErrors[#ctx.internalErrors + 1] = tostring(params)
 			end
 			body = "-- [low-level] the structure of the main body could not be rebuilt (" .. reasonText(params) .. "); it is exact but low level\n"
-				.. Lifter.liftScript(chunk, function(childId, childUpnames, childIndent)
+				.. layoutLines(Lifter.liftScript(chunk, function(childId, childUpnames, childIndent)
 					return (decompileFunction(chunk, childId, childUpnames, childIndent, ctx))
-				end)
+				end), false)
 		end
 		return body, ctx
 	end
@@ -10613,6 +11346,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		RenameVariables = true,
 		ScriptHeaders = false,
+		MatchLineNumbers = true,
 		FixGoto = true,
 		DecompilerFallback = true,
 		RebuildFromBytecode = true,
@@ -10890,6 +11624,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local RenameVariables = OPTIONS.RenameVariables
 	local ScriptHeaders = OPTIONS.ScriptHeaders
+	local MatchLineNumbers = OPTIONS.MatchLineNumbers
 	local FixGoto = OPTIONS.FixGoto
 	local DecompilerFallback = OPTIONS.DecompilerFallback
 	local RebuildFromBytecode = OPTIONS.RebuildFromBytecode
@@ -10919,7 +11654,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07e " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	local CACHE_VERSION = "2026-10-07g " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
@@ -11318,7 +12053,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 			local chunk = BytecodeLifter.parse(bytecode)
 			local scriptName = typeof(script) == "Instance" and script.Name or nil
-			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName })
+			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName, matchLines = MatchLineNumbers ~= false })
 			local header = "-- Decompiled with BetterSaveinstance's built-in decompiler (" .. stats.structured + stats.lifted .. " functions"
 			if stats.lifted > 0 then
 				header ..= ", " .. stats.lifted .. " rebuilt low-level: search for \"[low-level]\""
