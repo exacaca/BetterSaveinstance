@@ -1727,6 +1727,10 @@ All options are case insensitive.
   - Set to -1 to disable timeout (unreliable).
   - Aliases: DecompileTimeout
   - Default: 10
+- ScriptHeaders: `boolean`
+  - Adds the "-- Saved by ..." and "-- Decompiled with ..." comments at the top of every saved script.
+  - Off by default: they shift every line number by 4. The saved file itself still says what saved it.
+  - Default: false
 - RenameVariables: `boolean`
   - Renames the generic names decompilers emit (`v14`, `p1`, `s1`, `arg3`, `var_1`, ...) to names inferred from what each variable is assigned from, or how each parameter is used.
     - `local v14 = load("ClientStore")` becomes `local ClientStore = load("ClientStore")`
@@ -2153,16 +2157,20 @@ do
 					return base and base + lineinfo[pc] or nil
 				end
 			end
-			if u8() ~= 0 then -- debug info
-				for _ = 1, varint() do
-					varint()
-					varint()
-					varint()
-					u8()
+			if u8() ~= 0 then -- debug info (only with -g2: real local and upvalue names)
+				local locvars = {}
+				for n = 1, varint() do
+					local name = varint()
+					local startpc = varint()
+					local endpc = varint()
+					local reg = u8()
+					locvars[n] = { name = strings[name], startpc = startpc, endpc = endpc, reg = reg }
 				end
-				for _ = 1, varint() do
-					varint()
+				local upvalnames = {}
+				for n = 1, varint() do
+					upvalnames[n] = strings[varint()]
 				end
+				p.locvars, p.upvalnames = locvars, upvalnames
 			end
 			if version >= 11 and not protoSize then
 				for _ = 1, varint() do -- * feedback vector
@@ -6243,6 +6251,37 @@ do
 		return nil
 	end
 
+	-- * names that say nothing about what a variable holds
+	local GENERIC_NAMES = {
+		value = true, arg = true, data = true, text = true, tbl = true, list = true, object = true, flag = true,
+		result = true, callback = true, condition = true, key = true, count = true, message = true, lookup = true,
+		module = true, instance = true, vector = true, i = true, j = true, k = true, _ = true,
+	}
+	local function isGenericName(name)
+		local base = string.match(name, "^(.-)_?%d*$")
+		return GENERIC_NAMES[base] or GENERIC_NAMES[name] or string.find(name, "^arg%d+$") ~= nil
+	end
+	local function plural(word)
+		if string.find(word, "[^aeiou]y$") then
+			return string.sub(word, 1, -2) .. "ies"
+		elseif string.find(word, "[sxz]$") or string.find(word, "[cs]h$") then
+			return word .. "es"
+		end
+		return word .. "s"
+	end
+	-- * "deep_copy" -> "copy", "GetMoveVector" -> "vector"
+	local function lastWord(name)
+		local snake = string.match(name, "_([%a][%w]*)$")
+		if snake then
+			return snake
+		end
+		local camelWord = string.match(name, "%l(%u[%l%d]+)$")
+		if camelWord then
+			return string.lower(string.sub(camelWord, 1, 1)) .. string.sub(camelWord, 2)
+		end
+		return name
+	end
+
 	local RETURN_VERBS = { "Get", "Select", "Find", "Choose", "Pick", "Calculate", "Compute", "Create", "Make", "Build", "Load", "Fetch" }
 
 	-- * Chooses every variable name of one function. Returns names (web -> name), the
@@ -6285,6 +6324,9 @@ do
 						else
 							r.indexed = true
 						end
+					end
+					if not x.key.str and x.key.k == "var" then
+						rec(x.key.w).usedAsKey = true
 					end
 				elseif k == "method" then
 					if x.obj.k == "var" then
@@ -6331,6 +6373,14 @@ do
 							r.map = true
 						elseif path == "require" then
 							r.module = true
+						end
+					end
+					if path == "table.insert" and a1 and a1.k == "var" then
+						local item = x.args[#x.args]
+						if #x.args >= 2 and item.k == "var" then
+							local holder = rec(a1.w)
+							holder.storedVars = holder.storedVars or {}
+							holder.storedVars[#holder.storedVars + 1] = item.w
 						end
 					end
 					if path == "table.sort" and x.args[2] and x.args[2].k == "closure" then
@@ -6427,6 +6477,11 @@ do
 								end
 							end
 							local value = st.values[t]
+							if value and value.k == "var" and target.k == "index" and not target.key.str and target.obj.k == "var" then
+								local holder = rec(target.obj.w)
+								holder.storedVars = holder.storedVars or {}
+								holder.storedVars[#holder.storedVars + 1] = value.w
+							end
 							if value and value.k == "var" and target.k == "index" and target.key.str then
 								local r = rec(value.w)
 								r.stores[#r.stores + 1] = target.key.str
@@ -6519,11 +6574,14 @@ do
 				reserved[name] = true
 			end
 		end
+		-- * names of enclosing functions: not reused (no shadowing), except for a real name from
+		-- * debug info, which is what the original wrote
+		local outerReserved = {}
 		for _, outer in ctx.outerNames do
 			for name in outer do
 				-- * `_` only ever names variables nothing reads, so reusing it hides nothing
 				if name ~= "_" then
-					reserved[name] = true
+					outerReserved[name] = true
 				end
 			end
 		end
@@ -6597,8 +6655,23 @@ do
 					return camel(rest), 1.5
 				end
 			end
+			-- * `name_from_source` returns a name
+			local short = trimmed(fname)
+			if short ~= fname and camel(short) and not NAME_KEYWORDS[camel(short)] and not BUILTIN_NAMES[camel(short)] then
+				return camel(short), 1
+			end
 			local base = camel(fname)
-			return base and base .. "Result", fallbackScore or 0.3
+			if not base then
+				return nil
+			end
+			local word = lastWord(base)
+			if NAME_KEYWORDS[word] or BUILTIN_NAMES[word] or #word < 2 then
+				word = base
+			end
+			if NAME_KEYWORDS[word] or BUILTIN_NAMES[word] then
+				return "result", fallbackScore or 0.3
+			end
+			return word, fallbackScore or 0.3
 		end
 
 		local function fromList(v, pos)
@@ -6655,6 +6728,8 @@ do
 					return camel(nounOf(e.obj)), 1.5
 				elseif pos == 1 and isLookupName(m) and not METHOD_RESULTS[m] and lookupNameInArgs(e.args) then
 					return lookupNameInArgs(e.args), 2.5
+				elseif m == "format" then
+					return "text", 0.5
 				elseif METHOD_RESULTS[m] then
 					local name = fromList(METHOD_RESULTS[m], pos)
 					if name then
@@ -6856,6 +6931,18 @@ do
 					best, bestScore = name, score
 				end
 			end
+			if r.storedVars then
+				for _, item in r.storedVars do
+					local itemName = nameOf(item)
+					if itemName and not isGenericName(itemName) and #itemName <= 24 then
+						offer(plural(itemName), 1)
+						break
+					end
+				end
+			end
+			if r.usedAsKey then
+				offer("key", 0.6)
+			end
 			for _, key in r.stores do
 				if not string.find(key, "^__") then
 					offer(camel(key), 1.5)
@@ -6961,6 +7048,26 @@ do
 			local function offer(name, score)
 				if name and score and (not bestScore or score > bestScore) then
 					best, bestScore = name, score
+				end
+			end
+			-- * real names, when the script was compiled with them (-g2)
+			if p.locvars then
+				for _, id in r.w.defs do
+					local info = A.defInfo[id]
+					local at = info.ins and (info.ins.pc + (info.ins.size or 1)) or 0
+					if info.ins and info.ins.captures then
+						at += #info.ins.captures -- * a closure's local starts after its CAPTUREs
+					end
+					for _, lv in p.locvars do
+						local covers = lv.startpc <= at and at <= lv.endpc
+						if info.kind == "loopvar" and info.ins and info.ins.target then
+							-- * a loop variable's range is the loop body
+							covers = lv.startpc <= at and lv.endpc >= info.ins.target
+						end
+						if lv.reg == info.reg and covers and lv.name and isIdent(lv.name) then
+							offer(lv.name, 10)
+						end
+					end
 				end
 			end
 			if r.param then
@@ -7099,8 +7206,9 @@ do
 			end
 			return false
 		end
+		local allowShadowing = false
 		local function isFree(name, block, index)
-			if reserved[name] or not isIdent(name) then
+			if reserved[name] or not isIdent(name) or (outerReserved[name] and not allowShadowing) then
 				return false
 			end
 			local list = taken[name]
@@ -7154,7 +7262,22 @@ do
 			end
 		end
 
+		local deferred = {}
 		for _, r in order do
+			if not r.param and (materialized[r.w]) and not names[r.w] then
+				local _, score = candidate(r)
+				if score < 1 then
+					deferred[r] = true
+				end
+			end
+		end
+		local passes = { {}, {} }
+		for _, r in order do
+			local list = deferred[r] and passes[2] or passes[1]
+			list[#list + 1] = r
+		end
+		classTaken = false
+		for _, r in table.move(passes[2], 1, #passes[2], #passes[1] + 1, passes[1]) do
 			local w = r.w
 			if not names[w] and (materialized[w] or r.param) then
 				local multiTarget = false
@@ -7169,6 +7292,7 @@ do
 					local block = r.block or root
 					local index = r.block and r.index or 0
 					local base, score = candidate(r)
+					allowShadowing = score >= 10
 					-- * a weak guess borrowed from a numbered name (`r01`, `result2`) that is already
 					-- * taken would only read as a typo (`r01_2`)
 					local argIndex = r.param and tonumber(string.match(base, "^arg(%d+)$"))
@@ -7182,6 +7306,7 @@ do
 						base = "value"
 					end
 					names[w] = claim(base, block, index)
+					allowShadowing = false
 				end
 			end
 		end
@@ -10487,6 +10612,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- DisableCompression = false, --Description: Disables compression in the binary output
 
 		RenameVariables = true,
+		ScriptHeaders = false,
 		FixGoto = true,
 		DecompilerFallback = true,
 		RebuildFromBytecode = true,
@@ -10763,6 +10889,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local TreatUnionsAsParts = OPTIONS.TreatUnionsAsParts
 
 	local RenameVariables = OPTIONS.RenameVariables
+	local ScriptHeaders = OPTIONS.ScriptHeaders
 	local FixGoto = OPTIONS.FixGoto
 	local DecompilerFallback = OPTIONS.DecompilerFallback
 	local RebuildFromBytecode = OPTIONS.RebuildFromBytecode
@@ -10792,7 +10919,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-07d " .. string.lower(tostring(OPTIONS.decomptype or ""))
+	local CACHE_VERSION = "2026-10-07e " .. string.lower(tostring(OPTIONS.decomptype or ""))
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
@@ -11466,6 +11593,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						elseif __DEBUG_MODE then
 							__DEBUG_MODE("RenameVariables failed, keeping the original output for", script:GetFullName(), renamed)
 						end
+					end
+					if not ScriptHeaders then
+						-- * no banner in every script: line numbers stay closer to the original
+						result = string.gsub(result, "^%-%- Decompiled with BetterSaveinstance's built%-in decompiler[^\n]*\n\n", "", 1)
 					end
 					output = note and note .. result or result
 				else
@@ -12149,7 +12280,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 											end
 										end
 
-										value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
+										value = (ScriptHeaders and "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n" or "")
 											.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
 											.. value
 									end
