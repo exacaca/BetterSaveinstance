@@ -8363,7 +8363,7 @@ do
 		["math.abs"] = "absolute", ["math.lerp"] = "lerped", ["string.format"] = "text", ["string.split"] = "parts",
 		["string.sub"] = "substring", ["string.len"] = "length", ["string.rep"] = "repeated", ["string.lower"] = "lower",
 		["string.upper"] = "upper", ["string.find"] = { "startIndex", "endIndex" }, ["string.match"] = "match",
-		["string.gsub"] = { "result", "count" }, ["string.byte"] = "byte", ["string.char"] = "character",
+		["string.gsub"] = { "result", "count" }, ["debug.traceback"] = "traceback", ["string.byte"] = "byte", ["string.char"] = "character",
 		["table.concat"] = "text", ["table.find"] = "index", ["table.remove"] = "removed", ["table.create"] = "list",
 		["table.pack"] = "packed", ["table.clone"] = "copy", ["coroutine.create"] = "thread",
 		["coroutine.wrap"] = "thread", ["coroutine.running"] = "thread", ["coroutine.resume"] = { "success", "result" },
@@ -8497,7 +8497,11 @@ do
 		local base = string.match(name, "^(.-)_?%d*$")
 		return GENERIC_NAMES[base] or GENERIC_NAMES[name] or string.find(name, "^arg%d+$") ~= nil
 	end
+	local PLURAL_SPECIAL = { elapsed = "timings", now = "times", data = "data", info = "infos", child = "children", person = "people" }
 	local function plural(word)
+		if PLURAL_SPECIAL[word] then
+			return PLURAL_SPECIAL[word]
+		end
 		if string.find(word, "[^aeiou]y$") then
 			return string.sub(word, 1, -2) .. "ies"
 		elseif string.find(word, "[sxz]$") or string.find(word, "[cs]h$") then
@@ -8560,6 +8564,55 @@ do
 
 	-- * Chooses every variable name of one function. Returns names (web -> name), the
 	-- * parameter names in order, and whether the function is printed as `function T:m()`.
+	local LOOP_KINDS_NAMES = {}
+	local WEAK_NAMES = {
+		text = true, key = true, value = true, data = true, result = true, list = true, tbl = true, flag = true,
+		condition = true, number = true, object = true, instance = true, entry = true, callback = true, message = true,
+		match = true, count = true, index = true, lookup = true, copy = true, packed = true, removed = true,
+	}
+	-- * the names of the parameters of well known functions and methods, by position
+	local API_PARAMS = {
+		["task.wait"] = { "duration" }, wait = { "duration" }, ["task.delay"] = { "duration" }, delay = { "duration" },
+		["TweenInfo.new"] = { "duration", "easingStyle", "easingDirection", "repeatCount", "reverses", "delayTime" },
+		["debug.profilebegin"] = { "label" }, ["Instance.new"] = { "className", "parent" },
+		["math.clamp"] = { nil, "min", "max" }, ["math.random"] = { "min", "max" }, ["string.split"] = { nil, "separator" },
+		["string.format"] = { "format" }, ["string.rep"] = { nil, "count" }, ["string.sub"] = { nil, "startIndex", "endIndex" },
+		["table.remove"] = { nil, "index" }, ["table.concat"] = { nil, "separator" },
+		["Color3.fromRGB"] = { "red", "green", "blue" }, ["Color3.fromHex"] = { "hex" }, ["Color3.fromHSV"] = { "hue", "saturation", "value" },
+		["UDim2.fromScale"] = { "scaleX", "scaleY" }, ["UDim2.fromOffset"] = { "offsetX", "offsetY" },
+		["CFrame.Angles"] = { "rx", "ry", "rz" }, ["CFrame.lookAt"] = { "position", "lookAt" },
+		["NumberSequence.new"] = { "keypoints" }, ["ColorSequence.new"] = { "keypoints" },
+		["os.date"] = { "format", "time" }, ["DateTime.fromUnixTimestamp"] = { "timestamp" },
+	}
+	local API_METHOD_PARAMS = {
+		GetTextSize = { "text", "textSize", "font", "frameSize" }, GetStringForKeyCode = { "keyCode" },
+		GetImageForKeyCode = { "keyCode" }, Kick = { "message" }, LoadAnimation = { "animation" },
+		IsDescendantOf = { "ancestor" }, IsAncestorOf = { "descendant" }, GetPlayerFromCharacter = { "character" },
+		GetUserIdFromNameAsync = { "username" }, GetNameFromUserIdAsync = { "userId" }, GetPlayerByUserId = { "userId" },
+		UserOwnsGamePassAsync = { "userId", "gamePassId" }, PlayerOwnsAsset = { "player", "assetId" },
+		PromptGamePassPurchase = { "player", "gamePassId" }, PromptProductPurchase = { "player", "productId" },
+		GetAsync = { "key" }, SetAsync = { "key", "value" }, UpdateAsync = { "key", "transform" }, RemoveAsync = { "key" },
+		IncrementAsync = { "key", "delta" }, GetDataStore = { "name", "scope" }, GetOrderedDataStore = { "name", "scope" },
+		MoveTo = { "position" }, PivotTo = { "cframe" }, SetPrimaryPartCFrame = { "cframe" }, ApplyImpulse = { "impulse" },
+		ChangeState = { "state" }, SetStateEnabled = { "state", "enabled" },
+		TeleportAsync = { "placeId", "players" },
+		ScreenPointToRay = { "x", "y" }, ViewportPointToRay = { "x", "y" }, WorldToScreenPoint = { "position" },
+		WorldToViewportPoint = { "position" }, Raycast = { "origin", "direction", "params" },
+		GetPartBoundsInBox = { "cframe", "size", "params" }, GetPartBoundsInRadius = { "position", "radius", "params" },
+		SetNetworkOwner = { "player" }, BindAction = { "actionName", "callback" }, UnbindAction = { "actionName" },
+		BindToRenderStep = { "name", "priority", "callback" }, UnbindFromRenderStep = { "name" },
+		AdjustSpeed = { "speed" }, AdjustWeight = { "weight", "fadeTime" }, SetCore = { "name", "value" }, GetCore = { "name" }, SetCoreGuiEnabled = { "coreGuiType", "enabled" },
+		Clone = {}, Destroy = {}, FindFirstAncestorOfClass = { "className" }, FindFirstChildOfClass = { "className" },
+		FindFirstChildWhichIsA = { "className" }, FindFirstAncestorWhichIsA = { "className" }, IsA = { "className" },
+		GetPropertyChangedSignal = { "property" }, GetAttributeChangedSignal = { "attribute" },
+	}
+	-- * `x == Enum.UserInputState.Begin`: x is an input state
+	local ENUM_NAMES = {
+		UserInputState = "inputState", UserInputType = "inputType", HumanoidStateType = "state", KeyCode = "keyCode",
+		PlaybackState = "playbackState", Material = "material", PartType = "shape", EasingStyle = "easingStyle",
+		EasingDirection = "easingDirection", Font = "font", CameraType = "cameraType", ContextActionResult = "result",
+		ThumbnailType = "thumbnailType", ThumbnailSize = "thumbnailSize", ProductPurchaseDecision = "decision",
+	}
 	local function chooseNames(A, p, root, materialized, upnames, hints, ctx, chunk, protoId)
 		hints = hints or {}
 		local isMethod = false
@@ -8587,13 +8640,66 @@ do
 				end
 			elseif fn.k == "upval" and fn.key then
 				return ctx.closureOfKey and ctx.closureOfKey[fn.key]
+			elseif fn.k == "global" then
+				return ctx.closureOfKey and ctx.closureOfKey["global:" .. fn.name]
 			end
 			return nil
+		end
+		local shared = ctx.sharedFacts
+		-- * the module a variable holds: `local DataM = load("DataM")`, `require(x.Promise)`, this script's own table
+		local function moduleOfDef(e)
+			if e.k ~= "call" then
+				return nil
+			end
+			local a1 = e.args[1]
+			if e.fn.k == "global" and e.fn.name == "require" and a1 then
+				if a1.k == "index" and a1.key.str and isIdent(a1.key.str) then
+					return a1.key.str
+				end
+				return nil
+			end
+			if #e.args == 1 and constStr(a1) then
+				return string.match(constStr(a1), "^[%w_]*:?([%a_][%w_]*)$")
+			end
+			return nil
+		end
+		local function moduleOf(obj)
+			if obj.k == "var" then
+				local r = recs[obj.w]
+				if r and r.ownModule then
+					return ctx.options.scriptName
+				end
+				if r and #r.defs == 1 then
+					return moduleOfDef(r.defs[1].e)
+				end
+			elseif obj.k == "upval" and obj.key then
+				return ctx.moduleOfKey and ctx.moduleOfKey[obj.key]
+			end
+			return nil
+		end
+		-- * `M.fn(...)` / `M:fn(...)`: "M.fn"
+		local function exportKeyOf(x)
+			local m, fn
+			if x.k == "method" then
+				m, fn = moduleOf(x.obj), x.name
+			elseif x.k == "call" and x.fn.k == "index" and x.fn.key.str then
+				m, fn = moduleOf(x.fn.obj), x.fn.key.str
+			end
+			return m and fn and (m .. "." .. fn) or nil
 		end
 		-- * a name other functions gave: the parameter `pos` of function `id`, or the arguments passed to it
 		local function paramNameOf(id, pos)
 			local list = (ctx.paramFacts and ctx.paramFacts[id]) or (ctx.paramFactsPrev and ctx.paramFactsPrev[id])
 			return list and list[pos]
+		end
+		local function mostCommon(counts)
+			local best, bestN = nil, 0
+			for name, n in counts or {} do
+				if n > bestN or (n == bestN and best and name < best) then
+					best, bestN = name, n
+				end
+			end
+			return best
 		end
 		local function argNameOf(id, pos)
 			local facts = ctx.argFactsPrev and ctx.argFactsPrev[id]
@@ -8639,10 +8745,31 @@ do
 						rec(x.key.w).usedAsKey = true
 					end
 				elseif k == "method" then
+					callSites[#callSites + 1] = x
+					for n, arg in x.args do
+						local v = arg.k == "or" and arg.l or arg
+						if v.k == "var" then
+							local r = rec(v.w)
+							r.passedAs = r.passedAs or {}
+							r.passedAs[#r.passedAs + 1] = { call = x, pos = n }
+						end
+					end
 					if x.obj.k == "var" then
 						local r = rec(x.obj.w)
 						r.methods[x.name] = true
 						local a1 = x.args[1]
+						if x.name == "gsub" then
+							r.template = true
+						end
+						local methodNames = API_METHOD_PARAMS[x.name]
+						if methodNames then
+							for n, arg in x.args do
+								local v = arg.k == "or" and arg.l or arg
+								if v.k == "var" and methodNames[n] then
+									rec(v.w).apiName = rec(v.w).apiName or methodNames[n]
+								end
+							end
+						end
 						if x.name == "IsA" and constStr(a1) then
 							r.isA = r.isA or constStr(a1)
 						elseif (CHILD_BY_NAME[x.name] or CHILD_BY_CLASS[x.name])
@@ -8672,10 +8799,11 @@ do
 					end
 					callSites[#callSites + 1] = x
 					for n, arg in x.args do
-						if arg.k == "var" then
-							local r = rec(arg.w)
+						local v = arg.k == "or" and arg.l or arg
+						if v.k == "var" then
+							local r = rec(v.w)
 							r.passedAs = r.passedAs or {}
-							r.passedAs[#r.passedAs + 1] = { fn = x.fn, pos = n }
+							r.passedAs[#r.passedAs + 1] = { fn = x.fn, pos = n, call = x }
 						end
 					end
 					local path = pathOf(x.fn)
@@ -8706,12 +8834,79 @@ do
 						r.storedInto = r.storedInto or {}
 						r.storedInto[#r.storedInto + 1] = a1
 					end
+					local apiNames = path and API_PARAMS[path]
+					if apiNames then
+						for n, arg in x.args do
+							local v = arg.k == "or" and arg.l or arg
+							if v.k == "var" and apiNames[n] then
+								rec(v.w).apiName = rec(v.w).apiName or apiNames[n]
+							end
+						end
+					end
+					-- * `assert(player, "Player must be specified")`: the message names the value
+					if path == "assert" and a1 and a1.k == "var" and constStr(x.args[2]) then
+						local word = string.match(constStr(x.args[2]), "^(%u%l+) ")
+							or string.match(constStr(x.args[2]), "^(%l+) must ") or string.match(constStr(x.args[2]), "^(%l+) is required")
+						if word and not NAME_VERBS[string.lower(word)] and #word >= 3 then
+							rec(a1.w).assertName = string.lower(word)
+						end
+					end
+					-- * `Base.Method(self, ...)` inside `Method`: the object itself
+					if a1 and a1.k == "var" and x.fn.k == "index" and x.fn.key.str and p.debugname and x.fn.key.str == p.debugname then
+						rec(a1.w).superSelf = true
+					end
+					-- * handed to something that calls it: a callback
+					local fnArgPos = (path == "pcall" or path == "xpcall" or path == "ypcall" or path == "task.spawn" or path == "task.defer"
+						or path == "coroutine.wrap" or path == "coroutine.create" or path == "spawn") and 1
+						or ((path == "delay" or path == "task.delay") and 2) or nil
+					local fnArg = fnArgPos and x.args[fnArgPos]
+					if fnArg and fnArg.k == "var" then
+						rec(fnArg.w).callbackUse = true
+					end
+					-- * `debug.info(level + 1, "s")`: a stack level
+					if path == "debug.info" and x.args[1] and x.args[1].k ~= "const" then
+						forEachExpr(x.args[1], function(y)
+							if y.k == "var" then
+								rec(y.w).stackLevel = true
+							end
+						end)
+					end
+					-- * `string.rep("  ", depth)`: an indentation depth
+					if path == "string.rep" and x.args[2] and x.args[2].k == "var" then
+						rec(x.args[2].w).depth = true
+					end
+					if path == "warn" or path == "error" or path == "print" then
+						for _, arg in x.args do
+							if arg.k == "var" then
+								rec(arg.w).message = true
+							end
+						end
+					end
+					if path == "string.gsub" and a1 and a1.k == "var" then
+						rec(a1.w).template = true
+					end
 					if path == "table.sort" and x.args[2] and x.args[2].k == "closure" then
 						x.args[2].hints = { params = { "a", "b" } }
 					elseif path == "xpcall" and x.args[2] and x.args[2].k == "closure" then
 						x.args[2].hints = { params = { "err" } }
 					end
 				elseif k == "binop" then
+					if x.op == "==" or x.op == "~=" then
+						for _, pair in { { x.l, x.r }, { x.r, x.l } } do
+							local v, other = pair[1], pair[2]
+							local enumPath = other.k == "index" and pathOf(other)
+							local enumType = enumPath and string.match(enumPath, "^Enum%.(%w+)%.%w+$")
+							if v.k == "var" and enumType then
+								rec(v.w).enumName = ENUM_NAMES[enumType] or camel(enumType)
+							end
+						end
+					end
+					if x.op == "-" and x.r.k == "var" then
+						rec(x.r.w).subtracted = true
+					end
+					if x.op == "-" and x.l.k == "var" then
+						rec(x.l.w).subtractedFrom = true
+					end
 					for _, side in { x.l, x.r } do
 						if side.k == "var" then
 							if x.op == "+" or x.op == "-" or x.op == "*" or x.op == "/" or x.op == "%" or x.op == "^" or x.op == "//" then
@@ -8809,6 +9004,9 @@ do
 							end
 							def.multi = n > 1
 							r.defs[#r.defs + 1] = def
+							if st.isLocal and n == 1 and #r.defs == 1 then
+								r.localInit = st.values[1]
+							end
 							local e = def.e
 							if def.pos == 2 and e.k == "call" and pathOf(e.fn) == "pcall" and e.args[1] and e.args[1].k == "closure" then
 								r.flag = flagNameOfProto(chunk, e.args[1].child, ctx)
@@ -8882,6 +9080,24 @@ do
 					end
 				elseif k == "if" then
 					scan(st.cond)
+					-- * `if verbose then warn(...) end`: the flag says whether to warn
+					local gate = st.cond.k == "var" and st.cond.w
+					local only = #st.thenB.stmts == 1 and not st.elseB and st.thenB.stmts[1]
+					if gate and only and only.k == "call" and only.expr.k == "call" then
+						local fnPath = pathOf(only.expr.fn)
+						if fnPath == "warn" or fnPath == "print" or fnPath == "error" then
+							rec(gate).gates = fnPath
+						end
+					end
+					-- * `if x:IsA("ModuleScript") then ... return end`: x is any instance, tested for its type
+					local lastStmt = st.thenB.stmts[#st.thenB.stmts]
+					if lastStmt and lastStmt.k == "return" then
+						forEachExpr(st.cond, function(y)
+							if y.k == "method" and y.name == "IsA" and y.obj.k == "var" then
+								rec(y.obj.w).isAGuard = true
+							end
+						end)
+					end
 					local c, first = st.cond, st.thenB.stmts[1]
 					if c.k == "binop" and (c.op == "<" or c.op == ">" or c.op == "<=" or c.op == ">=") and first and first.k == "assign"
 						and #first.targets == 1 and first.targets[1].k == "var" and first.values[1] and first.values[1].k == "var"
@@ -8928,6 +9144,13 @@ do
 					for _, v in st.exprs do
 						scan(v)
 					end
+					local iter = st.exprs[1]
+					if iter and iter.k == "call" and (pathOf(iter.fn) == "ipairs" or pathOf(iter.fn) == "pairs") and iter.args[1] then
+						iter = iter.args[1]
+					end
+					if iter and iter.k == "var" and #st.exprs == 1 or (iter and iter.k == "var" and st.exprs[1].k == "call") then
+						rec(iter.w).iteratedAs = st.vars[2] or st.vars[1]
+					end
 					for n, w in st.vars do
 						local r = rec(w)
 						r.block, r.index = st.body, 0
@@ -8939,6 +9162,13 @@ do
 			end
 		end
 		walk(root)
+		if protoId == chunk.main and ctx.options.scriptName then
+			for w in returnedFromMain do
+				if recs[w] then
+					recs[w].ownModule = true -- * existing records only: the naming order stays fixed
+				end
+			end
+		end
 
 		local names = {}
 		local baseOfName = {} -- * "angle3" -> "angle" for names that got a number to be unique
@@ -9155,6 +9385,12 @@ do
 					return "object", 1
 				elseif path == "Instance.new" and constStr(a1) then
 					return camel(constStr(a1)), 3
+				elseif path == "debug.info" and constStr(e.args[2]) then
+					local what = ({ s = "source", n = "name", l = "line", f = "fn", a = "arity" })[constStr(e.args[2])]
+					if what then
+						return what, 2
+					end
+					return nil
 				elseif path and CALL_RESULTS[path] then
 					local name = fromList(CALL_RESULTS[path], pos)
 					if name then
@@ -9268,6 +9504,10 @@ do
 				local function isPosition(x)
 					return x.k == "index" and (x.key.str == "Position" or x.key.str == "p")
 				end
+				-- * `os.clock() - start`: the time that passed
+				if e.op == "-" and e.l.k == "call" and ({ tick = true, ["os.clock"] = true, time = true, ["os.time"] = true })[pathOf(e.l.fn) or ""] then
+					return "elapsed", 1.2
+				end
 				if e.op == "-" and isPosition(e.l) and isPosition(e.r) then
 					return "offset", 0.6
 				end
@@ -9341,25 +9581,40 @@ do
 					best, bestScore = name, score
 				end
 			end
+			if r.iteratedAs and r.param then
+				local item = nameOf(r.iteratedAs)
+				if item and not isGenericName(item) and item ~= "_" and not string.find(item, "^arg%d") and #item <= 24 then
+					offer(plural((string.gsub(item, "%d+$", ""))), 0.95)
+				end
+			end
 			if r.storedVars then
 				for _, item in r.storedVars do
 					local itemName = nameOf(item)
+					-- * an instance tested for its class: a table of that class
+					if (not itemName or isGenericName(itemName) or itemName == "instance") and recs[item] and recs[item].isA then
+						itemName = camel(recs[item].isA)
+					end
 					if itemName and not isGenericName(itemName) and #itemName <= 24 then
-						offer(plural(itemName), 1)
+						offer(plural((string.gsub(itemName, "%d+$", ""))), 1)
 						break
 					end
 				end
 			end
 			if r.usedAsKey then
-				offer("key", 0.6)
+				offer("key", 0.45)
 			end
 			if r.roleName then
 				offer(r.roleName[1], r.roleName[2])
 			end
 			if r.passedAs then
 				for _, use in r.passedAs do
-					local id = protoOfFn(use.fn)
+					local id = use.fn and protoOfFn(use.fn)
 					local name = id and paramNameOf(id, use.pos)
+					if not name and shared and use.call then
+						local key = exportKeyOf(use.call)
+						local list = key and shared.params[key]
+						name = list and list[use.pos]
+					end
 					if name then
 						offer(name, 0.85)
 						break
@@ -9403,7 +9658,7 @@ do
 					break
 				end
 			end
-			if r.isA then
+			if r.isA and not r.isAGuard then
 				offer(camel(r.isA), 1.2)
 			end
 			if r.hasHumanoid then
@@ -9433,6 +9688,53 @@ do
 			if r.called then
 				offer("callback", 0.6)
 			end
+			if r.callbackUse then
+				offer("callback", 1)
+			end
+			if r.apiName then
+				offer(r.apiName, 0.9)
+			end
+			if r.enumName then
+				offer(r.enumName, 1.1)
+			end
+			if r.assertName then
+				offer(r.assertName, 1.2)
+			end
+			if r.superSelf and r.param == 1 and not outerReserved.self then
+				offer("self", 1.6)
+			end
+			if r.stackLevel then
+				offer("stackLevel", 1.2)
+			end
+			if r.depth then
+				offer("depth", 1.1)
+			end
+			if r.template then
+				offer("template", 1)
+			end
+			if r.message and r.param then
+				offer("message", 0.5)
+			end
+			if r.gates then
+				offer("should" .. upperFirst(r.gates), 1.3)
+			end
+			-- * passed on to the function itself: `recurse(child, depth + 1, visited)`
+			for _, call in callSites do
+				local id = call.fn and protoOfFn(call.fn)
+				local recursive = id == protoId or (call.fn and call.fn.k == "global" and p.debugname and call.fn.name == p.debugname)
+				if recursive then
+					for n, arg in call.args do
+						if arg.k == "var" and arg.w == r.w and r.setKeys then
+							offer("visited", 1.3)
+						elseif arg.k == "binop" and arg.op == "+" and arg.l.k == "var" and arg.l.w == r.w and arg.r.k == "const" and arg.r.text == "1" then
+							offer("depth", 1.2)
+						end
+						if r.param and n == r.param - (isMethod and 1 or 0) and arg.k == "binop" and arg.op == "+" and arg.r.k == "const" and arg.r.text == "1" then
+							offer("depth", 1)
+						end
+					end
+				end
+			end
 			if r.list then
 				offer("list", 0.8)
 			end
@@ -9443,11 +9745,25 @@ do
 				offer("module", 0.8)
 			end
 			if r.text then
-				offer("text", 0.5)
+				offer("text", r.param and 0.4 or 0.5)
+			end
+			-- * a parameter read only for its lower_case fields: `options.min_value`
+			if r.param and next(r.fields) and not next(r.methods) and not r.indexed and not r.called and not r.list and not r.map then
+				local all = true
+				for field in r.fields do
+					if not string.find(field, "^%l[%l%d]*_[%l%d_]+$") then
+						all = false
+					end
+				end
+				if all then
+					offer("options", 0.6)
+				end
 			end
 			if r.methods.Destroy or r.methods.FindFirstChild or r.methods.WaitForChild or r.methods.GetChildren
-				or r.fields.Parent or r.fields.Name or r.fields.ClassName
+				or r.methods.GetDescendants or r.fields.Parent or r.isAGuard
 			then
+				offer("instance", r.isAGuard and 1.3 or 0.7)
+			elseif r.fields.Name or r.fields.ClassName then
 				offer("instance", 0.4)
 			end
 			if r.fields.Magnitude or r.fields.Unit or r.fields.magnitude or r.fields.unit then
@@ -9581,6 +9897,13 @@ do
 				if passed then
 					offer(passed, 0.9)
 				end
+				local exportKey = ctx.exportOf and ctx.exportOf[protoId]
+				if exportKey and shared and shared.args[exportKey] then
+					local name = mostCommon(shared.args[exportKey][r.param - (isMethod and 1 or 0)])
+					if name then
+						offer(name, 0.8)
+					end
+				end
 				if fnameNoun and count == 1 then
 					offer(fnameNoun, 1)
 				elseif fnameNoun and count == 2 and index >= 1 then
@@ -9642,6 +9965,21 @@ do
 					local other = nameOf(def.e.w)
 					if other and not isGenericName(other) and #other <= 20 then
 						offer(string.find(other, "_") and (extreme .. "_" .. other) or (extreme .. upperFirst(other)), 1)
+					end
+				end
+				if (def.e.k == "call") and r.subtracted and not r.subtractedFrom then
+					local clock = ({ tick = "startTick", ["os.clock"] = "startClock", time = "startTime", ["os.time"] = "startTime",
+						elapsedTime = "startTime", ["workspace.GetServerTimeNow"] = "startTime" })[pathOf(def.e.fn) or ""]
+					if clock then
+						offer(clock, 2)
+					end
+				end
+				if def.e.k == "call" then
+					local id = protoOfFn(def.e.fn)
+					local list = id and ((ctx.returnFacts and ctx.returnFacts[id]) or (ctx.returnFactsPrev and ctx.returnFactsPrev[id]))
+					local name = list and list[def.pos]
+					if name then
+						offer(name, 0.9)
 					end
 				end
 				if def.e.k == "or" and def.e.l.k == "var" and recs[def.e.l.w] and recs[def.e.l.w].param
@@ -9789,7 +10127,7 @@ do
 
 		local deferred = {}
 		for _, r in order do
-			if not r.param and (materialized[r.w]) and not names[r.w] then
+			if ((r.param and r.iteratedAs) or (not r.param and materialized[r.w])) and not names[r.w] then
 				local _, score = candidate(r)
 				if score < 1 then
 					deferred[r] = true
@@ -9799,7 +10137,15 @@ do
 		local passes = { {}, {} }
 		for _, r in order do
 			local list = deferred[r] and passes[2] or passes[1]
-			list[#list + 1] = r
+			if not (r.param and deferred[r] and r.iteratedAs) then
+				list[#list + 1] = r
+			end
+		end
+		-- * a parameter named after the loop over it: after that loop's variables
+		for _, r in order do
+			if r.param and deferred[r] and r.iteratedAs then
+				passes[2][#passes[2] + 1] = r
+			end
 		end
 		classTaken = false
 		for _, r in table.move(passes[2], 1, #passes[2], #passes[1] + 1, passes[1]) do
@@ -9812,6 +10158,8 @@ do
 					end
 				end
 				if r.reads == 0 and not w.captured and not r.param and (r.genfor or multiTarget) and not reserved._ then
+					names[w] = "_"
+				elseif r.param and r.reads == 0 and #r.defs == 0 and not w.captured and not reserved._ then
 					names[w] = "_"
 				else
 					local block = r.block or root
@@ -9832,6 +10180,23 @@ do
 					end
 					names[w] = claim(base, block, index)
 					allowShadowing = false
+				end
+			end
+		end
+
+		-- * `local options = arg2 or {}` where that is the parameter's only use: the parameter takes the
+		-- * local's name (`local options = options or {}`), which only it reads
+		for _, r in order do
+			local init = r.localInit
+			if init and init.k == "or" and init.l.k == "var" and names[r.w] then
+				local pr = recs[init.l.w]
+				local pname = pr and names[pr.w]
+				if pr and pr.param and pr.reads == 1 and #pr.defs == 0 and not pr.w.captured and pname then
+					if string.find(pname, "^arg%d+$") or isGenericName(pname) then
+						names[pr.w] = baseOfName[names[r.w]] or names[r.w]
+					elseif (baseOfName[names[r.w]] or names[r.w]) == pname then
+						names[r.w] = pname -- * `local depth = depth or 0`, not `depth2`
+					end
 				end
 			end
 		end
@@ -9882,12 +10247,35 @@ do
 						elseif v and v.k == "upval" and v.key and target.k == "index" and target.key.str and not string.find(target.key.str, "^__") then
 							-- * `part.Transparency = captured`
 							fact(v.key, camel(target.key.str), 1.2)
+						end
+						-- * a table filled by `add_child_blacklist(...)` is the child blacklist
+						if v and target.k == "index" and target.obj.k == "upval" and target.obj.key and not target.key.str and fname then
+							local what = string.match(fname, "^add_(%a[%w_]*)$") or string.match(fname, "^register_(%a[%w_]*)$")
+								or (string.match(fname, "^Add(%u%w*)$") and camel(string.match(fname, "^Add(%u%w*)$")))
+								or (string.match(fname, "^Register(%u%w*)$") and camel(string.match(fname, "^Register(%u%w*)$")))
+							what = what and (string.match(what, "^(.-)_helper$") or string.match(what, "^(.-)_internal$")
+								or string.match(what, "^(.-)Helper$") or string.match(what, "^(.-)Internal$") or what)
+							if what and #what >= 3 then
+								fact(target.obj.key, what, 0.95)
+							end
+						end
+						if false then
 						elseif v and target.k == "index" and target.obj.k == "upval" and target.obj.key and not target.key.str and v.k == "var" then
 							local item = names[v.w]
-							if item and not isGenericName(item) then
+							if (not item or isGenericName(item) or item == "instance") and recs[v.w] and recs[v.w].isA then
+								item = camel(recs[v.w].isA)
+							end
+							if item and not isGenericName(item) and item ~= "instance" then
 								fact(target.obj.key, plural((string.gsub(item, "%d+$", ""))), 1)
 							end
 						end
+					end
+				elseif st.k == "if" and st.cond.k == "upval" and st.cond.key and #st.thenB.stmts == 1 and not st.elseB
+					and st.thenB.stmts[1].k == "call" and st.thenB.stmts[1].expr.k == "call"
+				then
+					local fnPath = pathOf(st.thenB.stmts[1].expr.fn)
+					if fnPath == "warn" or fnPath == "print" or fnPath == "error" then
+						fact(st.cond.key, "should" .. upperFirst(fnPath), 1.3)
 					end
 				elseif st.k == "call" and st.expr.k == "call" and pathOf(st.expr.fn) == "table.insert" then
 					local args = st.expr.args
@@ -9907,8 +10295,105 @@ do
 		end
 		if ctx.upFacts then
 			factsIn(root)
+			-- * `template:gsub(...)`, `pcall(callback)` on captured variables
+			local function exprFacts(block)
+				for _, st in block.stmts do
+					local function each(e)
+						forEachExpr(e, function(x)
+							if x.k == "binop" and x.op == "-" and x.r.k == "upval" and x.r.key and x.l.k == "call" then
+								local clock = ({ tick = "startTick", ["os.clock"] = "startClock", time = "startTime", ["os.time"] = "startTime" })[pathOf(x.l.fn) or ""]
+								if clock then
+									fact(x.r.key, clock, 2)
+								end
+							end
+							if x.k == "method" and x.name == "gsub" and x.obj.k == "upval" and x.obj.key then
+								fact(x.obj.key, "template", 1)
+							elseif x.k == "call" then
+								local path = pathOf(x.fn)
+								local a1 = x.args[1]
+								if a1 and a1.k == "upval" and a1.key and (path == "pcall" or path == "xpcall" or path == "task.spawn" or path == "task.defer") then
+									fact(a1.key, "callback", 1)
+								end
+								if x.fn.k == "upval" and x.fn.key and not (ctx.closureOfKey and ctx.closureOfKey[x.fn.key]) then
+									fact(x.fn.key, "callback", 0.8)
+								end
+							end
+						end)
+					end
+					if st.k == "assign" then
+						for _, v in st.values do
+							each(v)
+						end
+						for _, t in st.targets do
+							each(t)
+						end
+					elseif st.k == "call" then
+						each(st.expr)
+					elseif st.k == "return" then
+						for _, v in st.values do
+							each(v)
+						end
+					elseif st.k == "if" or st.k == "while" then
+						if st.cond then
+							each(st.cond)
+						end
+					end
+					local a, b = childBlocks(st)
+					if a then
+						exprFacts(a)
+					end
+					if b then
+						exprFacts(b)
+					end
+				end
+			end
+			exprFacts(root)
 		end
 		if ctx.closureOfKey then
+			local function globalsIn(block)
+				for _, st in block.stmts do
+					if st.k == "assign" and #st.targets == 1 and st.targets[1].k == "global" and st.values[1] and st.values[1].k == "closure" then
+						ctx.closureOfKey["global:" .. st.targets[1].name] = st.values[1].child
+					end
+					local a, b = childBlocks(st)
+					if a then
+						globalsIn(a)
+					end
+					if b then
+						globalsIn(b)
+					end
+				end
+			end
+			globalsIn(root)
+			ctx.moduleOfKey = ctx.moduleOfKey or {}
+			ctx.exportOf = ctx.exportOf or {}
+			for _, r in order do
+				local m = r.ownModule and ctx.options.scriptName or (#r.defs == 1 and moduleOfDef(r.defs[1].e))
+				if m then
+					ctx.moduleOfKey[protoId .. ":" .. r.w.id] = m
+				end
+			end
+			local function exportsIn(block)
+				for _, st in block.stmts do
+					if st.k == "assign" and #st.targets == 1 and st.values[1] and st.values[1].k == "closure" then
+						local t = st.targets[1]
+						if t.k == "index" and t.key.str then
+							local m = moduleOf(t.obj)
+							if m then
+								ctx.exportOf[st.values[1].child] = m .. "." .. t.key.str
+							end
+						end
+					end
+					local a, b = childBlocks(st)
+					if a then
+						exportsIn(a)
+					end
+					if b then
+						exportsIn(b)
+					end
+				end
+			end
+			exportsIn(root)
 			for _, r in order do
 				for _, def in r.defs do
 					if def.e.k == "closure" then
@@ -9924,8 +10409,60 @@ do
 				end
 			end
 			ctx.paramFacts[protoId] = own
+			local exportKey = ctx.exportOf[protoId]
+			if shared and exportKey then
+				local visible = {}
+				for pos, name in own do
+					visible[pos - (isMethod and 1 or 0)] = name
+				end
+				shared.params[exportKey] = visible
+			end
+			if shared then
+				for _, call in callSites do
+					local key = exportKeyOf(call)
+					if key then
+						local facts = shared.args[key]
+						if not facts then
+							facts = {}
+							shared.args[key] = facts
+						end
+						for n, arg in call.args do
+							local name = arg.k == "var" and names[arg.w]
+							if name and not isGenericName(name) and not string.find(name, "^arg%d") and name ~= "self" and name ~= "_"
+								and not WEAK_NAMES[(string.gsub(name, "%d+$", ""))]
+							then
+								name = string.gsub(name, "%d+$", "")
+								facts[n] = facts[n] or {}
+								facts[n][name] = (facts[n][name] or 0) + 1
+							end
+						end
+					end
+				end
+			end
+			local returned = {}
+			local function returnsIn(block)
+				for _, st in block.stmts do
+					if st.k == "return" then
+						for n, v in st.values do
+							local name = v.k == "var" and names[v.w]
+							if name and not isGenericName(name) and name ~= "self" and not string.find(name, "^arg%d") and returned[n] == nil then
+								returned[n] = (string.gsub(name, "%d+$", ""))
+							end
+						end
+					end
+					local a, b = childBlocks(st)
+					if a and not LOOP_KINDS_NAMES[st.k] then
+						returnsIn(a)
+					end
+					if b then
+						returnsIn(b)
+					end
+				end
+			end
+			returnsIn(root)
+			ctx.returnFacts[protoId] = returned
 			for _, call in callSites do
-				local id = protoOfFn(call.fn)
+				local id = call.fn and protoOfFn(call.fn)
 				if id and id ~= protoId then
 					local facts = ctx.argFacts[id]
 					if not facts then
@@ -9934,7 +10471,9 @@ do
 					end
 					for n, arg in call.args do
 						local name = arg.k == "var" and names[arg.w]
-						if name and not isGenericName(name) and not string.find(name, "^arg%d") and name ~= "self" then
+						if name and not isGenericName(name) and not string.find(name, "^arg%d") and name ~= "self"
+							and not WEAK_NAMES[(string.gsub(name, "%d+$", ""))]
+						then
 							name = string.gsub(name, "%d+$", "")
 							facts[n] = facts[n] or {}
 							facts[n][name] = (facts[n][name] or 0) + 1
@@ -11059,8 +11598,9 @@ do
 			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {}, outerNames = {},
 			lineOwner = lineOwner, protoParent = protoParent,
 			upkeysByProto = {}, upFacts = {}, upFactsPrev = prev and prev.upFacts,
-			argFacts = {}, paramFacts = {}, closureOfKey = {},
-			argFactsPrev = prev and prev.argFacts, paramFactsPrev = prev and prev.paramFacts,
+			argFacts = {}, paramFacts = {}, closureOfKey = {}, returnFacts = {}, moduleOfKey = {}, exportOf = {},
+			sharedFacts = (options and options.shared) or (prev and prev.sharedFacts) or { params = {}, args = {} },
+			argFactsPrev = prev and prev.argFacts, paramFactsPrev = prev and prev.paramFacts, returnFactsPrev = prev and prev.returnFacts,
 		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
@@ -14076,7 +14616,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-08f " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
+	local CACHE_VERSION = "2026-10-09a " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
@@ -14468,6 +15008,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				warn("[BetterSaveinstance] This executor compiled saveinstance with -O2 (ignoring --!optimize 1). Luau's -O2 inliner has a bug that can corrupt decompiled scripts; report your executor's name.")
 			end
 		end
+		-- * names learned from one script for the others: `DataM.get_store(player)` names DataM's parameter
+		local SharedNames = { params = {}, args = {} }
 		BuiltinDecompile = function(script)
 			local bytecode = getscriptbytecode(script)
 			if type(bytecode) ~= "string" or bytecode == "" then
@@ -14475,7 +15017,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 			local chunk = BytecodeLifter.parse(bytecode)
 			local scriptName = typeof(script) == "Instance" and script.Name or nil
-			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName, lineMode = PreserveLineNumbers and "preserve" or "annotate" })
+			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName, lineMode = PreserveLineNumbers and "preserve" or "annotate", shared = SharedNames })
 			local header = "-- Decompiled with BetterSaveinstance's built-in decompiler (" .. stats.structured + stats.lifted .. " functions"
 			if stats.lifted > 0 then
 				header ..= ", " .. stats.lifted .. " rebuilt low-level: search for \"[low-level]\""
