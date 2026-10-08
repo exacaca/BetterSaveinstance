@@ -4214,6 +4214,9 @@ do
 			if loop.tailExit and (target == loop.tailExit or t == canonical(loop.tailExit)) then
 				return "break"
 			end
+			if loop.flagExit and (target == loop.flagExit or t == canonical(loop.flagExit)) then
+				return "flagbreak"
+			end
 			for c in loop.conts do
 				if target == c or t == canonical(c) then
 					return "continue"
@@ -4294,7 +4297,7 @@ do
 			end
 			local action = loopTargets(ctx, telse)
 			if action then
-				return { kind = "condjump", chain = chain, action = action }, tthen
+				return { kind = "condjump", chain = chain, action = action, flag = ctx.loop and ctx.loop.flag }, tthen
 			end
 			return nil, "conditional jump to " .. telse .. " cannot be structured"
 		end
@@ -4330,7 +4333,8 @@ do
 						Jn = ins.target
 					end
 					pc = ins.next
-				elseif ins.op == OP.JUMP and ins.target > ins.pc and ins.target <= e and elements[#elements] and elements[#elements].kind == "leaf" then
+				elseif not A.conservative and ins.op == OP.JUMP and ins.target > ins.pc and ins.target <= e and elements[#elements] and elements[#elements].kind == "leaf" then
+					A.info.usedNew = true
 					positions[pc] = #elements + 1
 					elements[#elements + 1] = { kind = "goto", jump = ins, startPc = pc }
 					regionJumps[ins] = true
@@ -4342,7 +4346,7 @@ do
 					local startPc = pc
 					local run = {}
 					while ins and pc < e and pc < Jn and not (CONDITIONAL[ins.op] and not ins.boolmat)
-						and not (ins.op == OP.JUMP and ins.target > ins.pc) and (pc == startPc or not A.incoming[pc])
+						and not (not A.conservative and ins.op == OP.JUMP and ins.target > ins.pc) and (pc == startPc or not A.incoming[pc])
 					do
 						local multretOk = ((ins.op == OP.CALL and ins.c == 0) or (ins.op == OP.GETVARARGS and ins.b == 0))
 						if (ins.target and not ins.boolmat) or (#ins.defs == 0 and not NOOPS[ins.op] and not multretOk) then
@@ -4815,6 +4819,44 @@ do
 			end
 			return J, loads, at
 		end
+		-- * An inlined function's `return` inside a loop (-O2) jumps past the code after the loop,
+		-- * which Luau cannot say with `break`. Rebuilt exactly with a flag:
+		-- * `exited = false; for ... do ... exited = true; break ... end; if not exited then <rest> end`.
+		-- * Returns the jump target and the code between the loop and it.
+		local function flagExit(bodyStart, loopEnd, exit, e, ctx)
+			if A.conservative then
+				return nil
+			end
+			local J
+			local pc = bodyStart
+			while pc < loopEnd do
+				local ins = insAt(pc)
+				if not ins then
+					return nil
+				end
+				local t = ins.target
+				if t and not ins.boolmat and (t > exit or t < bodyStart) and canonical(t) ~= canonical(exit) then
+					if t < bodyStart or t > e then
+						return nil
+					end
+					if J and canonical(J) ~= canonical(t) then
+						return nil
+					end
+					J = J and math.min(J, t) or t
+				end
+				pc = ins.next
+			end
+			if not J or J <= exit then
+				return nil
+			end
+			local ok, tail = pcall(structRange, exit, J, ctx)
+			if not ok then
+				return nil
+			end
+			A.info.usedNew = true
+			return J, tail
+		end
+
 		local function insertLoads(items, loads, at)
 			for n, ins in loads do
 				table.insert(items, at + n - 1, { kind = "ins", ins = ins })
@@ -4833,7 +4875,7 @@ do
 					conts[#conts + 1] = c
 				end
 				table.sort(conts)
-				key ..= ":" .. tostring(loop.exit) .. ":" .. tostring(loop.header) .. ":" .. concat(conts, ",") .. (loop.isBlock and ":b" or "") .. ":" .. tostring(loop.tailExit)
+				key ..= ":" .. tostring(loop.exit) .. ":" .. tostring(loop.header) .. ":" .. concat(conts, ",") .. (loop.isBlock and ":b" or "") .. ":" .. tostring(loop.tailExit) .. ":" .. tostring(loop.flagExit)
 			end
 			local hit = memo[key]
 			if hit then
@@ -4943,7 +4985,7 @@ do
 								-- * the same place, or two copies of a bare `return` (the compiler copies
 								-- * a `return` over a jump to it)
 								if canonical(i2.next) == canonical(exit)
-									or (a2 and b2 and a2.op == OP.RETURN and b2.op == OP.RETURN and a2.b == 1 and b2.b == 1)
+									or (a2 and b2 and a2.op == OP.RETURN and b2.op == OP.RETURN and a2.b >= 1 and a2.b == b2.b and (a2.b == 1 or a2.a == b2.a))
 								then
 									loopIns, exit = i2, i2.next
 								end
@@ -4958,16 +5000,41 @@ do
 					local loop = { header = ins.next, exit = exit, conts = { [loopIns.pc] = true } }
 					local ok, body = pcall(structRange, ins.next, loopIns.pc, { loop = loop })
 					local J, loads, at
+					local flagTail
 					if not ok then
 						J, loads, at = hoistLoopTail(ins, loopIns, exit, e, items)
-						if not J then
-							error(body, 0)
+						if J then
+							loop.tailExit = J
+							body = structRange(ins.next, loopIns.pc, { loop = loop })
+							insertLoads(items, loads, at)
+						else
+							J, flagTail = flagExit(ins.next, loopIns.pc, exit, e, ctx)
+							if not J then
+								error(body, 0)
+							end
+							loop.flagExit, loop.flag = J, {}
+							body = structRange(ins.next, loopIns.pc, { loop = loop })
+							-- * before the loop's setup (instructions that only fill the loop registers)
+							local at = #items + 1
+							while at > 1 and items[at - 1].kind == "ins" and #items[at - 1].ins.defs > 0 do
+								local below = false
+								for _, r in items[at - 1].ins.defs do
+									if r < ins.a then
+										below = true
+									end
+								end
+								if below then
+									break
+								end
+								at -= 1
+							end
+							table.insert(items, at, { kind = "flagset", flag = loop.flag })
 						end
-						loop.tailExit = J
-						body = structRange(ins.next, loopIns.pc, { loop = loop })
-						insertLoads(items, loads, at)
 					end
 					items[#items + 1] = { kind = "numfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
+					if flagTail then
+						items[#items + 1] = { kind = "flagif", flag = loop.flag, body = flagTail }
+					end
 					pc = J or exit
 				elseif FORGPREPS[ins.op] then
 					local loopIns = insAt(ins.target)
@@ -4977,16 +5044,41 @@ do
 					local loop = { header = ins.next, exit = loopIns.next, conts = { [loopIns.pc] = true } }
 					local ok, body = pcall(structRange, ins.next, loopIns.pc, { loop = loop })
 					local J, loads, at
+					local flagTail
 					if not ok then
 						J, loads, at = hoistLoopTail(ins, loopIns, loopIns.next, e, items)
-						if not J then
-							error(body, 0)
+						if J then
+							loop.tailExit = J
+							body = structRange(ins.next, loopIns.pc, { loop = loop })
+							insertLoads(items, loads, at)
+						else
+							J, flagTail = flagExit(ins.next, loopIns.pc, loopIns.next, e, ctx)
+							if not J then
+								error(body, 0)
+							end
+							loop.flagExit, loop.flag = J, {}
+							body = structRange(ins.next, loopIns.pc, { loop = loop })
+							-- * before the loop's setup (instructions that only fill the loop registers)
+							local at = #items + 1
+							while at > 1 and items[at - 1].kind == "ins" and #items[at - 1].ins.defs > 0 do
+								local below = false
+								for _, r in items[at - 1].ins.defs do
+									if r < ins.a then
+										below = true
+									end
+								end
+								if below then
+									break
+								end
+								at -= 1
+							end
+							table.insert(items, at, { kind = "flagset", flag = loop.flag })
 						end
-						loop.tailExit = J
-						body = structRange(ins.next, loopIns.pc, { loop = loop })
-						insertLoads(items, loads, at)
 					end
 					items[#items + 1] = { kind = "genfor", prep = ins, loopIns = loopIns, body = body, loop = loop }
+					if flagTail then
+						items[#items + 1] = { kind = "flagif", flag = loop.flag, body = flagTail }
+					end
 					pc = J or loopIns.next
 				elseif CONDITIONAL[ins.op] and not ins.boolmat then
 					-- * prefer `x = a and b or c`, then if statements, then `if c then a else b` values
@@ -5037,7 +5129,7 @@ do
 					if not action then
 						fail("unstructured jump from " .. ins.pc .. " to " .. ins.target)
 					end
-					items[#items + 1] = { kind = action }
+					items[#items + 1] = { kind = action, flag = ctx.loop and ctx.loop.flag }
 					pc = ins.next
 				elseif ins.op == OP.FORNLOOP or ins.op == OP.FORGLOOP or (ins.op == OP.LOADB and ins.c ~= 0) then
 					fail("stray loop/jump instruction")
@@ -5273,6 +5365,17 @@ do
 			return st
 		end
 
+		local function flagVar(flag)
+			if not flag.w then
+				flag.w = { id = "exitflag" .. tostring(flag), defs = {}, uses = {}, kinds = { normal = true }, captured = false, useLeft = 0, synthetic = "exited" }
+				materialized[flag.w] = true
+			end
+			return E("var", { w = flag.w })
+		end
+		local function flagAssign(flag, value)
+			return { k = "assign", targets = { flagVar(flag) }, values = { E("const", { text = value }) } }
+		end
+
 		local function condLeaf(block, seg)
 			local ins = seg.jump
 			local op = ins.op
@@ -5399,10 +5502,10 @@ do
 				local ex = takeOperands(block, ins, { a }, nil, true)
 				pushStmt(block, { k = "assign", targets = { E("global", { name = name }) }, values = ex })
 			elseif op == OP.GETUPVAL then
-				pushDef(block, ins, a, E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue") }), false)
+				pushDef(block, ins, a, E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue"), key = ctx.upkeys and ctx.upkeys[b + 1] }), false)
 			elseif op == OP.SETUPVAL then
 				local ex = takeOperands(block, ins, { a })
-				pushStmt(block, { k = "assign", targets = { E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue") }) }, values = ex })
+				pushStmt(block, { k = "assign", targets = { E("upval", { name = ctx.upnames[b + 1] or fail("unknown upvalue"), key = ctx.upkeys and ctx.upkeys[b + 1] }) }, values = ex })
 			elseif op == OP.GETIMPORT then
 				local aux = ins.aux
 				local count = rshift(aux, 30)
@@ -5459,7 +5562,7 @@ do
 							at -= 1
 						end
 					end
-					insert(entries, at, { key = keyExpr, value = valueExpr, rank = rank, line = ctx.ownLine and ctx.ownLine(ins.pc) or nil })
+					insert(entries, at, { key = keyExpr, value = valueExpr, rank = rank, line = ctx.ownLine and ctx.ownLine(ins.pc) or nil, valueLine = block.absorbedLine })
 					tail.pure = false
 					tw.useLeft -= 1
 				else
@@ -5530,18 +5633,20 @@ do
 					end
 				end
 			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
-				local caps = {}
+				local caps, capKeys = {}, {}
 				for n, cap in ins.captures do
 					if cap.a == 2 then
 						caps[n] = ctx.upnames[cap.b + 1] or fail("unknown upvalue")
+						capKeys[n] = ctx.upkeys and ctx.upkeys[cap.b + 1]
 					else
 						caps[n] = { w = webOf(ins.useDef[cap.b]) }
 						materialized[caps[n].w] = true
 						caps[n].w.useLeft -= 1
+						capKeys[n] = ctx.protoId .. ":" .. caps[n].w.id
 					end
 				end
 				local selfW = webOf(ins.defIds[a])
-				local st = pushDef(block, ins, a, E("closure", { child = ins.child, caps = caps, selfW = selfW }), false)
+				local st = pushDef(block, ins, a, E("closure", { child = ins.child, caps = caps, capKeys = capKeys, selfW = selfW }), false)
 				if ctx.chunk.protos[ins.child].debugname then
 					st.namedClosure = true -- * only folded into `t.name = ...`, otherwise `local function`
 				end
@@ -5738,7 +5843,11 @@ do
 					local st = { k = "if", cond = cond, refBlock = block, degenerate = item.degenerate }
 					if kind == "condjump" then
 						st.thenB = newBlock(block)
-						st.thenB.stmts = { item.action == "return" and { k = "return", values = {} } or { k = item.action } }
+						if item.action == "flagbreak" then
+							st.thenB.stmts = { flagAssign(item.flag, "true"), { k = "break" } }
+						else
+							st.thenB.stmts = { item.action == "return" and { k = "return", values = {} } or { k = item.action } }
+						end
 					else
 						st.thenB = buildBlock(item.thenB, block)
 						if item.elseB then
@@ -5922,6 +6031,15 @@ do
 
 				elseif kind == "break" or kind == "continue" then
 					pushStmt(block, { k = kind })
+				elseif kind == "flagbreak" then
+					pushStmt(block, flagAssign(item.flag, "true"))
+					pushStmt(block, { k = "break" })
+				elseif kind == "flagset" then
+					pushStmt(block, flagAssign(item.flag, "false"))
+				elseif kind == "flagif" then
+					local st = { k = "if", cond = E("not", { e = flagVar(item.flag) }), refBlock = block }
+					st.thenB = buildBlock(item.body, block)
+					pushStmt(block, st)
 				elseif kind == "return" then
 					pushStmt(block, { k = "return", values = {} })
 				elseif kind == "breakblock" then
@@ -6621,6 +6739,7 @@ do
 		if not s then
 			return nil
 		end
+		s = string.gsub(s, "%d+$", "")
 		local single = singular(s)
 		if single then
 			return single
@@ -6629,7 +6748,7 @@ do
 		if target then
 			return camel(target)
 		end
-		for _, suffix in { "Map", "Lookup", "Table", "Dict", "Dictionary", "Cache", "List", "Array", "Registry" } do
+		for _, suffix in { "Map", "Lookup", "Table", "Dict", "Dictionary", "Cache", "List", "Array", "Registry", "DB", "Db", "_list", "_map", "_by_name", "_by_id" } do
 			local base = string.match(s, "^(.-)" .. suffix .. "$")
 			if base and #base >= 2 then
 				return singular(base) or base
@@ -7067,6 +7186,13 @@ do
 								end
 							end
 							local value = st.values[t]
+							if value and target.k == "var" and value.k == "binop" and (value.op == "+" or value.op == "-")
+								and value.l.k == "var" and value.l.w == target.w and value.r.k == "const" and tonumber(value.r.text)
+							then
+								rec(target.w).stepped = true
+							elseif value and target.k == "var" and not (value.k == "const" and tonumber(value.text)) then
+								rec(target.w).otherWrites = true
+							end
 							if value and value.k == "var" and target.k == "index" and not target.key.str and target.obj.k == "var" then
 								local holder = rec(target.obj.w)
 								holder.storedVars = holder.storedVars or {}
@@ -7533,6 +7659,17 @@ do
 			if r.usedAsKey then
 				offer("key", 0.6)
 			end
+			if r.w.synthetic then
+				offer(r.w.synthetic, 5)
+			end
+			local learned = ctx.upFactsPrev and ctx.upFactsPrev[protoId .. ":" .. r.w.id]
+			if learned then
+				offer(learned.name, learned.score)
+			end
+			-- * starts as a number and only ever steps by a constant
+			if r.stepped and not r.otherWrites and not r.param then
+				offer("count", 0.9)
+			end
 			for _, key in r.stores do
 				if not string.find(key, "^__") then
 					offer(camel(key), 1.5)
@@ -7930,6 +8067,62 @@ do
 		if p.isvararg then
 			params[#params + 1] = "..."
 		end
+		-- * facts about captured variables, for the function that declares them (next pass)
+		local function fact(key, name, score)
+			if not key or not name or (isGenericName(name) and name ~= "count") or NAME_KEYWORDS[name] or BUILTIN_NAMES[name] then
+				return
+			end
+			local old = ctx.upFacts[key]
+			if not old or score > old.score then
+				ctx.upFacts[key] = { name = name, score = score }
+			end
+		end
+		local function factsIn(block)
+			for _, st in block.stmts do
+				if st.k == "assign" then
+					for t, target in st.targets do
+						local v = st.values[t]
+						if v and target.k == "upval" and target.key then
+							if v.k == "binop" and (v.op == "+" or v.op == "-") and v.l.k == "upval" and v.l.key == target.key and v.r.k == "const" and tonumber(v.r.text) then
+								fact(target.key, "count", 1.2)
+							elseif v.k == "var" and names[v.w] then
+								-- * `captured = deltaTime`
+								fact(target.key, (string.gsub(names[v.w], "%d+$", "")), 0.9)
+							elseif v.k ~= "var" and v.k ~= "upval" and v.k ~= "const" then
+								local name, score = valueName(v, 1, 1)
+								if name then
+									fact(target.key, name, math.min(score or 0.5, 1.5))
+								end
+							end
+						elseif v and v.k == "upval" and v.key and target.k == "index" and target.key.str and not string.find(target.key.str, "^__") then
+							-- * `part.Transparency = captured`
+							fact(v.key, camel(target.key.str), 1.2)
+						elseif v and target.k == "index" and target.obj.k == "upval" and target.obj.key and not target.key.str and v.k == "var" then
+							local item = names[v.w]
+							if item and not isGenericName(item) then
+								fact(target.obj.key, plural((string.gsub(item, "%d+$", ""))), 1)
+							end
+						end
+					end
+				elseif st.k == "call" and st.expr.k == "call" and pathOf(st.expr.fn) == "table.insert" then
+					local args = st.expr.args
+					local holder, item = args[1], args[#args]
+					if #args >= 2 and holder.k == "upval" and holder.key and item.k == "var" and names[item.w] and not isGenericName(names[item.w]) then
+						fact(holder.key, plural((string.gsub(names[item.w], "%d+$", ""))), 1)
+					end
+				end
+				local a, b = childBlocks(st)
+				if a then
+					factsIn(a)
+				end
+				if b then
+					factsIn(b)
+				end
+			end
+		end
+		if ctx.upFacts then
+			factsIn(root)
+		end
 		return names, params, isMethod, classWebs
 	end
 
@@ -8205,7 +8398,7 @@ do
 			if #e.entries == 0 then
 				return "{}"
 			end
-			local function render(entryIndent)
+			local function render(entryIndent, valueMarks)
 				local parts = {}
 				for n, entry in e.entries do
 					local value = entry.value
@@ -8213,12 +8406,17 @@ do
 					if value.k == "closure" and entry.key and entry.key.str and self.chunk.protos[value.child].debugname == entry.key.str then
 						value.namedByKey = true
 					end
-					local v = self:expr(value, entryIndent)
+					-- * `key =` <newline> `value` when the value starts on a later line than its key
+					local valueMark = valueMarks and valueMarks[n]
+					local v = self:expr(value, entryIndent + (valueMark and 1 or 0))
+					if valueMark then
+						v = "\n" .. valueMark .. rep("\t", entryIndent + 1) .. v
+					end
 					if entry.key then
 						if entry.key.str and isIdent(entry.key.str) then
-							parts[n] = entry.key.str .. " = " .. v
+							parts[n] = entry.key.str .. (valueMark and " =" or " = ") .. v
 						else
-							parts[n] = "[" .. self:expr(entry.key, entryIndent) .. "] = " .. v
+							parts[n] = "[" .. self:expr(entry.key, entryIndent) .. "]" .. (valueMark and " =" or " = ") .. v
 						end
 					else
 						if n == #e.entries and (value.k == "call" or value.k == "method" or value.k == "vararg") and not value.multret then
@@ -8242,6 +8440,9 @@ do
 				if entry.line then
 					fieldLines[entry.line] = true
 				end
+				if entry.valueLine then
+					fieldLines[entry.valueLine] = true
+				end
 			end
 			local multiLine = next(fieldLines) ~= nil and next(fieldLines, next(fieldLines)) ~= nil
 			if not hasFunction and not multiLine then
@@ -8252,15 +8453,19 @@ do
 			end
 			local inner = rep("\t", indent + 1)
 			-- * each field on its source line (when it is not earlier than the code around it)
-			local marks = {}
+			local marks, valueMarks = {}, {}
 			local floor = self.ctx.lineFloor
 			for n, entry in e.entries do
 				if entry.line and (not floor or entry.line >= floor) then
 					marks[n] = "\1" .. entry.line .. "\2"
 					floor = entry.line
+					if entry.valueLine and entry.valueLine > entry.line and entry.key then
+						valueMarks[n] = "\1" .. entry.valueLine .. "\2"
+						floor = entry.valueLine
+					end
 				end
 			end
-			local parts = render(indent + 1)
+			local parts = render(indent + 1, valueMarks)
 			local lines = {}
 			for n, part in parts do
 				lines[n] = (marks[n] or "") .. inner .. part .. ","
@@ -8276,6 +8481,7 @@ do
 			for n, cap in e.caps do
 				upnames[n] = type(cap) == "string" and cap or self:name(cap.w)
 			end
+			self.ctx.upkeysByProto[e.child] = e.capKeys
 			return "function" .. (decompileFunction(self.chunk, e.child, upnames, indent, self.ctx, e.namedByKey, e.hints))
 		end
 		fail("cannot print " .. tostring(k))
@@ -8356,6 +8562,7 @@ do
 					for m, cap in v1.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
+					self.ctx.upkeysByProto[v1.child] = v1.capKeys
 					-- * a method: called with `:` somewhere in the script, or stored in a class table
 					local methodHint
 					local key = t1.k == "index" and t1.key.str
@@ -8378,12 +8585,14 @@ do
 					for m, cap in v.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
+					self.ctx.upkeysByProto[v.child] = v.capKeys
 					out[#out + 1] = tab .. "local function " .. targets[1] .. (decompileFunction(self.chunk, v.child, upnames, indent, self.ctx, true, v.hints))
 				elseif st.isLocal and #st.targets == 1 and v1.k == "closure" and self.chunk.protos[v1.child].debugname then
 					local upnames = {}
 					for m, cap in v1.caps do
 						upnames[m] = type(cap) == "string" and cap or self:name(cap.w)
 					end
+					self.ctx.upkeysByProto[v1.child] = v1.capKeys
 					out[#out + 1] = tab .. "local function " .. targets[1] .. (decompileFunction(self.chunk, v1.child, upnames, indent, self.ctx, true, v1.hints))
 				elseif st.isLocal and #st.targets == 1 and #st.values == 1 and v1.k == "const" and v1.text == "nil" then
 					out[#out + 1] = tab .. "local " .. targets[1]
@@ -8521,8 +8730,20 @@ do
 		local A = analyze(chunk, p)
 		A.conservative = noSplit
 		A.info = info or {}
+		for _, w in A.webs do
+			if w.crossTemp then
+				if noSplit then
+					w.tempish, w.temp, w.crossTemp = false, false, nil
+				else
+					A.info.usedNew = true
+				end
+			end
+		end
+		if noSplit then
+			table.clear(A.crossSpans)
+		end
 		local ast = structure(A)
-		local irCtx = { upnames = upnames, globals = ctx.globals, chunk = chunk }
+		local irCtx = { upnames = upnames, globals = ctx.globals, chunk = chunk, protoId = protoId, upkeys = ctx.upkeysByProto[protoId] }
 		-- * this function and the ones it is written in
 		local enclosing = {}
 		local q = protoId
@@ -8584,7 +8805,7 @@ do
 		for n = 2, #A.seq do
 			local ins, prev = A.seq[n], A.seq[n - 1]
 			local l, pl = irCtx.ownLine(ins.pc), irCtx.ownLine(prev.pc)
-			if ins.op == OP.RETURN and ins.b == 1 and n < #A.seq and l and pl and l <= pl then
+			if ins.op == OP.RETURN and ins.b >= 1 and n < #A.seq and l and pl and l <= pl then
 				A.copiedReturn[ins] = true
 			end
 		end
@@ -8601,15 +8822,28 @@ do
 				local st = stmts[i]
 				local tb = st.k == "if" and not st.elseB and st.thenB.stmts
 				local ret = tb and tb[#tb]
-				if not noSplit and ret and ret.k == "return" and #ret.values == 0 and ret.copiedReturn then
+				-- * a copied `return x`: the function's own `return x` is its last statement and stays
+				local final = stmts[#stmts]
+				local keepFinal = false
+				if ret and ret.k == "return" and #ret.values > 0 and final and final ~= st and final.k == "return" and #final.values == #ret.values then
+					keepFinal = true
+					for n, v in ret.values do
+						local f = final.values[n]
+						if not ((v.k == "var" and f.k == "var" and v.w == f.w) or (v.k == "const" and f.k == "const" and v.text == f.text)) then
+							keepFinal = false
+						end
+					end
+				end
+				if not noSplit and ret and ret.k == "return" and (#ret.values == 0 or keepFinal) and ret.copiedReturn then
 					A.info.usedNew = true
 					remove(tb)
 					local rest = {}
-					for n = i + 1, #stmts do
+					local last = keepFinal and #stmts - 1 or #stmts
+					for n = i + 1, last do
 						rest[#rest + 1] = stmts[n]
 					end
-					for n = #stmts, i + 1, -1 do
-						stmts[n] = nil
+					for n = last, i + 1, -1 do
+						remove(stmts, n)
 					end
 					st.elseB = { stmts = rest, parent = root, depth = 1 }
 					if #tb == 0 then
@@ -8867,13 +9101,23 @@ do
 	-- * decompiles a whole script; returns source text and stats.
 	-- * options.scriptName (optional) names the module's main table after the script.
 	-- * options.matchLines (default true) puts statements on their original line numbers.
+	local decompileOnce
 	function BetterDecompiler.decompile(chunk, options)
+		local t0 = os.clock()
+		local body, ctx = decompileOnce(chunk, options, nil)
+		if next(ctx.upFacts) and os.clock() - t0 < 3 then
+			return decompileOnce(chunk, options, ctx.upFacts)
+		end
+		return body, ctx
+	end
+	function decompileOnce(chunk, options, upFactsPrev)
 		local allGlobals, namecalls, dotReads = scanChunk(chunk)
 		local lineOwner, protoParent = lineOwners(chunk)
 		local ctx = {
 			globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {},
 			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {}, outerNames = {},
 			lineOwner = lineOwner, protoParent = protoParent,
+			upkeysByProto = {}, upFacts = {}, upFactsPrev = upFactsPrev,
 		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
@@ -11889,7 +12133,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-08a " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
+	local CACHE_VERSION = "2026-10-08c " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
