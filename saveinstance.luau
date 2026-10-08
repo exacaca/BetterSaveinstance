@@ -3013,6 +3013,7 @@ do
 		[OP.JUMPIFNOTEQ] = "~=", [OP.JUMPIFNOTLE] = "<=", [OP.JUMPIFNOTLT] = "<",
 	}
 	local NEGATED_COMPARE = { [OP.JUMPIFNOTLE] = true, [OP.JUMPIFNOTLT] = true }
+	local MIRRORED_COMPARE = { ["<"] = ">", ["<="] = ">=", ["=="] = "==", ["~="] = "~=" }
 	local UNCONDITIONAL = { [OP.JUMP] = true, [OP.JUMPBACK] = true, [OP.JUMPX] = true }
 	local FORGPREPS = { [OP.FORGPREP] = true, [OP.FORGPREP_INEXT] = true, [OP.FORGPREP_NEXT] = true }
 	local NOOPS = {
@@ -3104,12 +3105,1221 @@ do
 	end
 
 	--------------------------------------------------------------------------
+	-- inlined calls: -O2 copies the body of a local function into the functions that call it,
+	-- with the callee's line numbers. Each copy is matched instruction by instruction against the
+	-- callee's own code; a copy that matches exactly is written back as a call to that function.
+	--------------------------------------------------------------------------
+	-- * registers an instruction reads and writes, constants it names, other fields that must be equal
+	local function insShape(ins, p)
+		local op, a, b, c = ins.op, ins.a, ins.b, ins.c
+		local U, D, raw, ks = {}, {}, {}, {}
+		local up, child, target
+		local function range(t, from, to)
+			for r = from, to do
+				t[#t + 1] = r
+			end
+		end
+		if op == OP.LOADNIL then
+			D = { a }
+		elseif op == OP.LOADB then
+			D, raw = { a }, { b, c }
+			if c ~= 0 then
+				target = ins.pc + 1 + c
+			end
+		elseif op == OP.LOADN then
+			D, raw = { a }, { ins.d }
+		elseif op == OP.LOADK then
+			D, ks = { a }, { ins.d }
+		elseif op == OP.LOADKX then
+			D, ks = { a }, { ins.aux }
+		elseif op == OP.MOVE then
+			U, D = { b }, { a }
+		elseif op == OP.GETGLOBAL then
+			D, ks = { a }, { ins.aux }
+		elseif op == OP.SETGLOBAL then
+			U, ks = { a }, { ins.aux }
+		elseif op == OP.GETUPVAL then
+			D, up = { a }, b
+		elseif op == OP.SETUPVAL then
+			U, up = { a }, b
+		elseif op == OP.CLOSEUPVALS then
+			-- * the level depends on the frame: not compared
+		elseif op == OP.GETIMPORT then
+			D, ks = { a }, { ins.d }
+		elseif op == OP.GETTABLE then
+			U, D = { b, c }, { a }
+		elseif op == OP.SETTABLE then
+			U = { a, b, c }
+		elseif op == OP.GETTABLEKS then
+			U, D, ks = { b }, { a }, { ins.aux }
+		elseif op == OP.SETTABLEKS then
+			U, ks = { a, b }, { ins.aux }
+		elseif op == OP.GETTABLEN then
+			U, D, raw = { b }, { a }, { c }
+		elseif op == OP.SETTABLEN then
+			U, raw = { a, b }, { c }
+		elseif op == OP.NEWCLOSURE then
+			D, child = { a }, p.p[ins.d]
+		elseif op == OP.DUPCLOSURE then
+			local k = p.k[ins.d]
+			D, child = { a }, k and k.t == "closure" and k.v or -1
+		elseif op == OP.NAMECALL then
+			U, D, ks = { b }, { a, a + 1 }, { ins.aux }
+		elseif op == OP.CALL then
+			raw = { b, c }
+			if b > 0 then
+				range(U, a, a + b - 1)
+			else
+				U = { a }
+			end
+			if c > 1 then
+				range(D, a, a + c - 2)
+			elseif c == 0 then
+				D = { a }
+			end
+		elseif op == OP.RETURN then
+			return nil
+		elseif op == OP.JUMP or op == OP.JUMPBACK then
+			target = ins.pc + 1 + ins.d
+		elseif op == OP.JUMPX then
+			target = ins.pc + 1 + ins.e
+		elseif op == OP.JUMPIF or op == OP.JUMPIFNOT then
+			U, target = { a }, ins.pc + 1 + ins.d
+		elseif TWO_REG_COMPARE[op] then
+			U, target = { a, ins.aux }, ins.pc + 1 + ins.d
+		elseif ARITH[op] or op == OP.AND or op == OP.OR then
+			U, D = { b, c }, { a }
+		elseif ARITHK[op] or op == OP.ANDK or op == OP.ORK then
+			U, D, ks = { b }, { a }, { c }
+		elseif op == OP.SUBRK or op == OP.DIVRK then
+			U, D, ks = { c }, { a }, { b }
+		elseif op == OP.CONCAT then
+			range(U, b, c)
+			D = { a }
+		elseif op == OP.NOT or op == OP.MINUS or op == OP.LENGTH then
+			U, D = { b }, { a }
+		elseif op == OP.NEWTABLE then
+			D, raw = { a }, { b, ins.aux }
+		elseif op == OP.DUPTABLE then
+			D, ks = { a }, { ins.d }
+		elseif op == OP.SETLIST then
+			U, raw = { a }, { c, ins.aux }
+			if c > 0 then
+				range(U, b, b + c - 2)
+			else
+				U[2] = b
+			end
+		elseif op == OP.FORNPREP or op == OP.FORNLOOP or FORGPREPS[op] then
+			U, target = { a, a + 1, a + 2 }, ins.pc + 1 + ins.d
+		elseif op == OP.FORGLOOP then
+			U, target, raw = { a, a + 1, a + 2 }, ins.pc + 1 + ins.d, { ins.aux }
+			range(D, a + 3, a + 2 + band(ins.aux, 0xFF))
+		elseif op == OP.FASTCALL or op == OP.FASTCALL1 or op == OP.FASTCALL2 or op == OP.FASTCALL3 then
+			raw = { a, c }
+		elseif op == OP.FASTCALL2K then
+			raw, ks = { a, c }, { ins.aux }
+		elseif op == OP.JUMPXEQKNIL or op == OP.JUMPXEQKB then
+			U, raw, target = { a }, { ins.aux }, ins.pc + 1 + ins.d
+		elseif op == OP.JUMPXEQKN or op == OP.JUMPXEQKS then
+			U, raw, ks, target = { a }, { band(ins.aux, 0x80000000) }, { band(ins.aux, 0xFFFFFF) }, ins.pc + 1 + ins.d
+		elseif op == OP.NOP or op == OP.BREAK or op == OP.COVERAGE or op == OP.NATIVECALL or op == OP.CAPTURE then
+			-- * nothing (captures are compared with their closure)
+		else
+			return nil -- * varargs and anything unusual: not matched
+		end
+		return { U = U, D = D, raw = raw, ks = ks, up = up, child = child, target = target }
+	end
+
+	-- * the same constant in two functions' constant tables
+	local function constSame(p1, i1, p2, i2, depth)
+		local k1, k2 = p1.k[i1], p2.k[i2]
+		if not k1 or not k2 or k1.t ~= k2.t then
+			return false
+		end
+		local t = k1.t
+		if t == "nil" then
+			return true
+		elseif t == "boolean" or t == "number" or t == "string" or t == "closure" then
+			return k1.v == k2.v or (t == "number" and k1.v ~= k1.v and k2.v ~= k2.v)
+		elseif t == "import" then
+			local n1, n2 = rshift(k1.v, 30), rshift(k2.v, 30)
+			if n1 ~= n2 then
+				return false
+			end
+			for n = 1, n1 do
+				local shift = 30 - 10 * n
+				if not constSame(p1, band(rshift(k1.v, shift), 1023), p2, band(rshift(k2.v, shift), 1023), (depth or 0) + 1) then
+					return false
+				end
+			end
+			return true
+		elseif t == "table" then
+			if #k1.v ~= #k2.v or (depth or 0) > 2 then
+				return false
+			end
+			for n, key in k1.v do
+				if not constSame(p1, key, p2, k2.v[n], (depth or 0) + 1) then
+					return false
+				end
+				-- * v7 templates: a constant value for the key, by index into each function's own table
+				local v1, v2 = k1.vals and k1.vals[n] or -1, k2.vals and k2.vals[n] or -1
+				if (v1 < 0) ~= (v2 < 0) or (v1 >= 0 and not constSame(p1, v1, p2, v2, (depth or 0) + 1)) then
+					return false
+				end
+			end
+			return true
+		elseif t == "vector" then
+			for n = 1, 4 do
+				if k1.v[n] ~= k2.v[n] then
+					return false
+				end
+			end
+			return true
+		end
+		return false
+	end
+
+	local CONST_LOAD = { [OP.LOADNIL] = true, [OP.LOADB] = true, [OP.LOADN] = true, [OP.LOADK] = true, [OP.LOADKX] = true }
+	local PRIMITIVE = { ["nil"] = true, boolean = true, number = true, string = true }
+
+	-- * a constant of F: { t, v, idx = constant index when it comes from the constant table }
+	local function kConst(fp, idx)
+		local k = fp.k[idx]
+		return k and PRIMITIVE[k.t] and { t = k.t, v = k.v, idx = idx } or nil
+	end
+	local function loadConst(fp, f)
+		local op = f.op
+		if op == OP.LOADNIL then
+			return { t = "nil" }
+		elseif op == OP.LOADB and f.c == 0 then
+			return { t = "boolean", v = f.b ~= 0 }
+		elseif op == OP.LOADN then
+			return { t = "number", v = f.d }
+		elseif op == OP.LOADK then
+			return kConst(fp, f.d)
+		elseif op == OP.LOADKX then
+			return kConst(fp, f.aux)
+		end
+		return nil
+	end
+	local function constEq(x, y)
+		return x ~= nil and y ~= nil and x.t == y.t and (x.t == "nil" or x.v == y.v)
+	end
+	-- * the same operation with a register operand (in C) and with a constant (in F)
+	local ARITH_TO_K = {
+		[OP.ADD] = OP.ADDK, [OP.SUB] = OP.SUBK, [OP.MUL] = OP.MULK, [OP.DIV] = OP.DIVK, [OP.MOD] = OP.MODK,
+		[OP.POW] = OP.POWK, [OP.IDIV] = OP.IDIVK, [OP.AND] = OP.ANDK, [OP.OR] = OP.ORK,
+	}
+
+	-- * Match the code of function C against F's instructions from index `fi`. Returns the region
+	-- * (where it ends, the arguments, the results) or nil.
+	local function matchInlined(cp, cIns, fp, fIns, fi0, fByPc)
+		local Mr, Mu = {}, {} -- * C register -> F register (or { up = C upvalue } / { const = F instruction })
+		local params, paramDone = {}, {}
+		local fWritten = {}
+		local pcMap, jumps, returns = {}, {}, {}
+		local targetSet = {}
+		local function fpcAfter(q)
+			return fIns[q] and fIns[q].pc or fp.sizecode
+		end
+		local pendingMultret = nil
+		local fi = fi0
+		local nparams = cp.numparams
+		-- * C reads register r where F reads register x
+		local function useReg(r, x)
+			local m = Mr[r]
+			if type(m) == "number" then
+				return m == x
+			elseif m == nil then
+				if r < nparams and not paramDone[r] then
+					if fWritten[x] then
+						return false
+					end
+					paramDone[r] = true
+					params[r] = { reg = x }
+					Mr[r] = x
+					return true
+				end
+				return false
+			elseif m.up ~= nil then
+				local u = Mu[m.up]
+				if u == nil then
+					if fWritten[x] then
+						return false
+					end
+					Mu[m.up] = { reg = x }
+					return true
+				end
+				return u.reg == x
+			end
+			return false
+		end
+		local fConstTemp = {}
+		local function defReg(r, x)
+			if r < nparams then
+				paramDone[r] = true
+			end
+			Mr[r] = x
+			fWritten[x] = true
+			fConstTemp[x] = nil
+		end
+		local function bindUp(u, val)
+			local cur = Mu[u]
+			if cur == nil then
+				Mu[u] = val
+				return true
+			end
+			return cur.reg == val.reg and cur.up == val.up
+		end
+		local function lineOk(ci, fpc)
+			local l1 = cp.lineOf and cp.lineOf(ci.pc)
+			local l2 = fp.lineOf and fp.lineOf(fpc)
+			return l1 == nil or l2 == nil or l1 == l2
+		end
+		-- * the F instruction gives C register r's value: { reg } / { up } / { const }
+		local function valueOf(r)
+			local m = Mr[r]
+			if type(m) == "number" then
+				return { reg = m }
+			elseif m == nil then
+				if r < nparams and not paramDone[r] then
+					return { param = r }
+				end
+				return nil
+			elseif m.up ~= nil then
+				local u = Mu[m.up]
+				if u then
+					return u
+				end
+				return { pendingUp = m.up }
+			elseif m.const or m.skipped then
+				return m
+			end
+			return nil
+		end
+		-- * F instruction `f` puts that value in a register
+		local function loadsValue(f, v)
+			if not v then
+				return false
+			end
+			if f.op == OP.MOVE then
+				if v.reg ~= nil then
+					return f.b == v.reg
+				elseif v.param ~= nil then
+					if fWritten[f.b] then
+						return false
+					end
+					paramDone[v.param] = true
+					params[v.param] = { reg = f.b }
+					Mr[v.param] = f.b
+					return true
+				elseif v.pendingUp ~= nil then
+					if fWritten[f.b] then
+						return false
+					end
+					Mu[v.pendingUp] = { reg = f.b }
+					return true
+				end
+			elseif f.op == OP.GETUPVAL then
+				if v.up ~= nil then
+					return f.b == v.up
+				elseif v.pendingUp ~= nil then
+					Mu[v.pendingUp] = { up = f.b }
+					return true
+				end
+			elseif CONST_LOAD[f.op] and v.param ~= nil then
+				local desc = loadConst(fp, f)
+				if not desc then
+					return false
+				end
+				paramDone[v.param] = true
+				params[v.param] = { const = desc }
+				Mr[v.param] = { const = desc }
+				return true
+			elseif CONST_LOAD[f.op] and v.const then
+				return constEq(v.const, loadConst(fp, f))
+			end
+			return false
+		end
+		-- * C register r (a parameter) where F has the constant `desc`
+		local function bindConst(r, desc)
+			if not desc then
+				return false
+			end
+			local m = Mr[r]
+			if m == nil and r < nparams and not paramDone[r] then
+				paramDone[r] = true
+				params[r] = { const = desc }
+				Mr[r] = { const = desc }
+				return true
+			end
+			return type(m) == "table" and m.const ~= nil and constEq(m.const, desc)
+		end
+		local function constSide(r)
+			local m = Mr[r]
+			return (m == nil and r < nparams and not paramDone[r]) or (type(m) == "table" and m.const ~= nil)
+		end
+		-- * constants F loaded into a register where C reads a parameter
+		local baseUseReg = useReg
+		useReg = function(r, x)
+			local desc = fConstTemp[x]
+			if desc and constSide(r) then
+				return bindConst(r, desc)
+			end
+			return baseUseReg(r, x)
+		end
+		local cByPc = {}
+		for _, x in cIns do
+			cByPc[x.pc] = x
+		end
+		-- * C's instruction with a parameter operand, F's with that parameter's constant
+		local function variantMatch(c, f)
+			local cop, fop = c.op, f.op
+			if (cop == OP.JUMPIFEQ or cop == OP.JUMPIFNOTEQ)
+				and (fop == OP.JUMPXEQKNIL or fop == OP.JUMPXEQKB or fop == OP.JUMPXEQKN or fop == OP.JUMPXEQKS)
+			then
+				local negated = band(f.aux, 0x80000000) ~= 0
+				if negated ~= (cop == OP.JUMPIFNOTEQ) then
+					return false
+				end
+				local desc
+				if fop == OP.JUMPXEQKNIL then
+					desc = { t = "nil" }
+				elseif fop == OP.JUMPXEQKB then
+					desc = { t = "boolean", v = band(f.aux, 1) ~= 0 }
+				else
+					desc = kConst(fp, band(f.aux, 0xFFFFFF))
+				end
+				local regSide, kSide = c.a, c.aux
+				if not constSide(kSide) then
+					regSide, kSide = c.aux, c.a
+				end
+				if not constSide(kSide) or not bindConst(kSide, desc) or not useReg(regSide, f.a) then
+					return false
+				end
+				jumps[#jumps + 1] = { c = c.pc + 1 + c.d, f = f.pc + 1 + f.d }
+				return true
+			elseif cop == OP.GETTABLE and (fop == OP.GETTABLEKS or fop == OP.GETTABLEN) then
+				local desc = fop == OP.GETTABLEKS and kConst(fp, f.aux) or { t = "number", v = f.c + 1 }
+				if not constSide(c.c) or not bindConst(c.c, desc) or not useReg(c.b, f.b) then
+					return false
+				end
+				defReg(c.a, f.a)
+				return true
+			elseif cop == OP.SETTABLE and (fop == OP.SETTABLEKS or fop == OP.SETTABLEN) then
+				local desc = fop == OP.SETTABLEKS and kConst(fp, f.aux) or { t = "number", v = f.c + 1 }
+				return constSide(c.c) and bindConst(c.c, desc) and useReg(c.a, f.a) and useReg(c.b, f.b)
+			elseif ARITH_TO_K[cop] == fop then
+				if not constSide(c.c) or not bindConst(c.c, kConst(fp, f.c)) or not useReg(c.b, f.b) then
+					return false
+				end
+				defReg(c.a, f.a)
+				return true
+			elseif (cop == OP.SUB and fop == OP.SUBRK) or (cop == OP.DIV and fop == OP.DIVRK) then
+				if not constSide(c.b) or not bindConst(c.b, kConst(fp, f.b)) or not useReg(c.c, f.c) then
+					return false
+				end
+				defReg(c.a, f.a)
+				return true
+			elseif cop == OP.FASTCALL2 and fop == OP.FASTCALL2K then
+				return c.a == f.a and c.c == f.c
+			end
+			return false
+		end
+
+		local ci = 1
+		local nC = #cIns
+		while ci <= nC do
+			local c = cIns[ci]
+			local f = fIns[fi]
+			local fpc = f and f.pc or fp.sizecode
+			pcMap[c.pc] = pcMap[c.pc] or fpc
+			local op = c.op
+			if op == OP.RETURN then
+				-- * `return values`: in the copy, the values go to the call's targets, then a jump to its end
+				local n, multBase = c.b - 1, nil
+				if c.b == 0 then
+					-- * `return f()`: as many values as the call in the copy gives
+					if not pendingMultret or pendingMultret.c ~= c.a then
+						return nil
+					end
+					n, multBase = pendingMultret.n, pendingMultret.f
+				end
+				pendingMultret = nil
+				local ret = { targets = {}, startPc = fpc, cins = c }
+				for i = 0, n - 1 do
+					local v = multBase and { reg = multBase + i } or valueOf(c.a + i)
+					local isUpReg = false
+					if v and v.reg ~= nil then
+						for _, u in Mu do
+							if u.reg == v.reg then
+								isUpReg = true
+							end
+						end
+					end
+					if v and v.skipped then
+						ret.targets[i + 1] = false
+					elseif v and v.reg ~= nil and fWritten[v.reg] and not isUpReg then
+						-- * computed in place, or (a local of the body) moved to the target, which is below
+						-- * every register of the body
+						local g = fIns[fi]
+						if g and g.op == OP.MOVE and g.b == v.reg and g.a < v.reg and lineOk(c, g.pc)
+							and (not fWritten[g.a] or targetSet[g.a])
+						then
+							ret.targets[i + 1] = g.a
+							fWritten[g.a] = true
+							targetSet[g.a] = true
+							fi += 1
+						else
+							ret.targets[i + 1] = v.reg
+							targetSet[v.reg] = true
+						end
+					else
+						local g = fIns[fi]
+						if g and lineOk(c, g.pc) and (g.op == OP.MOVE or g.op == OP.GETUPVAL or CONST_LOAD[g.op])
+							and (not fWritten[g.a] or targetSet[g.a]) and loadsValue(g, v)
+						then
+							ret.targets[i + 1] = g.a
+							fWritten[g.a] = true
+							targetSet[g.a] = true
+							fi += 1
+						elseif v and (v.reg ~= nil or v.up ~= nil or v.param ~= nil or v.pendingUp ~= nil or v.const) then
+							-- * a value with no side effects, not needed: the call's result is not used
+							ret.targets[i + 1] = false
+						else
+							return nil
+						end
+					end
+				end
+				-- * padding with nil, then the jump to the end
+				while fIns[fi] and fIns[fi].op == OP.LOADNIL and ci < nC do
+					ret.targets[#ret.targets + 1] = fIns[fi].a
+					fi += 1
+				end
+				local g = fIns[fi]
+				if ci < nC then
+					if g and g.op == OP.RETURN then
+						-- * the jump to the end, where F returns: the compiler copied that `return` here
+						ret.copied = g
+					elseif not g or not (g.op == OP.JUMP or g.op == OP.JUMPX) then
+						return nil
+					else
+						ret.jump = g
+					end
+					fi += 1
+				end
+				returns[#returns + 1] = ret
+				ci += 1
+				continue
+			end
+			local cs = insShape(c, cp)
+			if not cs then
+				return nil
+			end
+			-- * a pure load whose value only feeds a `return` whose result is not used
+			local function skipToReturn()
+				local j = ci
+				while j <= nC do
+					local cj = cIns[j]
+					if cj.op == OP.RETURN then
+						return true
+					end
+					if not (CONST_LOAD[cj.op] or cj.op == OP.MOVE or cj.op == OP.GETUPVAL) or (cj.op == OP.LOADB and cj.c ~= 0) then
+						return false
+					end
+					j += 1
+				end
+				return false
+			end
+			if op == OP.GETUPVAL then
+				if f and f.op == OP.GETUPVAL and lineOk(c, f.pc) and bindUp(c.b, { up = f.b }) then
+					defReg(c.a, f.a)
+					fi += 1
+				elseif f and f.op == OP.MOVE and lineOk(c, f.pc) and (Mu[c.b] ~= nil or not fWritten[f.b]) and bindUp(c.b, { reg = f.b }) then
+					defReg(c.a, f.a)
+					fi += 1
+				else
+					-- * read straight from F's register (or not needed at all)
+					Mr[c.a] = { up = c.b }
+				end
+				ci += 1
+				continue
+			end
+			if op == OP.SETUPVAL then
+				local m = Mr[c.a]
+				if f and f.op == OP.SETUPVAL and lineOk(c, f.pc) and useReg(c.a, f.a) and bindUp(c.b, { up = f.b }) then
+					fi += 1
+				elseif f and f.op == OP.MOVE and lineOk(c, f.pc) and useReg(c.a, f.b) and bindUp(c.b, { reg = f.a }) then
+					fWritten[f.a] = true
+					fi += 1
+				elseif type(m) == "number" and bindUp(c.b, { reg = m }) then
+					-- * computed straight into F's register
+				else
+					return nil
+				end
+				ci += 1
+				continue
+			end
+			if not f then
+				return nil
+			end
+			-- * C copies a value (a parameter, an upvalue) where F loads it another way
+			if op == OP.MOVE and f.op ~= OP.MOVE and lineOk(c, f.pc) then
+				local v = valueOf(c.b)
+				if v and (f.op == OP.GETUPVAL or CONST_LOAD[f.op]) and loadsValue(f, v) then
+					defReg(c.a, f.a)
+					ci += 1
+					fi += 1
+					continue
+				end
+			end
+			if op == OP.CALL and c.c == 0 and f.op == OP.CALL and f.c ~= 0 and f.b == c.b and lineOk(c, f.pc) then
+				local nextC = cIns[ci + 1]
+				if nextC and nextC.op == OP.RETURN and nextC.b == 0 and nextC.a == c.a and c.b > 0 then
+					local ok = true
+					for r = 0, c.b - 1 do
+						if not useReg(c.a + r, f.a + r) then
+							ok = false
+							break
+						end
+					end
+					if ok then
+						for r = 0, f.c - 2 do
+							fWritten[f.a + r] = true
+							fConstTemp[f.a + r] = nil
+						end
+						pendingMultret = { c = c.a, f = f.a, n = f.c - 1 }
+						ci += 1
+						fi += 1
+						continue
+					end
+				end
+			end
+			local fs = f.op == op and insShape(f, fp)
+			local same = fs and lineOk(c, f.pc) and #cs.U == #fs.U and #cs.D == #fs.D and #cs.raw == #fs.raw and #cs.ks == #fs.ks
+				and cs.child == fs.child and (cs.up == nil) == (fs.up == nil)
+			if same then
+				for n, v in cs.raw do
+					if fs.raw[n] ~= v then
+						same = false
+						break
+					end
+				end
+			end
+			if same then
+				for n, v in cs.ks do
+					if not constSame(cp, v, fp, fs.ks[n]) then
+						same = false
+						break
+					end
+				end
+			end
+			if same then
+				for n, r in cs.U do
+					if not useReg(r, fs.U[n]) then
+						same = false
+						break
+					end
+				end
+			end
+			if not same and f.op ~= op and lineOk(c, f.pc) and variantMatch(c, f) then
+				ci += 1
+				fi += 1
+				continue
+			end
+			if not same and CONST_LOAD[f.op] and f.op ~= op and lineOk(c, f.pc) then
+				local desc = loadConst(fp, f)
+				if desc then
+					fConstTemp[f.a] = desc
+					fWritten[f.a] = true
+					fi += 1
+					continue
+				end
+			end
+			if not same then
+				if (CONST_LOAD[op] or op == OP.MOVE) and skipToReturn() then
+					Mr[c.a] = { skipped = true }
+					if c.a < nparams then
+						paramDone[c.a] = true
+					end
+					ci += 1
+					continue
+				end
+				return nil
+			end
+			for n, r in cs.D do
+				defReg(r, fs.D[n])
+			end
+			-- * a value computed at the top of the stack (a call), then moved to the local it belongs
+			-- * to, where C computed it in that local directly
+			if #cs.D == 1 and not cs.target then
+				local g, nextC = fIns[fi + 1], cIns[ci + 1]
+				if g and g.op == OP.MOVE and g.b == fs.D[1] and g.a ~= g.b and lineOk(c, g.pc) and (not fWritten[g.a] or targetSet[g.a])
+					and not (nextC and nextC.op == OP.MOVE and nextC.b == cs.D[1])
+				then
+					defReg(cs.D[1], g.a)
+					fi += 1
+				end
+			end
+			if cs.target then
+				jumps[#jumps + 1] = { c = cs.target, f = fs.target }
+			end
+			if FORGPREPS[op] then
+				local loop = cByPc[cs.target]
+				if loop and loop.op == OP.FORGLOOP then
+					for j = 3, 2 + band(loop.aux, 0xFF) do
+						defReg(c.a + j, f.a + j)
+					end
+				end
+			end
+			ci += 1
+			fi += 1
+			-- * the captures of a new closure
+			if op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				while cIns[ci] and cIns[ci].op == OP.CAPTURE do
+					local cc, fc = cIns[ci], fIns[fi]
+					if not fc or fc.op ~= OP.CAPTURE then
+						return nil
+					end
+					if cc.a == 2 then
+						if fc.a == 2 then
+							if not bindUp(cc.b, { up = fc.b }) then
+								return nil
+							end
+						elseif not bindUp(cc.b, { reg = fc.b }) then
+							return nil
+						end
+					elseif cc.a ~= fc.a or not useReg(cc.b, fc.b) then
+						return nil
+					end
+					pcMap[cc.pc] = fc.pc
+					ci += 1
+					fi += 1
+				end
+			end
+		end
+		if #returns == 0 or fi == fi0 then
+			return nil -- * a copy is at least one instruction
+		end
+		-- * where the copy ends: where its `return`s jump to (after the nils for a body that ends
+		-- * without `return`, when the call's results are used)
+		-- * a `return` that jumps into the code of the last one (the same values): that one's targets
+		local final = returns[#returns]
+		local function jumpTarget(g)
+			return g.pc + 1 + (g.op == OP.JUMPX and g.e or g.d)
+		end
+		for _, ret in returns do
+			if ret.jump and ret ~= final and jumpTarget(ret.jump) == final.startPc and final.cins.op == OP.RETURN
+				and ret.cins.a == final.cins.a and ret.cins.b == final.cins.b and final.startPc < fpcAfter(fi)
+			then
+				ret.shared = true
+			end
+		end
+		local J = nil
+		for _, ret in returns do
+			if ret.jump and not ret.shared then
+				J = jumpTarget(ret.jump)
+				break
+			end
+		end
+		if not J then
+			-- * only copied `return`s: the end is the `return` they copy, after the nils
+			local copied = nil
+			for _, ret in returns do
+				copied = copied or ret.copied
+			end
+			if copied then
+				local q = fi
+				while fIns[q] and fIns[q].op == OP.LOADNIL do
+					q += 1
+				end
+				local g = fIns[q]
+				if g and g.op == OP.RETURN and g.a == copied.a and g.b == copied.b then
+					J = g.pc
+				end
+			end
+		end
+		if J then
+			local last = returns[#returns]
+			while fIns[fi] and fIns[fi].pc < J and fIns[fi].op == OP.LOADNIL do
+				last.targets[#last.targets + 1] = fIns[fi].a
+				fi += 1
+			end
+		end
+		local E = fIns[fi] and fIns[fi].pc or fp.sizecode
+		-- * a copied `return` must be the one the copy ends at
+		local atEnd = fByPc[E]
+		local function sameAsEnd(g)
+			return g and atEnd and g.op == OP.RETURN and atEnd.op == OP.RETURN and g.a == atEnd.a and g.b == atEnd.b
+		end
+		for _, ret in returns do
+			if ret.copied and not sameAsEnd(ret.copied) then
+				return nil
+			end
+		end
+		for _, ret in returns do
+			if ret.jump and not ret.shared then
+				if jumpTarget(ret.jump) ~= E then
+					return nil
+				end
+			end
+		end
+		for _, ret in returns do
+			if ret.shared then
+				ret.targets = final.targets
+			end
+		end
+		-- * every jump of C has its counterpart in the copy
+		local function canon(pc)
+			for _ = 1, 8 do
+				local g = fByPc[pc]
+				if g and (g.op == OP.JUMP or g.op == OP.JUMPX) and pc < E then
+					pc = g.pc + 1 + (g.op == OP.JUMPX and g.e or g.d)
+				elseif pc < E and sameAsEnd(g) then
+					return E
+				else
+					break
+				end
+			end
+			return pc
+		end
+		for _, j in jumps do
+			local mapped = pcMap[j.c]
+			if mapped == nil or canon(mapped) ~= canon(j.f) then
+				return nil
+			end
+		end
+		return { E = E, params = params, Mu = Mu, nparams = nparams, fWritten = fWritten, returns = returns }
+	end
+
+	-- * is register `reg` read (before it is written) on some path from `pc` in this function?
+	local function readLater(fp, byPc, pc, reg)
+		local seen, stack = {}, { pc }
+		while #stack > 0 do
+			local at = table.remove(stack)
+			if seen[at] or at >= fp.sizecode then
+				continue
+			end
+			seen[at] = true
+			local ins = byPc[at]
+			if not ins then
+				return true
+			end
+			local op = ins.op
+			if op == OP.RETURN then
+				if (ins.b == 0 and reg >= ins.a) or (ins.b > 0 and reg >= ins.a and reg <= ins.a + ins.b - 2) then
+					return true
+				end
+				continue
+			end
+			if op == OP.CAPTURE then
+				if (ins.a == 0 or ins.a == 1) and ins.b == reg then
+					return true
+				end
+				stack[#stack + 1] = ins.next
+				continue
+			end
+			local sh = insShape(ins, fp)
+			if not sh then
+				return true -- * unknown: assume it is read
+			end
+			-- * reads up to the top of the stack
+			if (op == OP.CALL and ins.b == 0 and reg >= ins.a) or (op == OP.SETLIST and ins.c == 0 and reg >= ins.b) then
+				return true
+			end
+			for _, r in sh.U do
+				if r == reg then
+					return true
+				end
+			end
+			local written = false
+			for _, r in sh.D do
+				if r == reg then
+					written = true
+				end
+			end
+			if op == OP.CALL and ins.c == 0 and reg >= ins.a then
+				written = true
+			end
+			if written then
+				continue
+			end
+			local t = sh.target
+			if op == OP.JUMP or op == OP.JUMPX or op == OP.JUMPBACK or FORGPREPS[op] or (op == OP.LOADB and ins.c ~= 0) then
+				stack[#stack + 1] = t
+			else
+				stack[#stack + 1] = ins.next
+				if t then
+					stack[#stack + 1] = t
+				end
+			end
+		end
+		return false
+	end
+
+	-- * the call's results: the registers the copy wrote that are still read after it. They must be
+	-- * the same registers, filled on every path, or the copy is left as it is.
+	local function inlineResults(m, fp, byPc)
+		local upRegs = {}
+		for _, u in m.Mu do
+			if u.reg ~= nil then
+				upRegs[u.reg] = true
+			end
+		end
+		local live = {}
+		for reg in m.fWritten do
+			if not upRegs[reg] and readLater(fp, byPc, m.E, reg) then
+				live[#live + 1] = reg
+			end
+		end
+		if #live == 0 then
+			return 0, nil
+		end
+		table.sort(live)
+		-- * the results start where every `return` puts its first value (`local _, b = f()` reads only
+		-- * the second)
+		local base, top = m.returns[1].targets[1], live[#live]
+		if type(base) ~= "number" or live[1] < base then
+			return nil
+		end
+		for _, ret in m.returns do
+			local t = ret.targets
+			if t[1] ~= base then
+				return nil
+			end
+			for reg = base, top do
+				if t[reg - base + 1] ~= reg then
+					return nil
+				end
+			end
+		end
+		return top - base + 1, base
+	end
+
+	-- * For every function: the copies of other functions in it, written back as calls.
+	-- * plan[protoId] = { regions = { ... } }, virtualUps[protoId] = { callee ids }: upvalues a function
+	-- * gets so it can name a function it only ever called inline.
+	local function planInlines(chunk, lineOwner, realParent)
+		local plan, virtualUps = {}, {}
+		local decoded = {}
+		local function dec(id)
+			local d = decoded[id]
+			if not d then
+				local p = chunk.protos[id]
+				local ok, insns, byPc = pcall(Lifter.decodeProto, chunk, p)
+				d = ok and { insns = insns, byPc = byPc } or { insns = {}, byPc = {} }
+				decoded[id] = d
+			end
+			return d
+		end
+		-- * where each function's closure is created (in its own parent only)
+		local sites = {}
+		for id, p in chunk.protos do
+			if p.p and p.sizecode then
+				for _, ins in dec(id).insns do
+					if ins.op == OP.NEWCLOSURE or ins.op == OP.DUPCLOSURE then
+						local childId
+						if ins.op == OP.NEWCLOSURE then
+							childId = p.p[ins.d]
+						else
+							local k = p.k[ins.d]
+							childId = k and k.t == "closure" and k.v
+						end
+						if childId and realParent[childId] == id then
+							local list = sites[childId]
+							if not list then
+								list = {}
+								sites[childId] = list
+							end
+							list[#list + 1] = ins
+						end
+					end
+				end
+			end
+		end
+		local function site(id)
+			local list = sites[id]
+			return list and #list == 1 and list[1] or nil
+		end
+		-- * the latest write of register r before `pc` in function `id`, if it is the closure of a function
+		local function closureIn(id, r, pc)
+			local found = nil
+			for _, ins in dec(id).insns do
+				if ins.pc >= pc then
+					break
+				end
+				local s = insShape(ins, chunk.protos[id])
+				if s then
+					for _, d in s.D do
+						if d == r then
+							found = s.child
+						end
+					end
+				elseif ins.op == OP.RETURN then
+					-- * nothing written
+				else
+					found = nil
+				end
+			end
+			return found
+		end
+		local function resolveUp(id, n, depth)
+			if depth > 20 then
+				return nil
+			end
+			local parentId = realParent[id]
+			local s = parentId and site(id)
+			if not s then
+				return nil
+			end
+			-- * the captures follow the closure instruction
+			local d = dec(parentId)
+			local cap = d.byPc[s.pc]
+			local capIns = cap
+			for _ = 0, n do
+				capIns = capIns and d.byPc[capIns.next]
+			end
+			if not capIns or capIns.op ~= OP.CAPTURE then
+				return nil
+			end
+			if capIns.a == 2 then
+				return resolveUp(parentId, capIns.b, depth + 1)
+			end
+			return closureIn(parentId, capIns.b, s.pc)
+		end
+		local function enclosingOf(id)
+			local set = {}
+			local q = id
+			while q ~= nil and not set[q] do
+				set[q] = true
+				q = realParent[q]
+			end
+			return set
+		end
+		local function virtualIndex(id, calleeId)
+			local list = virtualUps[id]
+			if not list then
+				list = {}
+				virtualUps[id] = list
+			end
+			for n, c in list do
+				if c == calleeId then
+					return chunk.protos[id].nups + n - 1
+				end
+			end
+			list[#list + 1] = calleeId
+			return chunk.protos[id].nups + #list - 1
+		end
+		-- * how F reaches the closure of C: its register, its upvalue, or a new upvalue
+		local function reach(F, C, s)
+			local H = realParent[C]
+			if H == F then
+				local cs = site(C)
+				if not cs or cs.pc >= s then
+					return nil
+				end
+				if closureIn(F, cs.a, s) ~= C then
+					return nil
+				end
+				return { reg = cs.a }
+			end
+			for n = 0, chunk.protos[F].nups - 1 do
+				if resolveUp(F, n, 0) == C then
+					return { up = n }
+				end
+			end
+			-- * not captured: every function from H down to F gets one more upvalue
+			local cs = site(C)
+			if not cs or H == nil then
+				return nil
+			end
+			local path = {}
+			local q = F
+			while q ~= nil and q ~= H do
+				path[#path + 1] = q
+				q = realParent[q]
+				if #path > 30 then
+					return nil
+				end
+			end
+			if q ~= H then
+				return nil
+			end
+			for _, id in path do
+				if not site(id) then
+					return nil
+				end
+			end
+			-- * the closure exists, unchanged, where the outermost of them is created
+			local top = path[#path]
+			local topSite = site(top)
+			if topSite.pc <= cs.pc or closureIn(H, cs.a, topSite.pc) ~= C then
+				return nil
+			end
+			for _, id in path do
+				virtualIndex(id, C)
+			end
+			return { up = virtualIndex(F, C) }
+		end
+
+		-- * functions by the lines their code starts with
+		local startsAt = {}
+		for id, p in chunk.protos do
+			if p.lineOf and p.sizecode and not p.isvararg then
+				local seenLine = {}
+				for n, ins in dec(id).insns do
+					if n > 4 then
+						break
+					end
+					local l = p.lineOf(ins.pc)
+					if l and not seenLine[l] then
+						seenLine[l] = true
+						local list = startsAt[l]
+						if not list then
+							list = {}
+							startsAt[l] = list
+						end
+						list[#list + 1] = id
+					end
+				end
+			end
+		end
+		for F, fp in chunk.protos do
+			if not (fp.lineOf and fp.sizecode) then
+				continue
+			end
+			local enclosing = enclosingOf(F)
+			local d = dec(F)
+			local insns = d.insns
+			local regions = {}
+			local i = 1
+			while i <= #insns do
+				local ins = insns[i]
+				local line = fp.lineOf(ins.pc)
+				local o = line and lineOwner[line]
+				local C = nil
+				if o ~= nil and not enclosing[o] then
+					C = o
+					while realParent[C] ~= nil and not enclosing[realParent[C]] do
+						C = realParent[C]
+					end
+				end
+				local region = nil
+				-- * the function whose lines these are, and any whose code starts on this line (a body
+				-- * of one line has no lines of its own)
+				local cands = { C }
+				for _, other in startsAt[line] or {} do
+					if other ~= C and other ~= F and not enclosing[other] then
+						cands[#cands + 1] = other
+					end
+				end
+				if #cands > 0 then
+					for _, cand in cands do
+						local cp = chunk.protos[cand]
+						if cp and not cp.isvararg and cp.sizecode and not enclosing[cand] then
+							local m = matchInlined(cp, dec(cand).insns, fp, insns, i, d.byPc)
+							if m and (region == nil or m.E > region.E) then
+								local k, base = inlineResults(m, fp, d.byPc)
+								local fn = k and reach(F, cand, ins.pc)
+								if fn then
+									m.s, m.callee, m.fn, m.k, m.base = ins.pc, cand, fn, k, base
+									-- * a function that always returns exactly one value: no `(...)` needed
+									local single = true
+									for _, x in dec(cand).insns do
+										if x.op == OP.RETURN and x.b ~= 2 then
+											single = false
+										end
+									end
+									m.single = single and k == 1
+									region = m
+								end
+							end
+						end
+					end
+				end
+				if region and region.E > ins.pc then
+					regions[#regions + 1] = region
+					while i <= #insns and insns[i].pc < region.E do
+						i += 1
+					end
+				else
+					i += 1
+				end
+			end
+			-- * nothing may jump into the middle of a copy
+			if #regions > 0 then
+				local kept = {}
+				for _, r in regions do
+					local ok = true
+					for _, ins in insns do
+						local s = insShape(ins, fp)
+						local t = s and s.target
+						if t and t > r.s and t < r.E and (ins.pc < r.s or ins.pc >= r.E) then
+							ok = false
+							break
+						end
+					end
+					if ok then
+						kept[#kept + 1] = r
+					end
+				end
+				if #kept > 0 then
+					plan[F] = { regions = kept }
+				end
+			end
+		end
+		-- * for the functions that get new upvalues: where the callee's closure is
+		local closureReg = {}
+		for _, list in virtualUps do
+			for _, calleeId in list do
+				local cs = site(calleeId)
+				closureReg[calleeId] = cs and cs.a
+			end
+		end
+		local function lookup(id, calleeId)
+			for n, c in virtualUps[id] or {} do
+				if c == calleeId then
+					return chunk.protos[id].nups + n - 1
+				end
+			end
+			error("BetterDecompiler: no upvalue for an inlined function", 0)
+		end
+		return plan, virtualUps, closureReg, lookup
+	end
+
+	--------------------------------------------------------------------------
 	-- analysis: jumps, closures, boolean materialisation, multret, data flow
 	--------------------------------------------------------------------------
-	local function analyze(chunk, p)
+	local function analyze(chunk, p, noInline)
 		local insns, byPc = Lifter.decodeProto(chunk, p)
 		local K = p.k
 		local size = p.sizecode
+		local info = chunk.inlineInfo
+		-- * inlined copies of other functions: one call instruction each
+		local inlinedHere = false
+		local plan = not noInline and info and info.plan[p.id]
+		if plan then
+			for _, r in plan.regions do
+				local pc = r.s
+				while pc < r.E do
+					local ins = byPc[pc]
+					byPc[pc] = nil
+					pc = ins.next
+				end
+				byPc[r.s] = {
+					pc = r.s, op = OP.CALL, a = r.base or 0, b = 1, c = r.k + 1, d = 0, e = 0,
+					next = r.E, size = r.E - r.s, inlined = r,
+				}
+			end
+			insns = {}
+			local pc = 0
+			while pc < size do
+				local ins = byPc[pc]
+				insns[#insns + 1] = ins
+				pc = ins.next
+			end
+			inlinedHere = true
+		end
 
 		for i, ins in insns do
 			ins.index = i
@@ -3145,6 +4355,16 @@ do
 					cap.consumed = true
 					ins.captures[n] = cap
 					cpc = cap.next
+				end
+				local virtual = info and info.virtualUps[childId]
+				if virtual and info.realParent[childId] == p.id then
+					for _, calleeId in virtual do
+						if info.realParent[calleeId] == p.id then
+							insert(ins.captures, { op = OP.CAPTURE, a = 0, b = info.closureReg[calleeId], virtual = true })
+						else
+							insert(ins.captures, { op = OP.CAPTURE, a = 2, b = info.virtualIndex(p.id, calleeId), virtual = true })
+						end
+					end
 				end
 			end
 		end
@@ -3339,7 +4559,21 @@ do
 			local function def(r)
 				defs[#defs + 1] = r
 			end
-			if ins.boolmat then
+			if ins.inlined then
+				local r = ins.inlined
+				if r.fn.reg then
+					use(r.fn.reg)
+				end
+				for i = 0, r.nparams - 1 do
+					local arg = r.params[i]
+					if arg and arg.reg then
+						use(arg.reg)
+					end
+				end
+				for n = 0, r.k - 1 do
+					def(r.base + n)
+				end
+			elseif ins.boolmat then
 				use(a)
 				if TWO_REG_COMPARE[op] then
 					use(ins.aux)
@@ -3894,7 +5128,7 @@ do
 						ok = false
 						break
 					end
-					for _, d in i2.defs do
+					for _, d in i2.defs or {} do
 						if d <= r then
 							ok = false
 						end
@@ -4014,7 +5248,7 @@ do
 		return {
 			p = p, K = K, seq = seq, byPc = byPc, prevOf = prevOf, incoming = incoming, blocks = blocks, crossSpans = crossSpans,
 			blockAt = blockAt, webOf = webOf, webs = webs, defInfo = defInfo, liveIn = liveIn,
-			openWebsAt = openWebsAt, backSources = backSources, paramDefs = paramDefs,
+			openWebsAt = openWebsAt, backSources = backSources, paramDefs = paramDefs, inlinedHere = inlinedHere,
 		}
 	end
 
@@ -5342,6 +6576,10 @@ do
 			if k.t == "nil" then
 				return E("const", { text = "nil" })
 			end
+			if k.t == "number" and (k.v == math.huge or k.v == -math.huge) then
+				ctx.globals.math = true
+				return E("const", { text = k.v > 0 and "math.huge" or "-math.huge", value = k })
+			end
 			return E("const", { text = Lifter.constText(k), value = k })
 		end
 		local function K_(i)
@@ -5569,7 +6807,13 @@ do
 			elseif op == OP.JUMPIFNOT then
 				taken = E("not", { e = ex[1] })
 			elseif TWO_REG_COMPARE[op] then
-				local cmp = E("binop", { op = TWO_REG_COMPARE[op], l = ex[1], r = ex[2] })
+				local l, r, cop = ex[1], ex[2], TWO_REG_COMPARE[op]
+				-- * `x > y` compiles to `y < x` with x computed first: when both sides are computed for this
+				-- * comparison, the order they were computed in is the order they were written in
+				if ins.aux < ins.a and l.k ~= "var" and r.k ~= "var" then
+					l, r, cop = r, l, MIRRORED_COMPARE[cop]
+				end
+				local cmp = E("binop", { op = cop, l = l, r = r })
 				taken = NEGATED_COMPARE[op] and E("not", { e = cmp }) or cmp
 			else
 				local aux = ins.aux
@@ -5849,6 +7093,68 @@ do
 				end
 			elseif op == OP.NAMECALL then
 				pushStmt(block, { k = "namecall", ins = ins })
+			elseif op == OP.CALL and ins.inlined then
+				-- * a copy of another function's body: the call it was
+				local r = ins.inlined
+				local last = -1
+				for i = 0, r.nparams - 1 do
+					if r.params[i] then
+						last = i
+					end
+				end
+				local regs = {}
+				if r.fn.reg then
+					regs[1] = r.fn.reg
+				end
+				for i = 0, last do
+					local arg = r.params[i]
+					if arg and arg.reg then
+						regs[#regs + 1] = arg.reg
+					end
+				end
+				local ex = takeOperands(block, ins, regs)
+				local j = 0
+				local fn
+				if r.fn.reg then
+					j = 1
+					fn = ex[1]
+				else
+					fn = E("upval", { name = ctx.upnames[r.fn.up + 1] or fail("unknown upvalue"), key = ctx.upkeys and ctx.upkeys[r.fn.up + 1] })
+				end
+				local args = {}
+				for i = 0, last do
+					local arg = r.params[i]
+					if arg and arg.reg then
+						j += 1
+						args[#args + 1] = ex[j]
+					elseif arg and arg.const then
+						local g = arg.const
+						if g.idx then
+							args[#args + 1] = K_(g.idx)
+						elseif g.t == "nil" then
+							args[#args + 1] = E("const", { text = "nil" })
+						elseif g.t == "boolean" then
+							args[#args + 1] = E("const", { text = g.v and "true" or "false" })
+						else
+							args[#args + 1] = E("const", { text = numLit(g.v) })
+						end
+					else
+						args[#args + 1] = E("const", { text = "nil" })
+					end
+				end
+				local expr = E("call", { fn = fn, args = args, multret = r.single or nil })
+				if r.k == 0 then
+					pushStmt(block, { k = "call", expr = expr })
+				elseif r.k == 1 then
+					pushDef(block, ins, r.base, expr, false)
+				else
+					local targets = {}
+					for reg = r.base, r.base + r.k - 1 do
+						targets[#targets + 1] = varExpr(webOf(ins.defIds[reg]))
+					end
+					expr.multret = true
+					pushStmt(block, { k = "assign", targets = targets, values = { expr } })
+				end
 			elseif op == OP.CALL then
 				local tail = block.stmts[#block.stmts]
 				local argRegs = {}
@@ -6083,7 +7389,7 @@ do
 					local tail = block.stmts[#block.stmts]
 					local regs = { prep.a, prep.a + 1, prep.a + 2 }
 					local usedCall = false
-					if tail and tail.k == "assign" and #tail.targets == 3 and #tail.values == 1 and tail.values[1].k == "call" then
+					if tail and tail.k == "assign" and #tail.targets == 3 and #tail.values == 1 and (tail.values[1].k == "call" or tail.values[1].k == "method") then
 						local ok = true
 						for n = 1, 3 do
 							local t = tail.targets[n]
@@ -6139,7 +7445,7 @@ do
 					end
 					-- * `not` in a value context: only flips what is already a boolean
 					local function valueNot(x)
-						if x.k == "not" and x.e.k == "binop" and (x.e.op == "==" or x.e.op == "~=" or x.e.op == "<" or x.e.op == "<=") then
+						if x.k == "not" and x.e.k == "binop" and (x.e.op == "==" or x.e.op == "~=" or x.e.op == "<" or x.e.op == "<=" or x.e.op == ">" or x.e.op == ">=") then
 							return x.e
 						elseif x.k == "binop" and x.op == "==" then
 							return E("binop", { op = "~=", l = x.l, r = x.r })
@@ -6149,7 +7455,7 @@ do
 						return E("not", { e = x })
 					end
 					local function isBoolean(x)
-						return x.k == "not" or (x.k == "binop" and (x.op == "==" or x.op == "~=" or x.op == "<" or x.op == "<="))
+						return x.k == "not" or (x.k == "binop" and (x.op == "==" or x.op == "~=" or x.op == "<" or x.op == "<=" or x.op == ">" or x.op == ">="))
 							or (x.k == "const" and (x.text == "true" or x.text == "false"))
 					end
 					local function build(t)
@@ -6923,6 +8229,13 @@ do
 	local function upperFirst(s)
 		return (string.gsub(s, "^%l", string.upper))
 	end
+	-- * two words joined in the style of the first: `partPosition`, `beam_part_position`
+	local function joinWords(a, b)
+		if string.find(a, "_") then
+			return a .. "_" .. string.lower((string.gsub(b, "(%l)(%u)", "%1_%2")))
+		end
+		return a .. upperFirst(b)
+	end
 
 	local IRREGULAR_PLURALS = {
 		children = "child", people = "person", data = "entry", indices = "index", vertices = "vertex",
@@ -7205,6 +8518,44 @@ do
 		return name
 	end
 
+	-- * first words of function names that are actions, and words that join two nouns
+	local NAME_VERBS = {}
+	for _, verb in {
+		"get", "set", "make", "build", "create", "find", "load", "update", "remove", "add", "play", "stop", "start",
+		"apply", "select", "pick", "gather", "annotate", "survey", "style", "loop", "is", "has", "can", "should", "on",
+		"handle", "refresh", "reset", "clear", "init", "setup", "destroy", "show", "hide", "enable", "disable", "spawn",
+		"fire", "send", "request", "check", "compute", "calculate", "try", "ensure", "register", "unregister", "connect",
+		"disconnect", "bind", "unbind", "track", "untrack", "equip", "unequip", "open", "close", "toggle", "render",
+		"draw", "tween", "animate", "move", "teleport", "give", "take", "use", "run", "do", "process", "parse", "format",
+		"convert", "new", "await", "wait", "mark", "unmark", "for", "each", "aim", "save", "store", "fetch", "read",
+		"write", "sort", "filter", "map", "count", "sum", "merge", "copy", "clone", "call", "invoke", "notify", "emit",
+		"listen", "watch", "observe", "schedule", "queue", "dequeue", "push", "pop", "insert", "delete", "kill", "attach",
+		"detach", "plant", "restore", "release", "hold", "pull", "push", "grab", "drop", "place", "position", "resize",
+		"scale", "rotate", "lerp", "clamp", "round", "floor", "ceil", "lock", "unlock", "claim", "award", "grant",
+		"revoke", "validate", "verify", "test", "assert", "debug", "log", "print", "warn", "report", "track", "cache",
+		"preload", "prefetch", "sync", "replicate", "serialize", "deserialize", "encode", "decode", "should", "will",
+		"did", "was", "all", "any", "no", "not", "with", "without", "maybe", "safe", "raw", "internal", "default",
+	} do
+		NAME_VERBS[verb] = true
+	end
+	local NAME_PROPERTIES = {}
+	for _, word in {
+		"target", "model", "geometry", "candidate", "root", "position", "cframe", "distance", "id", "name", "size",
+		"color", "data", "info", "state", "config", "settings", "offset", "velocity", "direction", "range", "radius",
+		"height", "width", "length", "count", "index", "level", "kind", "type", "owner", "parent", "part", "parts",
+		"entry", "label", "text", "icon", "image", "price", "cost", "value", "amount", "key", "path", "folder",
+	} do
+		NAME_PROPERTIES[word] = true
+	end
+	local NAME_ADJECTIVES = {}
+	for _, word in {
+		"auto", "best", "max", "min", "new", "old", "current", "last", "first", "next", "prev", "previous", "local",
+		"global", "main", "default", "all", "any", "total", "full", "base", "final", "initial", "active", "selected",
+		"target", "nearest", "closest", "random", "own", "other", "extra", "custom", "temp", "cached", "visible",
+	} do
+		NAME_ADJECTIVES[word] = true
+	end
+	local NAME_PREPOSITIONS = { of = true, from = true, ["for"] = true, by = true, to = true, ["in"] = true, at = true, with = true, on = true }
 	local RETURN_VERBS = { "Get", "Select", "Find", "Choose", "Pick", "Calculate", "Compute", "Create", "Make", "Build", "Load", "Fetch" }
 
 	-- * Chooses every variable name of one function. Returns names (web -> name), the
@@ -7221,6 +8572,42 @@ do
 				order[#order + 1] = r
 			end
 			return r
+		end
+		local callSites = {}
+		-- * the local function a call calls, if it is one of this script's
+		local function protoOfFn(fn)
+			if fn.k == "var" then
+				local r = recs[fn.w]
+				if r then
+					for _, def in r.defs do
+						if def.e.k == "closure" then
+							return def.e.child
+						end
+					end
+				end
+			elseif fn.k == "upval" and fn.key then
+				return ctx.closureOfKey and ctx.closureOfKey[fn.key]
+			end
+			return nil
+		end
+		-- * a name other functions gave: the parameter `pos` of function `id`, or the arguments passed to it
+		local function paramNameOf(id, pos)
+			local list = (ctx.paramFacts and ctx.paramFacts[id]) or (ctx.paramFactsPrev and ctx.paramFactsPrev[id])
+			return list and list[pos]
+		end
+		local function argNameOf(id, pos)
+			local facts = ctx.argFactsPrev and ctx.argFactsPrev[id]
+			local counts = facts and facts[pos]
+			if not counts then
+				return nil
+			end
+			local best, bestN = nil, 0
+			for name, n in counts do
+				if n > bestN or (n == bestN and best and name < best) then
+					best, bestN = name, n
+				end
+			end
+			return best
 		end
 
 		local function pathOf(e)
@@ -7283,6 +8670,14 @@ do
 					if x.fn.k == "var" then
 						rec(x.fn.w).called = true
 					end
+					callSites[#callSites + 1] = x
+					for n, arg in x.args do
+						if arg.k == "var" then
+							local r = rec(arg.w)
+							r.passedAs = r.passedAs or {}
+							r.passedAs[#r.passedAs + 1] = { fn = x.fn, pos = n }
+						end
+					end
 					local path = pathOf(x.fn)
 					local a1 = x.args[1]
 					if a1 and a1.k == "var" then
@@ -7305,6 +8700,11 @@ do
 							holder.storedVars = holder.storedVars or {}
 							holder.storedVars[#holder.storedVars + 1] = item.w
 						end
+					end
+					if path == "table.insert" and a1 and #x.args >= 2 and x.args[#x.args].k == "var" then
+						local r = rec(x.args[#x.args].w)
+						r.storedInto = r.storedInto or {}
+						r.storedInto[#r.storedInto + 1] = a1
 					end
 					if path == "table.sort" and x.args[2] and x.args[2].k == "closure" then
 						x.args[2].hints = { params = { "a", "b" } }
@@ -7331,6 +8731,33 @@ do
 					for _, cap in x.caps do
 						if type(cap) == "table" then
 							rec(cap.w).reads += 1
+						end
+					end
+				elseif k == "table" then
+					-- * `{ connections = list }`: the field names the variable
+					for _, entry in x.entries do
+						if entry.key and entry.key.str and entry.value and entry.value.k == "var" then
+							local r = rec(entry.value.w)
+							r.stores[#r.stores + 1] = entry.key.str
+						end
+					end
+				end
+				-- * `x:SetSize(v)` / `set_size(v)`: v is a size; `x:SetAttribute(name, ...)`: an attribute name
+				if (k == "method" or k == "call") and #x.args >= 1 then
+					local fnName = k == "method" and x.name or (x.fn.k == "index" and x.fn.key.str) or ((x.fn.k == "upval" or x.fn.k == "global") and x.fn.name)
+						or (x.fn.k == "var" and nameOf and nameOf(x.fn.w))
+					local a1 = x.args[1]
+					if type(fnName) == "string" and a1.k == "var" then
+						local r = rec(a1.w)
+						if fnName == "SetAttribute" or fnName == "GetAttribute" then
+							r.roleName = r.roleName or { "attributeName", 1.1 }
+						elseif fnName == "FindFirstChild" or fnName == "WaitForChild" or fnName == "FindFirstAncestor" then
+							r.roleName = r.roleName or { "childName", 0.9 }
+						elseif #x.args == 1 then
+							local rest = string.match(fnName, "^Set(%u%w*)$") or string.match(fnName, "^set_(%a[%w_]*)$")
+							if rest and camel(rest) and not NAME_KEYWORDS[camel(rest)] and not BUILTIN_NAMES[camel(rest)] then
+								r.roleName = r.roleName or { camel(rest), 1.2 }
+							end
 						end
 					end
 				end
@@ -7412,6 +8839,18 @@ do
 								holder.storedVars = holder.storedVars or {}
 								holder.storedVars[#holder.storedVars + 1] = value.w
 							end
+							if value and target.k == "index" and not target.key.str and target.key.k == "var"
+								and target.obj.k == "var" and value.k == "const" and value.text == "true"
+							then
+								local holder = rec(target.obj.w)
+								holder.setKeys = holder.setKeys or {}
+								holder.setKeys[#holder.setKeys + 1] = target.key.w
+							end
+							if value and value.k == "var" and target.k == "index" and not target.key.str then
+								local r = rec(value.w)
+								r.storedInto = r.storedInto or {}
+								r.storedInto[#r.storedInto + 1] = target.obj
+							end
 							if value and value.k == "var" and target.k == "index" and target.key.str then
 								local r = rec(value.w)
 								r.stores[#r.stores + 1] = target.key.str
@@ -7443,6 +8882,26 @@ do
 					end
 				elseif k == "if" then
 					scan(st.cond)
+					local c, first = st.cond, st.thenB.stmts[1]
+					if c.k == "binop" and (c.op == "<" or c.op == ">" or c.op == "<=" or c.op == ">=") and first and first.k == "assign"
+						and #first.targets == 1 and first.targets[1].k == "var" and first.values[1] and first.values[1].k == "var"
+					then
+						local t, v = first.targets[1].w, first.values[1].w
+						local small, big
+						if c.op == "<" or c.op == "<=" then
+							small, big = c.l, c.r
+						else
+							small, big = c.r, c.l
+						end
+						if small.k == "var" and big.k == "var" then
+							local kind = (small.w == t and big.w == v and "max") or (big.w == t and small.w == v and "min") or nil
+							if kind then
+								local r = rec(t)
+								r.extreme = r.extreme or {}
+								r.extreme[v] = kind
+							end
+						end
+					end
 					walk(st.thenB)
 					if st.elseB then
 						walk(st.elseB)
@@ -7751,7 +9210,7 @@ do
 					if PREFIXED_FIELDS[key] then
 						local noun = e.obj.k == "var" and names[e.obj.w]
 						if noun and #noun + #key <= 28 then
-							return noun .. key, 2
+							return joinWords(noun, key), 2
 						end
 					end
 					local obj = e.obj
@@ -7766,7 +9225,7 @@ do
 					local name = camel(key)
 					if name and (BUILTIN_NAMES[name] or NAME_KEYWORDS[name]) then
 						local noun = camel(nounOf(obj))
-						name = noun and #noun + #name <= 28 and noun .. upperFirst(name) or nil
+						name = noun and #noun + #name <= 28 and joinWords(noun, name) or nil
 					end
 					return name, 2
 				end
@@ -7803,7 +9262,7 @@ do
 				end
 				return nil
 			elseif k == "binop" then
-				if e.op == "==" or e.op == "~=" or e.op == "<" or e.op == "<=" then
+				if e.op == "==" or e.op == "~=" or e.op == "<" or e.op == "<=" or e.op == ">" or e.op == ">=" then
 					return "condition", 0.2
 				end
 				local function isPosition(x)
@@ -7825,6 +9284,27 @@ do
 			elseif k == "and" or k == "or" then
 				if e.r.k == "var" and recs[e.r.w] and recs[e.r.w].flag then
 					return recs[e.r.w].flag, 3.5
+				end
+				local sides
+				if k == "and" then
+					sides = { e.r, e.l }
+				else
+					sides = { e.l.k == "and" and e.l.r or e.l, e.r }
+				end
+				local allText = true
+				for _, side in sides do
+					if side.k ~= "const" then
+						allText = false
+						local name, score = valueName(side, 1, 1)
+						if name and not isGenericName(name) then
+							return name, math.min(score or 0.3, 1)
+						end
+					elseif not constStr(side) then
+						allText = false
+					end
+				end
+				if allText then
+					return "text", 0.4
 				end
 				local noun = (e.r.k == "var" and nameOf(e.r.w)) or nounOf(e.r) or nounOf(e.l)
 				return camel(noun), 0.3
@@ -7872,6 +9352,39 @@ do
 			end
 			if r.usedAsKey then
 				offer("key", 0.6)
+			end
+			if r.roleName then
+				offer(r.roleName[1], r.roleName[2])
+			end
+			if r.passedAs then
+				for _, use in r.passedAs do
+					local id = protoOfFn(use.fn)
+					local name = id and paramNameOf(id, use.pos)
+					if name then
+						offer(name, 0.85)
+						break
+					end
+				end
+			end
+			if r.setKeys then
+				for _, keyW in r.setKeys do
+					local keyName = nameOf(keyW)
+					if keyName and not isGenericName(keyName) and keyName ~= "key" and #keyName <= 24 then
+						offer(plural((string.gsub(keyName, "%d+$", ""))), 0.9)
+						break
+					end
+				end
+			end
+			if r.storedInto then
+				-- * an element of `players` is a player, of `rootToManifest` a manifest
+				for _, holder in r.storedInto do
+					local noun = nounOf(holder)
+					local element = noun and (string.match(noun, "%lTo(%u%w*)$") and camel(string.match(noun, "%lTo(%u%w*)$")) or elementName(noun))
+					if element and not isGenericName(element) then
+						offer(element, 1)
+						break
+					end
+				end
 			end
 			if r.w.synthetic then
 				offer(r.w.synthetic, 5)
@@ -7973,6 +9486,32 @@ do
 		if fnameNoun and (NAME_KEYWORDS[fnameNoun] or BUILTIN_NAMES[fnameNoun]) then
 			fnameNoun = nil -- * `guardReturn` says nothing about its parameter
 		end
+		local fnameFirst
+		if fname then
+			local bare = string.gsub(fname, "^_+", "")
+			fnameFirst = string.match(bare, "_from_(%l[%w_]*)$") or string.match(bare, "_of_(%l[%w_]*)$")
+				or string.match(bare, "_for_(%l[%w_]*)$")
+			local camelTail = string.match(bare, "%lFrom(%u%w*)$") or string.match(bare, "%lOf(%u%w*)$") or string.match(bare, "%lFor(%u%w*)$")
+			if not fnameFirst and camelTail then
+				fnameFirst = camel(camelTail)
+			end
+			if not fnameFirst then
+				-- * `prop_target(prop)`, `get_prop_geometry(prop)`: a noun, then what the function gives of it
+				local verb, noun, what = string.match(bare, "^(%l+)_(%l+)_(%l+)$")
+				if not (verb and NAME_VERBS[verb]) then
+					verb = nil
+					noun, what = string.match(bare, "^(%l+)_(%l+)$")
+				end
+				if noun and what and NAME_PROPERTIES[what] and not NAME_VERBS[noun] and not NAME_PREPOSITIONS[noun] and #noun >= 3
+					and not NAME_ADJECTIVES[noun]
+				then
+					fnameFirst = noun
+				end
+			end
+			if fnameFirst and (NAME_KEYWORDS[fnameFirst] or BUILTIN_NAMES[fnameFirst] or isGenericName(fnameFirst)) then
+				fnameFirst = nil
+			end
+		end
 
 		-- * the module's class / table, named after the script
 		local className
@@ -8025,7 +9564,7 @@ do
 				end
 			end
 			if r.param then
-				local index = r.param - (hints.methodSelf and 1 or 0)
+				local index = r.param - (isMethod and 1 or 0)
 				local hinted = hints.params and hints.params[index]
 				if hinted then
 					offer(hinted, 4)
@@ -8034,7 +9573,14 @@ do
 				if fromName then
 					offer(fromName, 3)
 				end
-				local count = p.numparams - (hints.methodSelf and 1 or 0)
+				local count = p.numparams - (isMethod and 1 or 0)
+				if fnameFirst and index == 1 then
+					offer(fnameFirst, 0.7)
+				end
+				local passed = argNameOf(protoId, r.param)
+				if passed then
+					offer(passed, 0.9)
+				end
 				if fnameNoun and count == 1 then
 					offer(fnameNoun, 1)
 				elseif fnameNoun and count == 2 and index >= 1 then
@@ -8077,11 +9623,31 @@ do
 					offer("value" .. n, 0.5)
 				end
 			end
+			local huge = 0
+			for _, def in r.defs do
+				local e = def.e
+				if e.k == "const" and e.value and e.value.t == "number" and (e.value.v == math.huge or e.value.v == -math.huge) then
+					huge = e.value.v > 0 and 1 or -1
+				end
+			end
 			for _, def in r.defs do
 				local name, score = valueName(def.e, def.pos, def.count)
 				local isCopy = def.e.k == "var" or def.e.k == "upval" or def.e.k == "global"
 				if not (isCopy and #r.defs > 1) then
 					offer(name, score)
+				end
+				-- * starts at math.huge, then takes smaller distances: the smallest distance
+				local extreme = huge ~= 0 and (huge > 0 and "min" or "max") or (r.extreme and r.extreme[def.e.w])
+				if extreme and isCopy and def.e.k == "var" then
+					local other = nameOf(def.e.w)
+					if other and not isGenericName(other) and #other <= 20 then
+						offer(string.find(other, "_") and (extreme .. "_" .. other) or (extreme .. upperFirst(other)), 1)
+					end
+				end
+				if def.e.k == "or" and def.e.l.k == "var" and recs[def.e.l.w] and recs[def.e.l.w].param
+					and def.e.r.k == "table" and #def.e.r.entries == 0 and next(r.fields)
+				then
+					offer("options", 1.1)
 				end
 				-- * `local self = setmetatable({}, Class) ... return self` in a constructor
 				if def.e.k == "call" and pathOf(def.e.fn) == "setmetatable" and r.returned and not isMethod then
@@ -8101,6 +9667,11 @@ do
 				end
 			end
 			if r.returned and fname then
+				local snake = string.match(fname, "^get_(%a[%w_]*)$") or string.match(fname, "^make_(%a[%w_]*)$")
+					or string.match(fname, "^build_(%a[%w_]*)$") or string.match(fname, "^create_(%a[%w_]*)$")
+				if snake and camel(snake) and not NAME_KEYWORDS[camel(snake)] and not BUILTIN_NAMES[camel(snake)] then
+					offer(camel(snake), 1.2)
+				end
 				for _, verb in RETURN_VERBS do
 					local rest = string.match(fname, "^" .. verb .. "(%u%w*)$") or string.match(fname, "^" .. string.lower(verb) .. "(%u%w*)$")
 					if rest then
@@ -8114,7 +9685,7 @@ do
 					best = "object"
 				elseif r.param then
 					-- * nothing says what it is: named by position (`arg1`)
-					best = "arg" .. (r.param - (hints.methodSelf and 1 or 0))
+					best = "arg" .. (r.param - (isMethod and 1 or 0))
 				else
 					local fromCall = false
 					for _, def in r.defs do
@@ -8337,6 +9908,41 @@ do
 		if ctx.upFacts then
 			factsIn(root)
 		end
+		if ctx.closureOfKey then
+			for _, r in order do
+				for _, def in r.defs do
+					if def.e.k == "closure" then
+						ctx.closureOfKey[protoId .. ":" .. r.w.id] = def.e.child
+					end
+				end
+			end
+			local own = {}
+			for n, r in paramRecs do
+				local name = names[r.w]
+				if name and not (isMethod and n == 1) and not isGenericName(name) and not string.find(name, "^arg%d") then
+					own[r.param] = (string.gsub(name, "%d+$", ""))
+				end
+			end
+			ctx.paramFacts[protoId] = own
+			for _, call in callSites do
+				local id = protoOfFn(call.fn)
+				if id and id ~= protoId then
+					local facts = ctx.argFacts[id]
+					if not facts then
+						facts = {}
+						ctx.argFacts[id] = facts
+					end
+					for n, arg in call.args do
+						local name = arg.k == "var" and names[arg.w]
+						if name and not isGenericName(name) and not string.find(name, "^arg%d") and name ~= "self" then
+							name = string.gsub(name, "%d+$", "")
+							facts[n] = facts[n] or {}
+							facts[n][name] = (facts[n][name] or 0) + 1
+						end
+					end
+				end
+			end
+		end
 		return names, params, isMethod, classWebs
 	end
 
@@ -8530,6 +10136,8 @@ do
 			return 0
 		elseif k == "const" and e.text:sub(1, 1) == "(" then
 			return 10
+		elseif k == "const" and e.text:sub(1, 1) == "-" then
+			return UNARY_PREC -- * -math.huge
 		elseif k == "closure" or k == "table" or k == "const" or k == "vararg" then
 			return 9
 		end
@@ -8936,7 +10544,7 @@ do
 			end
 		end
 		local mode, firstErr = {}, nil
-		for attempt = 1, 6 do
+		for attempt = 1, 10 do
 			if attempt > 1 then
 				restore()
 			end
@@ -8961,9 +10569,17 @@ do
 					end
 				end
 			end
+			-- * a function it calls inline that it cannot name (its parent was rebuilt low level)
+			if string.find(err, "unknown upvalue", 1, true) and info.usedInline and not mode.noInline then
+				mode.noInline, changed = true, true
+			end
 			-- * the rules that only pick a nicer form: off
 			if not changed and info.usedNew and not mode.conservative then
 				mode.conservative, changed = true, true
+			end
+			-- * the calls written back where the copies were: off
+			if not changed and info.usedInline and not mode.noInline then
+				mode.noInline, changed = true, true
 			end
 			if not changed then
 				break
@@ -8975,11 +10591,14 @@ do
 	function structuredOnce(chunk, protoId, upnames, indent, ctx, hints, mode, info)
 		local noSplit = mode and mode.conservative or false
 		local p = chunk.protos[protoId]
-		local A = analyze(chunk, p)
+		local A = analyze(chunk, p, mode and mode.noInline)
 		A.conservative = noSplit
 		A.nestChains = mode and mode.nest or false
 		A.avoidValues = mode and mode.avoidValues
 		A.info = info or {}
+		if A.inlinedHere then
+			A.info.usedInline = true
+		end
 		for _, w in A.webs do
 			if w.crossTemp then
 				if noSplit then
@@ -9002,6 +10621,10 @@ do
 			q = ctx.protoParent and ctx.protoParent[q]
 		end
 		irCtx.ownLine = function(pc)
+			local at = A.byPc[pc]
+			if at and at.inlined then
+				return nil -- * a call written back from a copy: the copy's lines are the callee's
+			end
 			local l = p.lineOf and p.lineOf(pc)
 			if not l then
 				return nil
@@ -9355,14 +10978,7 @@ do
 	-- * written in) is inlined code: -O2 copies a local function's body, with its lines, into
 	-- * the caller.
 	local function lineOwners(chunk)
-		local parent, spans = {}, {}
-		for id, p in chunk.protos do
-			if p.p then
-				for _, child in p.p do
-					parent[child] = id
-				end
-			end
-		end
+		local parent, spans, spanOf, listedIn = {}, {}, {}, {}
 		for id, p in chunk.protos do
 			if p.lineOf and p.sizecode then
 				local last = p.linedefined or 0
@@ -9372,8 +10988,34 @@ do
 						last = l
 					end
 				end
-				spans[#spans + 1] = { id = id, first = p.linedefined or 0, last = last }
+				local span = { id = id, first = p.linedefined or 0, last = last }
+				spans[#spans + 1] = span
+				spanOf[id] = span
 			end
+		end
+		for id, p in chunk.protos do
+			if p.p then
+				for _, child in p.p do
+					local list = listedIn[child]
+					if not list then
+						list = {}
+						listedIn[child] = list
+					end
+					list[#list + 1] = id
+				end
+			end
+		end
+		for child, list in listedIn do
+			-- * the smallest function whose lines contain the child's
+			local best, bestSize = list[1], math.huge
+			local cs = spanOf[child]
+			for _, id in list do
+				local s = spanOf[id]
+				if s and cs and s.first <= cs.first and s.last >= cs.last and s.last - s.first < bestSize then
+					best, bestSize = id, s.last - s.first
+				end
+			end
+			parent[child] = best
 		end
 		table.sort(spans, function(x, y)
 			return (x.last - x.first) > (y.last - y.first)
@@ -9395,19 +11037,30 @@ do
 	function BetterDecompiler.decompile(chunk, options)
 		local t0 = os.clock()
 		local body, ctx = decompileOnce(chunk, options, nil)
-		if next(ctx.upFacts) and os.clock() - t0 < 3 then
-			return decompileOnce(chunk, options, ctx.upFacts)
+		if (next(ctx.upFacts) or next(ctx.argFacts)) and os.clock() - t0 < 3 then
+			return decompileOnce(chunk, options, ctx)
 		end
 		return body, ctx
 	end
-	function decompileOnce(chunk, options, upFactsPrev)
+	function decompileOnce(chunk, options, prev)
 		local allGlobals, namecalls, dotReads = scanChunk(chunk)
 		local lineOwner, protoParent = lineOwners(chunk)
+		if chunk.inlineInfo == nil then
+			chunk.inlineInfo = false
+			if not (options and options.inline == false) then
+				local ok, plan, virtualUps, closureReg, virtualIndex = pcall(planInlines, chunk, lineOwner, protoParent)
+				if ok then
+					chunk.inlineInfo = { plan = plan, virtualUps = virtualUps, realParent = protoParent, closureReg = closureReg, virtualIndex = virtualIndex }
+				end
+			end
+		end
 		local ctx = {
 			globals = {}, structured = 0, lifted = 0, reasons = {}, internalErrors = {},
 			allGlobals = allGlobals, namecalls = namecalls, dotReads = dotReads, options = options or {}, outerNames = {},
 			lineOwner = lineOwner, protoParent = protoParent,
-			upkeysByProto = {}, upFacts = {}, upFactsPrev = upFactsPrev,
+			upkeysByProto = {}, upFacts = {}, upFactsPrev = prev and prev.upFacts,
+			argFacts = {}, paramFacts = {}, closureOfKey = {},
+			argFactsPrev = prev and prev.argFacts, paramFactsPrev = prev and prev.paramFacts,
 		}
 		local ok, params, out = pcall(structured, chunk, chunk.main, {}, -1, ctx)
 		local body
@@ -12423,7 +14076,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-08e " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
+	local CACHE_VERSION = "2026-10-08f " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
