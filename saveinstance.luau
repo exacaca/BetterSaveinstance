@@ -1731,11 +1731,14 @@ All options are case insensitive.
   - Adds the "-- Saved by ..." and "-- Decompiled with ..." comments at the top of every saved script.
   - Off by default: they shift every line number by 4. The saved file itself still says what saved it.
   - Default: false
-- MatchLineNumbers: `boolean`
+- PreserveLineNumbers: `boolean`
   - Built-in decompiler: puts every statement on the line it has in the original script (Roblox keeps
-    line numbers in the bytecode), so errors, tracebacks and `debug.info` report the original lines.
-    Code is kept on its own lines where the original had room, joined onto one line where it was denser.
-  - Default: true
+    line numbers in the bytecode), so errors, tracebacks and `debug.info` report the original lines
+    (some games name things after `debug.info` lines). Lines the original spent on comments and type
+    definitions become blank lines, and dense code is joined onto one line.
+  - Off: compact output; where a statement is not on its original line, a `-- @L<line>` comment gives
+    it. A line without one is as far from the last marked line as in the original.
+  - Default: false
 - RenameVariables: `boolean`
   - Renames the generic names decompilers emit (`v14`, `p1`, `s1`, `arg3`, `var_1`, ...) to names inferred from what each variable is assigned from, or how each parameter is used.
     - `local v14 = load("ClientStore")` becomes `local ClientStore = load("ClientStore")`
@@ -3062,9 +3065,22 @@ do
 	-- * `not` in a boolean context (if / while / until)
 	-- * `c ? a : b` as Luau: `c and a or b` when `a` is a constant that is never false or nil
 	-- * (the usual way to write it, and what it compiles from), else `if c then a else b`
+	local function isBooleanValue(e)
+		if e.k == "not" or (e.k == "const" and (e.text == "true" or e.text == "false")) then
+			return true
+		elseif e.k == "binop" then
+			return e.op == "==" or e.op == "~=" or e.op == "<" or e.op == "<=" or e.op == ">" or e.op == ">="
+		elseif e.k == "and" or e.k == "or" then
+			return isBooleanValue(e.l) and isBooleanValue(e.r)
+		end
+		return false
+	end
 	local function ifValue(c, a, b)
 		if c.k == "not" then
 			c, a, b = c.e, b, a
+		end
+		if b.k == "const" and b.text == "false" and isBooleanValue(c) then
+			return E("and", { l = c, r = a })
 		end
 		if a.k == "const" and a.text ~= "nil" and a.text ~= "false" then
 			return E("or", { l = E("and", { l = c, r = a }), r = b })
@@ -4084,6 +4100,8 @@ do
 			return loopIns.target == loopIns.pc and canonical(bodyStart) == loopIns.pc
 		end
 
+		local tryValueExpr
+
 		-- * a chain of conditional jumps forming one and/or condition
 		local function buildChains(first, e, preFirst)
 			local segs = { { pre = preFirst or {}, jump = first, start = (preFirst and preFirst[1] and preFirst[1].pc) or first.pc } }
@@ -4112,11 +4130,11 @@ do
 						return false
 					end
 					for _, ins in segs[k].pre do
-						if ins.pc ~= segs[k].start and externalIncoming(ins.pc, {}) then
+						if not ins.kind and ins.pc ~= segs[k].start and externalIncoming(ins.pc, {}) then
 							return false
 						end
 					end
-					if segs[k].jump.pc ~= segs[k].start and externalIncoming(segs[k].jump.pc, {}) then
+					if segs[k].jump.pc ~= segs[k].start and externalIncoming(segs[k].jump.pc, segs[k].valueJumps or {}) then
 						return false
 					end
 				end
@@ -4136,18 +4154,45 @@ do
 					pc = ins.next
 					ins = insAt(pc)
 				end
+				-- * `a or (if c then x else y)`: an operand that is a value expression of its own,
+				-- * then the test of its value
+				local valueJumps
+				if ins and pc < e and CONDITIONAL[ins.op] and not ins.boolmat and not A.conservative and not A.backSources[startPc] then
+					local preItems = {}
+					for n2, p in pre do
+						preItems[n2] = { kind = "ins", ins = p }
+					end
+					local ok, node, join = pcall(tryValueExpr, ins, e, preItems, true)
+					local test = ok and node and insAt(join)
+					if test and CONDITIONAL[test.op] and not test.boolmat and join < e
+						and (test.a == node.reg or (TWO_REG_COMPARE[test.op] and test.aux == node.reg))
+					then
+						if node.leaf0 then
+							remove(pre, node.leaf0Index)
+						end
+						valueJumps = {}
+						for i2 in node.regionIns do
+							if i2.target then
+								valueJumps[i2] = true
+							end
+						end
+						A.info.usedNew = true
+						pre[#pre + 1] = node
+						pc, ins = join, test
+					end
+				end
 				if not ins or pc >= e or not CONDITIONAL[ins.op] or ins.boolmat or A.backSources[startPc] then
 					break
 				end
 				for _, p in pre do
-					for _, id in p.defIds do
+					for _, id in (p.defIds or {}) do
 						local u = A.webOf(id).uses[1].ins
 						if u.pc < startPc or u.pc > ins.pc then
 							return candidates, segs
 						end
 					end
 				end
-				segs[#segs + 1] = { pre = pre, jump = ins, start = startPc }
+				segs[#segs + 1] = { pre = pre, jump = ins, start = startPc, valueJumps = valueJumps }
 				if consistent() then
 					candidates[#candidates + 1] = #segs
 				end
@@ -4305,7 +4350,10 @@ do
 		-- * `x = a and b or c` and friends: conditional jumps plus value "leaves" that all write one
 		-- * register R, ending at one join point. Rebuilt as an and/or expression (or `if c then a
 		-- * else b` when allowCond), only when every test and leaf is used exactly once.
-		local function tryValueExpr(first, e, items, allowCond)
+		function tryValueExpr(first, e, items, allowCond)
+			if A.avoidValues and A.avoidValues[first.pc] then
+				return nil
+			end
 			local elements = {}
 			local R
 			local pc = first.pc
@@ -4553,7 +4601,12 @@ do
 						-- * c' ? (X or W) : W  ==  (c' and X) or W
 						F[k] = { k = "or", l = { k = "and", l = { k = "fallc", el = el }, r = splitTail(Fn, "or", Ft) }, r = Ft, el = Fn.el }
 					else
-						F[k] = { k = "cond", c = { k = "taken", el = el }, a = Ft, b = Fn }
+						if not A.conservative and Fn.k == "cond" and Fn.a == Ft then
+							F[k] = { k = "cond", c = { k = "or", l = { k = "taken", el = el }, r = Fn.c }, a = Ft, b = Fn.b }
+							A.info.usedNew = true
+						else
+							F[k] = { k = "cond", c = { k = "taken", el = el }, a = Ft, b = Fn }
+						end
 						hasCond = true
 					end
 				end
@@ -4644,11 +4697,122 @@ do
 			if leaf0 then
 				regionIns[leaf0] = true
 			end
-			return { kind = "valexpr", reg = R, tree = tree, cur = CUR, leaf0 = leaf0, leaf0Index = leaf0Index, dropLeaf0 = dropLeaf0, firstTest = firstTest, regionIns = regionIns, join = Jn }, Jn
+			return { kind = "valexpr", reg = R, tree = tree, cur = CUR, leaf0 = leaf0, leaf0Index = leaf0Index, dropLeaf0 = dropLeaf0, firstTest = firstTest, regionIns = regionIns, join = Jn, startPc = first.pc }, Jn
 		end
 
 		-- * Last resort for forward jumps to a common point J (inlined functions' early returns):
 		-- * `repeat ... until true` runs once, and `break` jumps to J.
+		-- * A condition whose evaluation has statements of its own (an inlined function with side
+		-- * effects inside `a or f() or b`): the code from the first test up to X, where the `then`
+		-- * part starts, only leaves to X or to F, where the `else` part starts. Rebuilt exactly as
+		-- * `failed = false; repeat <code, `failed = true; break` for F> until true;
+		-- * if not failed then <X..> else <F..> end`.
+		-- * one flag per place in the code: structures cached by range must refer to the same one
+		local flagsAt = {}
+		local function flagAt(key)
+			local flag = flagsAt[key]
+			if not flag then
+				flag = { name = string.find(key, "^cond:") and "failed" or "exited" }
+				flagsAt[key] = flag
+			end
+			return flag
+		end
+		local tryFlagCondition
+		function tryFlagCondition(first, e, ctx)
+			if A.conservative then
+				return nil
+			end
+			local s0 = first.pc
+			local guard = 0
+			local X = first.next
+			while X < e and guard < 400 do
+				guard += 1
+				-- * the targets of the jumps in [s0, X)
+				local F, ok, anyF = nil, true, false
+				local pc = s0
+				while pc < X do
+					local ins = insAt(pc)
+					if not ins then
+						return nil
+					end
+					local t = ins.target
+					if t and not ins.boolmat then
+						if t > X then
+							if F and F ~= t then
+								ok = false
+								break
+							end
+							F, anyF = t, true
+						elseif t < s0 then
+							ok = false
+							break
+						end
+					end
+					if ins.op == OP.RETURN or FORGPREPS[ins.op] or ins.op == OP.FORNPREP then
+						ok = false
+						break
+					end
+					pc = ins.next
+				end
+				local before = lastBefore(X)
+				if ok and anyF and F <= e and before and not UNCONDITIONAL[before.op] and before.op ~= OP.RETURN then
+					-- * entered only at s0; X and F reached only from here (or, for F, nowhere else either)
+					local entered = false
+					local q = first.next
+					while q <= X and not entered do
+						local list = A.incoming[q]
+						if list then
+							for _, src in list do
+								if src.pc < s0 or src.pc >= X then
+									entered = true
+								end
+							end
+						end
+						q = (insAt(q) or { next = X + 1 }).next
+					end
+					local list = A.incoming[F]
+					if list then
+						for _, src in list do
+							if src.pc < s0 or src.pc >= X then
+								entered = true
+							end
+						end
+					end
+					if not entered then
+						local flag = flagAt("cond:" .. s0 .. ":" .. X .. ":" .. F)
+						local blockLoop = { header = s0, exit = X, conts = {}, isBlock = true, flagExit = F, flag = flag }
+						local okC, condBody = pcall(structRange, s0, X, { loop = blockLoop })
+						if okC then
+							-- * the if after it: `then` X..F, and `else` F..E2 when X..F ends with a jump past it
+							local lastThen = lastBefore(F)
+							local node
+							if lastThen and lastThen.pc >= X and lastThen.op == OP.JUMP and lastThen.target > F and lastThen.target <= e then
+								local E2 = lastThen.target
+								local ok1, thenB = pcall(structRange, X, lastThen.pc, ctx)
+								local ok2, elseB = pcall(structRange, F, E2, ctx)
+								if ok1 and ok2 then
+									node = { kind = "flagcond", flag = flag, cond = condBody, thenB = thenB, elseB = elseB }
+									A.info.usedNew = true
+									return node, E2
+								end
+							end
+							local ok1, thenB = pcall(structRange, X, F, ctx)
+							if ok1 then
+								A.info.usedNew = true
+								return { kind = "flagcond", flag = flag, cond = condBody, thenB = thenB }, F
+							end
+						end
+					end
+				end
+				local nx = insAt(X)
+				if not nx then
+					return nil
+				end
+				X = nx.next
+			end
+			return nil
+		end
+
 		local function tryBreakBlock(s0, e)
 			local targets, list = {}, {}
 			local pc = s0
@@ -4681,7 +4845,19 @@ do
 			local candidates, segs = buildChains(first, e)
 			local lastErr = "no usable condition"
 			for c = #candidates, 1, -1 do
-				local node, nextPc = tryIf(segs, candidates[c], e, ctx)
+				local n = candidates[c]
+				local laterCode = false
+				if A.nestChains then
+					for k = 2, n do
+						if #segs[k].pre > 0 then
+							laterCode = true
+						end
+					end
+				end
+				local node, nextPc
+				if not laterCode then
+					node, nextPc = tryIf(segs, n, e, ctx)
+				end
 				if node then
 					return node, nextPc
 				end
@@ -5012,7 +5188,7 @@ do
 							if not J then
 								error(body, 0)
 							end
-							loop.flagExit, loop.flag = J, {}
+							loop.flagExit, loop.flag = J, flagAt("loop:" .. ins.pc .. ":" .. J)
 							body = structRange(ins.next, loopIns.pc, { loop = loop })
 							-- * before the loop's setup (instructions that only fill the loop registers)
 							local at = #items + 1
@@ -5056,7 +5232,7 @@ do
 							if not J then
 								error(body, 0)
 							end
-							loop.flagExit, loop.flag = J, {}
+							loop.flagExit, loop.flag = J, flagAt("loop:" .. ins.pc .. ":" .. J)
 							body = structRange(ins.next, loopIns.pc, { loop = loop })
 							-- * before the loop's setup (instructions that only fill the loop registers)
 							local at = #items + 1
@@ -5101,6 +5277,9 @@ do
 							node, nextPc = tryValueExpr(ins, e, items, true)
 							if not node then
 								node, nextPc = tryBreakBlock(ins.pc, e)
+							end
+							if not node then
+								node, nextPc = tryFlagCondition(ins, e, ctx)
 							end
 							if not node then
 								error(n2, 0)
@@ -5367,7 +5546,7 @@ do
 
 		local function flagVar(flag)
 			if not flag.w then
-				flag.w = { id = "exitflag" .. tostring(flag), defs = {}, uses = {}, kinds = { normal = true }, captured = false, useLeft = 0, synthetic = "exited" }
+				flag.w = { id = "exitflag" .. tostring(flag), defs = {}, uses = {}, kinds = { normal = true }, captured = false, useLeft = 0, synthetic = flag.name or "exited" }
 				materialized[flag.w] = true
 			end
 			return E("var", { w = flag.w })
@@ -5421,7 +5600,11 @@ do
 						scratch = newBlock(block)
 						scratch.stmts = {}
 						for _, ins in seg.pre do
-							emitIns(scratch, ins)
+							if ins.kind then
+								buildItem(scratch, ins)
+							else
+								emitIns(scratch, ins)
+							end
 						end
 						target = scratch
 					end
@@ -5624,12 +5807,26 @@ do
 					end
 					tw.useLeft -= 1
 				else
-					if c == 0 then
-						fail("SETLIST with multret outside a table constructor")
-					end
 					local ex = takeOperands(block, ins, { a })
-					for n, v in values do
-						pushStmt(block, { k = "assign", targets = { E("index", { obj = ex[1], key = E("const", { text = tostring(ins.aux + n - 1) }) }) }, values = { v } })
+					if c == 0 then
+						-- * `t[aux], t[aux + 1], ... = values..., f()`: table.pack keeps the count, nils too
+						if A.conservative then
+							fail("SETLIST with multret outside a table constructor")
+						end
+						A.info.usedNew = true
+						local packed = { id = "packed" .. ins.pc, defs = {}, uses = {}, kinds = { normal = true }, captured = false, useLeft = 0, synthetic = "packed" }
+						materialized[packed] = true
+						local tableG = E("global", { name = "table" })
+						local packedVar = E("var", { w = packed })
+						pushStmt(block, { k = "assign", targets = { packedVar }, values = { E("call", { fn = E("index", { obj = tableG, key = E("const", { text = strLit("pack"), str = "pack" }) }), args = values }) } })
+						pushStmt(block, { k = "call", expr = E("call", { fn = E("index", { obj = tableG, key = E("const", { text = strLit("move"), str = "move" }) }), args = {
+							E("var", { w = packed }), E("const", { text = "1" }), E("index", { obj = E("var", { w = packed }), key = E("const", { text = strLit("n"), str = "n" }) }),
+							E("const", { text = tostring(ins.aux) }), ex[1],
+						} }) })
+					else
+						for n, v in values do
+							pushStmt(block, { k = "assign", targets = { E("index", { obj = ex[1], key = E("const", { text = tostring(ins.aux + n - 1) }) }) }, values = { v } })
+						end
 					end
 				end
 			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
@@ -5926,6 +6123,8 @@ do
 						end
 						-- * folding may remove earlier statements of `target`, never add more than the value
 						if #target.stmts > before + 1 or #target.stmts == 0 then
+							A.info.badValues = A.info.badValues or {}
+							A.info.badValues[item.startPc or -1] = true
 							fail("value with side statements")
 						end
 						local st = remove(target.stmts)
@@ -5973,7 +6172,11 @@ do
 							local scratch = t.el == item.firstTest and block or newBlock(block)
 							local before = #scratch.stmts
 							for _, i2 in t.el.seg.pre do
-								emitIns(scratch, i2)
+								if i2.kind then
+									buildItem(scratch, i2)
+								else
+									emitIns(scratch, i2)
+								end
 							end
 							local taken = condLeaf(scratch, t.el.seg)
 							if scratch ~= block and #scratch.stmts > 0 then
@@ -6036,6 +6239,17 @@ do
 					pushStmt(block, { k = "break" })
 				elseif kind == "flagset" then
 					pushStmt(block, flagAssign(item.flag, "false"))
+				elseif kind == "flagcond" then
+					pushStmt(block, flagAssign(item.flag, "false"))
+					local rst = { k = "repeat", loop = nil, untilCond = E("const", { text = "true" }), isBlock = true }
+					rst.body = buildBlock(item.cond, block, rst)
+					pushStmt(block, rst)
+					local st = { k = "if", cond = E("not", { e = flagVar(item.flag) }), refBlock = block }
+					st.thenB = buildBlock(item.thenB, block)
+					if item.elseB then
+						st.elseB = buildBlock(item.elseB, block)
+					end
+					pushStmt(block, st)
 				elseif kind == "flagif" then
 					local st = { k = "if", cond = E("not", { e = flagVar(item.flag) }), refBlock = block }
 					st.thenB = buildBlock(item.body, block)
@@ -8446,10 +8660,13 @@ do
 			end
 			local multiLine = next(fieldLines) ~= nil and next(fieldLines, next(fieldLines)) ~= nil
 			if not hasFunction and not multiLine then
+				-- * a trial: printing nested tables moves the line floor, which must not stick
+				local savedFloor = self.ctx.lineFloor
 				local line = "{ " .. concat(render(indent), ", ") .. " }"
 				if #line <= 100 and not string.find(line, "\n", 1, true) then
 					return line
 				end
+				self.ctx.lineFloor = savedFloor
 			end
 			local inner = rep("\t", indent + 1)
 			-- * each field on its source line (when it is not earlier than the code around it)
@@ -8709,26 +8926,59 @@ do
 	local structuredOnce
 	local function structured(chunk, protoId, upnames, indent, ctx, hints)
 		local saved = { ctx.structured, ctx.lifted, #ctx.reasons, #ctx.internalErrors }
-		local info = {}
-		local result = table.pack(pcall(structuredOnce, chunk, protoId, upnames, indent, ctx, hints, false, info))
-		if result[1] then
-			return table.unpack(result, 2, result.n)
-		elseif not info.usedNew then
-			error(result[2], 0)
+		local function restore()
+			ctx.structured, ctx.lifted = saved[1], saved[2]
+			for n = #ctx.reasons, saved[3] + 1, -1 do
+				ctx.reasons[n] = nil
+			end
+			for n = #ctx.internalErrors, saved[4] + 1, -1 do
+				ctx.internalErrors[n] = nil
+			end
 		end
-		ctx.structured, ctx.lifted = saved[1], saved[2]
-		for n = #ctx.reasons, saved[3] + 1, -1 do
-			ctx.reasons[n] = nil
+		local mode, firstErr = {}, nil
+		for attempt = 1, 6 do
+			if attempt > 1 then
+				restore()
+			end
+			local info = {}
+			local result = table.pack(pcall(structuredOnce, chunk, protoId, upnames, indent, ctx, hints, attempt > 1 and mode or nil, info))
+			if result[1] then
+				return table.unpack(result, 2, result.n)
+			end
+			local err = tostring(result[2])
+			firstErr = firstErr or result[2]
+			local changed = false
+			-- * `if a then <statement> if b then` merged into `if a and b then`: split it again
+			if string.find(err, "condition with side statements", 1, true) and not mode.nest then
+				mode.nest, changed = true, true
+			end
+			-- * a value expression whose parts need statements: an `if` statement there instead
+			if info.badValues then
+				mode.avoidValues = mode.avoidValues or {}
+				for pc in info.badValues do
+					if not mode.avoidValues[pc] then
+						mode.avoidValues[pc], changed = true, true
+					end
+				end
+			end
+			-- * the rules that only pick a nicer form: off
+			if not changed and info.usedNew and not mode.conservative then
+				mode.conservative, changed = true, true
+			end
+			if not changed then
+				break
+			end
 		end
-		for n = #ctx.internalErrors, saved[4] + 1, -1 do
-			ctx.internalErrors[n] = nil
-		end
-		return structuredOnce(chunk, protoId, upnames, indent, ctx, hints, true)
+		restore()
+		error(firstErr, 0)
 	end
-	function structuredOnce(chunk, protoId, upnames, indent, ctx, hints, noSplit, info)
+	function structuredOnce(chunk, protoId, upnames, indent, ctx, hints, mode, info)
+		local noSplit = mode and mode.conservative or false
 		local p = chunk.protos[protoId]
 		local A = analyze(chunk, p)
 		A.conservative = noSplit
+		A.nestChains = mode and mode.nest or false
+		A.avoidValues = mode and mode.avoidValues
 		A.info = info or {}
 		for _, w in A.webs do
 			if w.crossTemp then
@@ -8947,7 +9197,8 @@ do
 		return nil
 	end
 	local MAX_JOINED = 240
-	local function layoutLines(text, enabled)
+	local function layoutLines(text, mode)
+		local enabled = mode == "preserve" or mode == "annotate"
 		if not enabled then
 			return (string.gsub(string.gsub(text, "\1%d+\2", ""), "[\3\4]", ""))
 		end
@@ -9028,6 +9279,44 @@ do
 			line.opener = entry.opener
 			describe(line, add)
 		end
+		if mode == "annotate" then
+			-- * each line on its own; one blank line where the original had a gap
+			local lastTarget, lastOut
+			local offset = 0
+			for _, entry in lines do
+				local t = entry.target
+				local blank = string.find(entry.text, "%S") == nil
+				if blank then
+					continue
+				end
+				-- * a gap: more lines between this and the last statement in the original than here
+				local prev = out[#out]
+				local afterOpener = prev and (prev.opener or (prev.lastWord and OPENER_WORDS[prev.lastWord]))
+				local firstWord = string.match(entry.text, "^%s*([%a_]+)")
+				if firstWord == "else" or firstWord == "elseif" or firstWord == "end" or firstWord == "until" then
+					afterOpener = true -- * no blank line before the rest of a block statement either
+				end
+				if t and lastTarget and t - lastTarget > #out + 1 - lastOut and prev and prev.len > 0 and not afterOpener then
+					push({ text = "", opener = false })
+				end
+				push(entry)
+				-- * only where the offset to the original changes: a line without a marker is as far
+				-- * from the last marked one as in the original
+				if t and t ~= #out + offset then
+					local line = out[#out]
+					line.pieces[#line.pieces + 1] = " -- @L" .. t
+					offset = t - #out
+				end
+				if t then
+					lastTarget, lastOut = t, #out
+				end
+			end
+			local result = table.create(#out)
+			for n, line in out do
+				result[n] = concat(line.pieces)
+			end
+			return concat(result, "\n")
+		end
 		for n, entry in lines do
 			local t = entry.target
 			local blank = string.find(entry.text, "%S") == nil
@@ -9100,7 +9389,8 @@ do
 
 	-- * decompiles a whole script; returns source text and stats.
 	-- * options.scriptName (optional) names the module's main table after the script.
-	-- * options.matchLines (default true) puts statements on their original line numbers.
+	-- * options.lineMode: "annotate" (default: compact, `-- @L<line>` on statements that are not on
+	-- * their original line), "preserve" (statements on their original line numbers) or "none".
 	local decompileOnce
 	function BetterDecompiler.decompile(chunk, options)
 		local t0 = os.clock()
@@ -9123,7 +9413,7 @@ do
 		local body
 		if ok then
 			ctx.structured += 1
-			body = layoutLines(concat(out, "\n"), ctx.options.matchLines ~= false)
+			body = layoutLines(concat(out, "\n"), ctx.options.lineMode or "annotate")
 		else
 			ctx.lifted += 1
 			ctx.reasons[#ctx.reasons + 1] = "main: " .. tostring(params)
@@ -11825,7 +12115,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		RenameVariables = true,
 		ScriptHeaders = false,
-		MatchLineNumbers = true,
+		PreserveLineNumbers = false,
 		FixGoto = true,
 		DecompilerFallback = true,
 		RebuildFromBytecode = true,
@@ -12103,7 +12393,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local RenameVariables = OPTIONS.RenameVariables
 	local ScriptHeaders = OPTIONS.ScriptHeaders
-	local MatchLineNumbers = OPTIONS.MatchLineNumbers
+	local PreserveLineNumbers = OPTIONS.PreserveLineNumbers
 	local FixGoto = OPTIONS.FixGoto
 	local DecompilerFallback = OPTIONS.DecompilerFallback
 	local RebuildFromBytecode = OPTIONS.RebuildFromBytecode
@@ -12133,7 +12423,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-08c " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.MatchLineNumbers == false and " compact" or "")
+	local CACHE_VERSION = "2026-10-08e " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
@@ -12532,10 +12822,37 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 			local chunk = BytecodeLifter.parse(bytecode)
 			local scriptName = typeof(script) == "Instance" and script.Name or nil
-			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName, matchLines = MatchLineNumbers ~= false })
+			local text, stats = BetterDecompiler.decompile(chunk, { scriptName = scriptName, lineMode = PreserveLineNumbers and "preserve" or "annotate" })
 			local header = "-- Decompiled with BetterSaveinstance's built-in decompiler (" .. stats.structured + stats.lifted .. " functions"
 			if stats.lifted > 0 then
 				header ..= ", " .. stats.lifted .. " rebuilt low-level: search for \"[low-level]\""
+				-- * the exact input, so the decompiler can be fixed for this script without re-running anything
+				local ok, encoded = pcall(function()
+					local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+					local chars = {}
+					for i = 1, 64 do
+						chars[i - 1] = string.sub(ALPHABET, i, i)
+					end
+					local out, line = {}, {}
+					for i = 1, #bytecode, 3 do
+						local a, b, c = string.byte(bytecode, i, i + 2)
+						local n = a * 65536 + (b or 0) * 256 + (c or 0)
+						line[#line + 1] = chars[bit32.extract(n, 18, 6)] .. chars[bit32.extract(n, 12, 6)]
+							.. (b and chars[bit32.extract(n, 6, 6)] or "=") .. (c and chars[bit32.extract(n, 0, 6)] or "=")
+						if #line == 30 then
+							out[#out + 1] = table.concat(line)
+							line = {}
+						end
+					end
+					if #line > 0 then
+						out[#out + 1] = table.concat(line)
+					end
+					return table.concat(out, "\n")
+				end)
+				if ok then
+					text ..= "\n\n--[[ BetterSaveinstance: part of this script could not be rebuilt and is low level. This is the\n"
+						.. "script's bytecode (base64), so the decompiler can be fixed for it:\n" .. encoded .. "\n]]\n"
+				end
 			end
 			return header .. ")\n\n" .. text
 		end
