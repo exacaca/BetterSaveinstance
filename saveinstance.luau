@@ -10184,6 +10184,15 @@ do
 			end
 		end
 
+		-- * a name no other variable of this function has (apart from the two given)
+		local function nameUsedElsewhere(name, except1, except2)
+			for _, other in order do
+				if other ~= except1 and other ~= except2 and names[other.w] == name then
+					return true
+				end
+			end
+			return false
+		end
 		-- * `local options = arg2 or {}` where that is the parameter's only use: the parameter takes the
 		-- * local's name (`local options = options or {}`), which only it reads
 		for _, r in order do
@@ -10192,11 +10201,69 @@ do
 				local pr = recs[init.l.w]
 				local pname = pr and names[pr.w]
 				if pr and pr.param and pr.reads == 1 and #pr.defs == 0 and not pr.w.captured and pname then
-					if string.find(pname, "^arg%d+$") or isGenericName(pname) then
-						names[pr.w] = baseOfName[names[r.w]] or names[r.w]
-					elseif (baseOfName[names[r.w]] or names[r.w]) == pname then
+					local lname = names[r.w]
+					if (string.find(pname, "^arg%d+$") or isGenericName(pname)) and not nameUsedElsewhere(lname, r, pr) then
+						names[pr.w] = lname
+						r.shadows = pr
+					elseif (baseOfName[lname] or lname) == pname and not nameUsedElsewhere(pname, r, pr) then
 						names[r.w] = pname -- * `local depth = depth or 0`, not `depth2`
+						r.shadows = pr
 					end
+				end
+			end
+		end
+
+		-- * never two variables visible at the same time under one name (a parameter list included):
+		-- * the later one is renamed
+		do
+			local used = {}
+			for _, r in order do
+				if names[r.w] then
+					used[names[r.w]] = true
+				end
+			end
+			local seen = {}
+			for _, r in order do
+				local n = names[r.w]
+				if n and n ~= "_" and (materialized[r.w] or r.param) then
+					local list = seen[n]
+					if not list then
+						list = {}
+						seen[n] = list
+					end
+					local clash = false
+					for _, other in list do
+						if other.shadows ~= r and r.shadows ~= other
+							and overlaps(other.block or root, other.block and other.index or 0, r.block or root, r.block and r.index or 0)
+						then
+							clash = true
+							break
+						end
+					end
+					if clash then
+						local base = string.gsub(n, "%d+$", "")
+						local k = 2
+						while used[base .. k] or reserved[base .. k] or outerReserved[base .. k] or not isIdent(base .. k) do
+							k += 1
+						end
+						names[r.w] = base .. k
+						used[base .. k] = true
+						local list2 = seen[base .. k] or {}
+						seen[base .. k] = list2
+						list2[#list2 + 1] = r
+					else
+						list[#list + 1] = r
+					end
+				end
+			end
+		end
+		-- * checking the names: every variable its own name, so the printed code can be compared
+		if ctx.options.uniqueNames then
+			for _, r in order do
+				local n = names[r.w]
+				if n and not (isMethod and r == paramRecs[1]) then
+					ctx.uniqueCount = (ctx.uniqueCount or 0) + 1
+					names[r.w] = "u" .. ctx.uniqueCount .. "_"
 				end
 			end
 		end
@@ -14616,7 +14683,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	-- * The cache lives in the executor's global environment, so it outlives this run. Output from an
 	-- * older saveinstance (or another decompiler) must not be reused: bump CACHE_VERSION whenever
 	-- * decompiled output changes.
-	local CACHE_VERSION = "2026-10-09a " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
+	local CACHE_VERSION = "2026-10-09b " .. string.lower(tostring(OPTIONS.decomptype or "")) .. (OPTIONS.PreserveLineNumbers and " lines" or "")
 	if ldeccache and (type(ldeccache) ~= "table" or ldeccache.__version ~= CACHE_VERSION) then
 		ldeccache = nil
 	end
